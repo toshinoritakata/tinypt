@@ -3,6 +3,19 @@
      shape の順序はデフォルトシーンと一致させてあり、同一の出力が得られる。
      使い方: tinypt --scene sample/default.xml -o out.ppm -->
 <scene version="3.0.0">
+  <!-- レンダリング設定もシーンファイルから読み込む（CLI 明示値が優先）。 -->
+  <integrator type="path">
+    <integer name="max_depth" value="8"/>
+    <integer name="rr_depth" value="3"/>
+  </integrator>
+  <sampler type="independent">
+    <integer name="sample_count" value="512"/>
+  </sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="1920"/>
+    <integer name="height" value="1080"/>
+  </film>
+
   <sensor type="perspective">
     <float name="fov" value="40"/>
     <string name="fov_axis" value="y"/>

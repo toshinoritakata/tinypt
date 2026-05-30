@@ -4,11 +4,14 @@
 //! サブセットを読み込み、[`Scene`] を構築する。採用理由とマッピング方針は
 //! `docs/adr/0002-mitsuba-xml-scene-format.md` を参照。
 //!
-//! ## 対応要素（M1）
-//! - `sensor type="perspective"`: `fov` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
-//! - `shape type="sphere"`: `center` / `radius` + 子 `bsdf` または `emitter`
+//! ## 対応要素
+//! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
+//! - `shape type="sphere"`: `center` / `radius`
+//! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
 //! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `twosided`(unwrap)
-//! - `emitter type="area"`: `radiance`
+//! - `emitter type="area"`: `radiance`（shape に付随）
+//! - `emitter type="envmap"`(filename) / `constant`(radiance): 環境マップ。`scale` 対応
+//! - `film`(width/height) / `sampler`(sample_count) / `integrator`(max_depth/rr_depth): RenderConfig へ反映
 //!
 //! ## 方針
 //! - 色: `<rgb>` はリニア、`<srgb>` は sRGB（ガンマ展開）。
@@ -66,6 +69,10 @@ impl Element {
         self.prop("float", name)?.attr("value")?.trim().parse().ok()
     }
 
+    fn int(&self, name: &str) -> Option<usize> {
+        self.prop("integer", name)?.attr("value")?.trim().parse().ok()
+    }
+
     fn string(&self, name: &str) -> Option<&str> {
         self.prop("string", name)?.attr("value")
     }
@@ -121,16 +128,50 @@ fn err(msg: &str) -> io::Error {
 }
 
 /// Mitsuba XML サブセットを読み込み、[`Scene`] を構築する。
-pub fn load_scene(path: &str, config: &RenderConfig) -> io::Result<Scene> {
+///
+/// `<film>`（解像度）・`<sampler>`（spp）・`<integrator>`（max_depth / rr_depth）を
+/// `config` に反映する。XML に無い項目は `config` の既定値を維持する。CLI 明示値で
+/// 上書きしたい場合は呼び出し側で行う（[`crate::load_scene`] の利用側参照）。
+pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
     let xml = std::fs::read_to_string(path)?;
     let root = parse_tree(&xml)?;
     if root.tag != "scene" {
         return Err(err("root element is not <scene>"));
     }
 
+    // 1st pass: レンダリング設定（film / sampler / integrator）を config に反映。
+    for child in &root.children {
+        match child.tag.as_str() {
+            "film" => {
+                if let Some(w) = child.int("width") {
+                    config.width = w.max(1);
+                }
+                if let Some(h) = child.int("height") {
+                    config.height = h.max(1);
+                }
+            }
+            "sampler" => {
+                if let Some(n) = child.int("sample_count") {
+                    config.spp = n.max(1);
+                }
+            }
+            "integrator" => {
+                // Mitsuba の max_depth/rr_depth に対応（max_depth=-1 の無制限は未対応＝既定維持）
+                if let Some(d) = child.int("max_depth") {
+                    config.max_bounces = d.max(1);
+                }
+                if let Some(r) = child.int("rr_depth") {
+                    config.rr_start = r;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // OBJ パスは XML ファイルのあるディレクトリからの相対で解決する。
     let base_dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
 
+    // アスペクト比は（film 反映後の）解像度から求める。
     let aspect = config.width as f64 / config.height as f64;
     let mut world = World::new();
     let mut mats: Vec<Material> = Vec::new();
@@ -496,7 +537,7 @@ mod tests {
         let path = dir.join(format!("tinypt_mitsuba_{}_{}.xml", std::process::id(), n));
         let path = path.to_str().unwrap().to_string();
         std::fs::write(&path, xml).unwrap();
-        let scene = load_scene(&path, &cfg()).unwrap();
+        let scene = load_scene(&path, &mut cfg()).unwrap();
         std::fs::remove_file(&path).ok();
         scene
     }
@@ -564,6 +605,39 @@ mod tests {
     }
 
     #[test]
+    fn reads_film_sampler_integrator_into_config() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tinypt_cfg_{}_{}.xml", std::process::id(), n));
+        std::fs::write(
+            &path,
+            r#"<scene version="3.0.0">
+              <integrator type="path">
+                <integer name="max_depth" value="12"/>
+                <integer name="rr_depth" value="5"/>
+              </integrator>
+              <sampler type="independent"><integer name="sample_count" value="256"/></sampler>
+              <film type="hdrfilm">
+                <integer name="width" value="800"/>
+                <integer name="height" value="600"/>
+              </film>
+              <shape type="sphere"><bsdf type="diffuse"/></shape>
+            </scene>"#,
+        )
+        .unwrap();
+        let mut config = cfg();
+        load_scene(path.to_str().unwrap(), &mut config).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(config.width, 800);
+        assert_eq!(config.height, 600);
+        assert_eq!(config.spp, 256);
+        assert_eq!(config.max_bounces, 12);
+        assert_eq!(config.rr_start, 5);
+    }
+
+    #[test]
     fn parses_obj_mesh_with_transform() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static C: AtomicUsize = AtomicUsize::new(0);
@@ -584,7 +658,7 @@ mod tests {
         );
         let xmlpath = dir.join(format!("tinypt_m2_{}_{}.xml", std::process::id(), n));
         std::fs::write(&xmlpath, &xml).unwrap();
-        let scene = load_scene(xmlpath.to_str().unwrap(), &cfg()).unwrap();
+        let scene = load_scene(xmlpath.to_str().unwrap(), &mut cfg()).unwrap();
         std::fs::remove_file(&obj).ok();
         std::fs::remove_file(&xmlpath).ok();
 

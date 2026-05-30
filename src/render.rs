@@ -21,7 +21,7 @@ use crossbeam_channel as chan;
 use crate::checkpoint::{load_checkpoint, save_checkpoint};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
-use crate::integrator::radiance;
+use crate::integrator::{radiance, PathLimits};
 use crate::math::Color;
 use crate::rng::{seed_for, Rng};
 use crate::scene::Scene;
@@ -111,6 +111,8 @@ pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io:
         w, h, config.spp, config.tile, threads, config.morton_enabled, config.seed
     );
 
+    let limits = PathLimits { max_bounces: config.max_bounces, rr_start: config.rr_start };
+
     scope(|sp| {
         let world_ref = &scene.world;
         let mats_ref = &scene.mats;
@@ -154,7 +156,7 @@ pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io:
                                     let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
                                     let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
                                     let ray = cam.ray(sx, sy, &mut rng);
-                                    let sample = radiance(world, mats, env, ray, &mut rng);
+                                    let sample = radiance(world, mats, env, ray, &mut rng, limits);
                                     c = c + sample;
                                     n += 1;
                                     // Welford: 輝度ベースのオンライン分散更新
@@ -182,7 +184,7 @@ pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io:
                                     let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
                                     let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
                                     let ray = cam.ray(sx, sy, &mut rng);
-                                    c = c + radiance(world, mats, env, ray, &mut rng);
+                                    c = c + radiance(world, mats, env, ray, &mut rng, limits);
                                 }
                                 sum[local_idx] = c;
                                 wsum[local_idx] = (t.sample_end - t.sample_start) as f64;
@@ -329,6 +331,8 @@ mod tests {
             width: w,
             height: h,
             spp: 1,
+            max_bounces: 8,
+            rr_start: 3,
             tile: 1,
             checkpoint_enabled: false,
             checkpoint_every_tasks: 1,

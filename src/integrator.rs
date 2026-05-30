@@ -11,7 +11,7 @@
 //!
 //! パストレーシングではこの積分をモンテカルロ推定で近似する。
 
-use crate::constants::path::{FIREFLY_CLAMP, MAX_BOUNCES, RR_START_BOUNCE};
+use crate::constants::path::FIREFLY_CLAMP;
 use crate::constants::{RAY_EPSILON, RAY_T_MAX};
 use crate::env::EnvMap;
 use crate::material::{BsdfSample, Material};
@@ -36,19 +36,35 @@ fn background(d: Vec3, env: Option<&EnvMap>) -> Color {
     }
 }
 
+/// パストレーシングのパラメータ（シーン/設定由来でランタイムに与える）。
+#[derive(Clone, Copy)]
+pub struct PathLimits {
+    /// 最大バウンス数
+    pub max_bounces: usize,
+    /// Russian Roulette を開始するバウンス数
+    pub rr_start: usize,
+}
+
 /// パスを追跡し推定放射輝度を返す。
 ///
-/// カメラレイから出発し、最大 `MAX_BOUNCES` 回の散乱を追跡する。
+/// カメラレイから出発し、最大 `limits.max_bounces` 回の散乱を追跡する。
 /// 各バウンスで NEE（直接照明推定）と BSDF サンプリングを行い、
 /// MIS で重みを統合して蓄積する。
-pub fn radiance(world: &World, mats: &[Material], env: Option<&EnvMap>, ray: Ray, rng: &mut Rng) -> Color {
+pub fn radiance(
+    world: &World,
+    mats: &[Material],
+    env: Option<&EnvMap>,
+    ray: Ray,
+    rng: &mut Rng,
+    limits: PathLimits,
+) -> Color {
     let mut accumulated_radiance = Color::new(0.0, 0.0, 0.0); // パス全体の蓄積放射輝度
     let mut path_throughput = Color::new(1.0, 1.0, 1.0);       // パスのスループット（減衰係数）
     let mut ray = ray;
     let mut last_bsdf_pdf = 0.0;     // 前バウンスの BSDF PDF（MIS 用）
     let mut last_non_delta = false;   // 前バウンスが非デルタ散乱か（MIS 適用判定）
 
-    for bounce in 0..MAX_BOUNCES {
+    for bounce in 0..limits.max_bounces {
         // レイとシーンの交差判定
         let hit = match world.hit(ray, RAY_EPSILON, RAY_T_MAX) {
             Some(v) => v,
@@ -70,7 +86,7 @@ pub fn radiance(world: &World, mats: &[Material], env: Option<&EnvMap>, ray: Ray
         // Russian Roulette: probabilistic path termination for unbiased rendering.
         // The survival probability is based on the maximum throughput component,
         // clamped to [0.05, 0.95] to avoid extreme variance.
-        if bounce >= RR_START_BOUNCE {
+        if bounce >= limits.rr_start {
             let p = path_throughput.r().max(path_throughput.g()).max(path_throughput.b()).min(0.95).max(0.05);
             if rng.next_f64() > p {
                 break;

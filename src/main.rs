@@ -5,8 +5,17 @@
 
 use tinypt::{build_scene, ckpt_path, denoise, load_scene, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
 
+/// CLI で明示的に指定された値（シーンファイルの設定より優先させる）。
+#[derive(Default)]
+struct CliOverrides {
+    /// `--spp` が指定された場合のサンプル数
+    spp: Option<usize>,
+}
+
 /// コマンドライン引数を解析して `RenderConfig` に反映する。
-fn parse_args(config: &mut RenderConfig) {
+/// シーンファイルの設定より優先すべき CLI 明示値を返す。
+fn parse_args(config: &mut RenderConfig) -> CliOverrides {
+    let mut overrides = CliOverrides::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -14,6 +23,7 @@ fn parse_args(config: &mut RenderConfig) {
                 if let Some(v) = args.next() {
                     if let Ok(n) = v.parse::<usize>() {
                         config.spp = n.max(1);
+                        overrides.spp = Some(n.max(1));
                     }
                 }
             }
@@ -91,20 +101,27 @@ fn parse_args(config: &mut RenderConfig) {
             _ => {}
         }
     }
+    overrides
 }
 
 fn main() -> std::io::Result<()> {
     // 1. 設定の初期化と引数解析
     let mut config = RenderConfig::default();
-    parse_args(&mut config);
-    let ckpt_file = ckpt_path(config.scene_hash);
+    let overrides = parse_args(&mut config);
 
     // 2. シーン構築（カメラ・ジオメトリ・マテリアル・環境マップ）
-    //    --scene 指定時は Mitsuba XML サブセットから、なければハードコードのデフォルトシーン。
-    let scene = match &config.scene_path {
-        Some(path) => load_scene(path, &config)?,
-        None => build_scene(&config),
+    //    --scene 指定時は Mitsuba XML サブセットから解像度・spp・integrator 設定も読み込む。
+    //    シーンファイルの設定より CLI 明示値を優先する。
+    let scene = if let Some(path) = config.scene_path.clone() {
+        let scene = load_scene(&path, &mut config)?;
+        if let Some(spp) = overrides.spp {
+            config.spp = spp;
+        }
+        scene
+    } else {
+        build_scene(&config)
     };
+    let ckpt_file = ckpt_path(config.scene_hash);
 
     // 3. レンダリング実行（マルチスレッド・タイルベース）
     let output = render(&scene, &config, &ckpt_file)?;
