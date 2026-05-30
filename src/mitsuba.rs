@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -25,9 +26,11 @@ use crate::config::RenderConfig;
 use crate::geometry::Sphere;
 use crate::material::Material;
 use crate::math::{Color, Vec3};
+use crate::obj_loader::load_obj_triangles;
 use crate::ray::Camera;
 use crate::scene::Scene;
-use crate::world::World;
+use crate::transform::Transform;
+use crate::world::{Instance, Mesh, World};
 
 /// パース済み XML 要素（タグ名・属性・子要素）。
 struct Element {
@@ -124,6 +127,9 @@ pub fn load_scene(path: &str, config: &RenderConfig) -> io::Result<Scene> {
         return Err(err("root element is not <scene>"));
     }
 
+    // OBJ パスは XML ファイルのあるディレクトリからの相対で解決する。
+    let base_dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+
     let aspect = config.width as f64 / config.height as f64;
     let mut world = World::new();
     let mut mats: Vec<Material> = Vec::new();
@@ -138,7 +144,7 @@ pub fn load_scene(path: &str, config: &RenderConfig) -> io::Result<Scene> {
                     warn(&format!("unsupported sensor type '{}', ignored", child.typ()));
                 }
             }
-            "shape" => parse_shape(child, &mut world, &mut mats),
+            "shape" => parse_shape(child, &base_dir, &mut world, &mut mats),
             // レンダリング設定ブロックは無視（このレンダラーは CLI で制御する）
             "integrator" | "sampler" | "film" | "default" | "rfilter" => {}
             other => warn(&format!("unsupported element <{}>, skipped", other)),
@@ -255,29 +261,132 @@ fn parse_lookat(el: &Element) -> Option<(Vec3, Vec3, Vec3)> {
     Some((origin, target, up))
 }
 
-/// `shape` を World へ追加する（M1 は sphere のみ）。
-fn parse_shape(el: &Element, world: &mut World, mats: &mut Vec<Material>) {
+/// `shape` を World へ追加する（sphere / obj メッシュ）。
+fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<Material>) {
+    // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
+    let mat = if let Some(em) = el.child_tag("emitter") {
+        parse_emitter(em)
+    } else if let Some(b) = el.child_tag("bsdf") {
+        parse_bsdf(b)
+    } else {
+        warn(&format!("shape type '{}' without bsdf or emitter; defaulting to diffuse", el.typ()));
+        Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }
+    };
+    let mat_id = mats.len();
+
     match el.typ() {
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
-
-            // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
-            let mat = if let Some(em) = el.child_tag("emitter") {
-                parse_emitter(em)
-            } else if let Some(b) = el.child_tag("bsdf") {
-                parse_bsdf(b)
-            } else {
-                warn("sphere without bsdf or emitter; defaulting to diffuse");
-                Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }
-            };
-
-            let mat_id = mats.len();
             mats.push(mat);
             world.spheres.push(Sphere { c: center, r: radius, mat_id });
         }
+        "obj" => {
+            let filename = match el.string("filename") {
+                Some(f) => f,
+                None => {
+                    warn("obj shape without filename; skipped");
+                    return;
+                }
+            };
+            let resolved = resolve_path(base_dir, filename);
+            let tris = match load_obj_triangles(resolved.to_string_lossy().as_ref(), mat_id) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
+                    return;
+                }
+            };
+            // to_world 変換（なければ恒等）でインスタンス配置する。
+            let xform = el
+                .child_tag("transform")
+                .map(parse_transform)
+                .unwrap_or_else(Transform::identity);
+
+            mats.push(mat);
+            let mesh_id = world.meshes.len();
+            world.meshes.push(Mesh::new(tris));
+            world.instances.push(Instance { mesh_id, xform, mat_override: None });
+        }
         other => warn(&format!("unsupported shape type '{}', skipped", other)),
     }
+}
+
+/// ファイル名を XML のあるディレクトリ基準で解決する（絶対パスはそのまま）。
+fn resolve_path(base_dir: &Path, filename: &str) -> PathBuf {
+    let p = Path::new(filename);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base_dir.join(p)
+    }
+}
+
+/// `<transform>` の子（translate / rotate / scale / matrix）を文書順に合成する。
+/// Mitsuba 規約に従い、`trafo = op1 · op2 · … · opN`（最後の子が最も内側）。
+fn parse_transform(el: &Element) -> Transform {
+    let mut acc = Transform::identity();
+    for child in &el.children {
+        if let Some(op) = parse_transform_op(child) {
+            acc = acc.compose(op);
+        }
+    }
+    acc
+}
+
+fn parse_transform_op(el: &Element) -> Option<Transform> {
+    match el.tag.as_str() {
+        "translate" => Some(Transform::translate(xyz(el, 0.0))),
+        "scale" => {
+            // value（均一）または x/y/z（成分ごと）
+            if let Some(v) = el.attr("value").and_then(parse_f64) {
+                Some(Transform::scale(Vec3::new(v, v, v)))
+            } else {
+                Some(Transform::scale(xyz(el, 1.0)))
+            }
+        }
+        "rotate" => {
+            let axis = xyz(el, 0.0);
+            let angle = el.attr("angle").and_then(parse_f64).unwrap_or(0.0);
+            if axis.len() < 1e-12 {
+                warn("rotate with zero axis; ignored");
+                None
+            } else {
+                Some(Transform::rotate(axis, angle))
+            }
+        }
+        "matrix" => {
+            let vals: Vec<f64> = el
+                .attr("value")?
+                .split([',', ' '])
+                .filter(|t| !t.trim().is_empty())
+                .filter_map(parse_f64)
+                .collect();
+            if vals.len() == 16 {
+                let mut m = [[0.0; 4]; 4];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        m[r][c] = vals[r * 4 + c];
+                    }
+                }
+                Some(Transform::from_matrix4(m))
+            } else {
+                warn(&format!("matrix expects 16 values, got {}; ignored", vals.len()));
+                None
+            }
+        }
+        "lookat" => None, // sensor 以外の lookat は未対応
+        other => {
+            warn(&format!("unsupported transform op <{}>, ignored", other));
+            None
+        }
+    }
+}
+
+/// 要素の x/y/z 属性を `Vec3` に読む（欠落は `default`）。
+fn xyz(el: &Element, default: f64) -> Vec3 {
+    let g = |k: &str| el.attr(k).and_then(parse_f64).unwrap_or(default);
+    Vec3::new(g("x"), g("y"), g("z"))
 }
 
 /// `emitter` を発光マテリアルにマップする。
@@ -414,6 +523,41 @@ mod tests {
         assert!((srgb.r() - Color::from_srgb(0.8, 0.8, 0.8).r()).abs() < 1e-12);
         assert!((lin.r() - 0.8).abs() < 1e-12);
         assert!(srgb.r() < lin.r());
+    }
+
+    #[test]
+    fn parses_obj_mesh_with_transform() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let obj = dir.join(format!("tinypt_m2_{}_{}.obj", std::process::id(), n));
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        let objname = obj.file_name().unwrap().to_string_lossy().into_owned();
+        let xml = format!(
+            r#"<scene version="3.0.0">
+              <shape type="obj">
+                <string name="filename" value="{}"/>
+                <transform name="to_world"><translate x="10" y="0" z="0"/></transform>
+                <bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf>
+              </shape>
+            </scene>"#,
+            objname
+        );
+        let xmlpath = dir.join(format!("tinypt_m2_{}_{}.xml", std::process::id(), n));
+        std::fs::write(&xmlpath, &xml).unwrap();
+        let scene = load_scene(xmlpath.to_str().unwrap(), &cfg()).unwrap();
+        std::fs::remove_file(&obj).ok();
+        std::fs::remove_file(&xmlpath).ok();
+
+        assert_eq!(scene.world.meshes.len(), 1);
+        assert_eq!(scene.world.instances.len(), 1);
+        assert_eq!(scene.world.meshes[0].tris.len(), 1);
+        assert_eq!(scene.mats.len(), 1);
+        // 頂点 v0=(0,0,0) は translate(10,0,0) でワールド (10,0,0) になる
+        let inst = scene.world.instances[0];
+        let p = inst.xform.apply_point(Vec3::new(0.0, 0.0, 0.0));
+        assert!((p - Vec3::new(10.0, 0.0, 0.0)).len() < 1e-9);
     }
 
     #[test]
