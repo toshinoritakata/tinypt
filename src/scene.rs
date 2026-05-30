@@ -46,24 +46,31 @@ pub fn build_scene(config: &RenderConfig) -> Scene {
     });
     world.spheres.push(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: id_ground });
 
-    // Lambert（左）
+    // Lambert（左端）
     let id_lambert = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.8, 0.3, 0.3),
     });
-    world.spheres.push(Sphere { c: Vec3::new(-1.2, 0.5, 0.0), r: 0.5, mat_id: id_lambert });
+    world.spheres.push(Sphere { c: Vec3::new(-1.8, 0.5, 0.0), r: 0.5, mat_id: id_lambert });
 
-    // Metal（中央）
+    // Metal（左中）
     let id_metal = push(&mut mats, Material::Metal {
         albedo: Color::from_srgb(0.8, 0.8, 0.8),
     });
-    world.spheres.push(Sphere { c: Vec3::new(0.0, 0.5, 0.0), r: 0.5, mat_id: id_metal });
+    world.spheres.push(Sphere { c: Vec3::new(-0.6, 0.5, 0.0), r: 0.5, mat_id: id_metal });
 
-    // Glass（右）
+    // GGX（右中）— 粗い金属（ゴールド、α=0.25）
+    let id_ggx = push(&mut mats, Material::Ggx {
+        albedo: Color::from_srgb(0.95, 0.78, 0.35),
+        alpha: 0.25,
+    });
+    world.spheres.push(Sphere { c: Vec3::new(0.6, 0.5, 0.0), r: 0.5, mat_id: id_ggx });
+
+    // Glass（右端）
     let id_glass = push(&mut mats, Material::Dielectric {
         ior: 1.5,
         absorption: Color::new(0.02, 0.05, 0.02),
     });
-    world.spheres.push(Sphere { c: Vec3::new(1.2, 0.5, 0.0), r: 0.5, mat_id: id_glass });
+    world.spheres.push(Sphere { c: Vec3::new(1.8, 0.5, 0.0), r: 0.5, mat_id: id_glass });
 
     // 発光球（上方）
     let id_light = push(&mut mats, Material::DiffuseLight {
