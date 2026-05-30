@@ -95,6 +95,80 @@ impl Mul<Color> for f64 { type Output = Color; fn mul(self, c: Color) -> Color {
 impl From<Vec3> for Color { fn from(v: Vec3) -> Color { Color(v) } }
 impl From<Color> for Vec3 { fn from(c: Color) -> Vec3 { c.0 } }
 
+/// 3×3 行列（色空間変換・アフィン変換の線形部などに使用）。
+#[derive(Clone, Copy, Debug)]
+pub struct Mat3 {
+    /// 行優先の成分。`m[row][col]`。
+    pub m: [[f64; 3]; 3],
+}
+
+impl Mat3 {
+    /// 行優先の成分から生成する。
+    pub fn from_rows(m: [[f64; 3]; 3]) -> Self {
+        Self { m }
+    }
+
+    /// 単位行列。
+    pub fn identity() -> Self {
+        Self { m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] }
+    }
+
+    /// 行列積 `self · b`。
+    pub fn mul(self, b: Mat3) -> Mat3 {
+        let mut r = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                r[i][j] = self.m[i][0] * b.m[0][j]
+                    + self.m[i][1] * b.m[1][j]
+                    + self.m[i][2] * b.m[2][j];
+            }
+        }
+        Mat3 { m: r }
+    }
+
+    /// ベクトルとの積 `self · v`。
+    pub fn mul_vec(self, v: Vec3) -> Vec3 {
+        Vec3::new(
+            self.m[0][0] * v.x + self.m[0][1] * v.y + self.m[0][2] * v.z,
+            self.m[1][0] * v.x + self.m[1][1] * v.y + self.m[1][2] * v.z,
+            self.m[2][0] * v.x + self.m[2][1] * v.y + self.m[2][2] * v.z,
+        )
+    }
+
+    /// 転置行列。
+    pub fn transpose(self) -> Mat3 {
+        let m = self.m;
+        Mat3 {
+            m: [
+                [m[0][0], m[1][0], m[2][0]],
+                [m[0][1], m[1][1], m[2][1]],
+                [m[0][2], m[1][2], m[2][2]],
+            ],
+        }
+    }
+
+    /// 逆行列（余因子法）。特異な場合の結果は未定義。
+    pub fn invert(self) -> Mat3 {
+        let m = self.m;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        let inv_det = 1.0 / det;
+
+        let mut r = [[0.0; 3]; 3];
+        r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
+        r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;
+        r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
+        r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;
+        r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
+        r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det;
+        r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
+        r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
+        r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
+        Mat3 { m: r }
+    }
+}
+
 /// スカラーを [a, b] にクランプする。
 pub fn clamp(x: f64, a: f64, b: f64) -> f64 { x.max(a).min(b) }
 

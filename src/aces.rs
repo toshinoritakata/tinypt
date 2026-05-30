@@ -9,55 +9,7 @@
 
 use std::sync::OnceLock;
 
-use crate::math::{Color, Vec3};
-
-#[derive(Clone, Copy)]
-/// 3×3 行列（色空間変換用）。
-struct Mat3 {
-    m: [[f64; 3]; 3],
-}
-
-impl Mat3 {
-    fn mul(self, b: Mat3) -> Mat3 {
-        let mut r = [[0.0; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                r[i][j] = self.m[i][0] * b.m[0][j]
-                    + self.m[i][1] * b.m[1][j]
-                    + self.m[i][2] * b.m[2][j];
-            }
-        }
-        Mat3 { m: r }
-    }
-
-    fn mul_vec3(self, v: Vec3) -> Vec3 {
-        Vec3::new(
-            self.m[0][0] * v.x + self.m[0][1] * v.y + self.m[0][2] * v.z,
-            self.m[1][0] * v.x + self.m[1][1] * v.y + self.m[1][2] * v.z,
-            self.m[2][0] * v.x + self.m[2][1] * v.y + self.m[2][2] * v.z,
-        )
-    }
-
-    fn invert(self) -> Mat3 {
-        let m = self.m;
-        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-        let inv_det = 1.0 / det;
-
-        let mut r = [[0.0; 3]; 3];
-        r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
-        r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;
-        r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
-        r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;
-        r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
-        r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det;
-        r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
-        r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
-        r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
-        Mat3 { m: r }
-    }
-}
+use crate::math::{Color, Mat3, Vec3};
 
 /// 対角行列を生成する。
 fn diag(v: Vec3) -> Mat3 {
@@ -85,7 +37,7 @@ fn rgb_to_xyz_matrix(primaries: [(f64, f64); 3], white: (f64, f64)) -> Mat3 {
     };
 
     let w = xy_to_xyz(white.0, white.1);
-    let s = m.invert().mul_vec3(w);
+    let s = m.invert().mul_vec(w);
     m.mul(diag(s))
 }
 
@@ -107,8 +59,8 @@ fn chromatic_adaptation_bradford(src_white: Vec3, dst_white: Vec3) -> Mat3 {
         ],
     };
 
-    let src = m.mul_vec3(src_white);
-    let dst = m.mul_vec3(dst_white);
+    let src = m.mul_vec(src_white);
+    let dst = m.mul_vec(dst_white);
     let scale = Vec3::new(dst.x / src.x, dst.y / src.y, dst.z / src.z);
     m_inv.mul(diag(scale)).mul(m)
 }
@@ -133,7 +85,7 @@ fn srgb_to_acescg_matrix() -> Mat3 {
 /// リニア sRGB/Rec.709 の色をリニア ACEScg に変換する。
 pub fn srgb_to_acescg(color: Color) -> Color {
     let v: Vec3 = color.into();
-    Color(srgb_to_acescg_matrix().mul_vec3(v))
+    Color(srgb_to_acescg_matrix().mul_vec(v))
 }
 
 /// ピクセルバッファ全体をリニア sRGB/Rec.709 → リニア ACEScg に一括変換する。
