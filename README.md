@@ -111,6 +111,7 @@ tinypt --scene sample/default.xml -o output.ppm
 | `<sensor type="perspective">` | `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance` (DOF) |
 | `<shape type="sphere">` | `center` / `radius` |
 | `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` |
+| `<shape type="rectangle"\|"cube"\|"disk">` | Mitsuba 正準形メッシュ + `to_world` |
 | `<transform>` | `translate` / `rotate` (任意軸) / `scale` (均一・非均一) / `matrix` (4×4) |
 | `<bsdf>` | `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `twosided` |
 | `<emitter type="area">` | `radiance` (shape に付随する面光源) |
@@ -135,6 +136,7 @@ tinypt --scene sample/default.xml -o output.ppm
 ```bash
 tinypt --scene sample/mesh.xml -o mesh.ppm
 tinypt --scene sample/env_scene.xml -o env.ppm
+tinypt --scene sample/cornell.xml --tonemap none -o cornell.ppm
 ```
 
 ### 記述例
