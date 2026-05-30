@@ -23,6 +23,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
 use crate::config::RenderConfig;
+use crate::env::EnvMap;
 use crate::geometry::Sphere;
 use crate::material::Material;
 use crate::math::{Color, Vec3};
@@ -134,6 +135,7 @@ pub fn load_scene(path: &str, config: &RenderConfig) -> io::Result<Scene> {
     let mut world = World::new();
     let mut mats: Vec<Material> = Vec::new();
     let mut cam: Option<Camera> = None;
+    let mut env: Option<EnvMap> = None;
 
     for child in &root.children {
         match child.tag.as_str() {
@@ -145,6 +147,12 @@ pub fn load_scene(path: &str, config: &RenderConfig) -> io::Result<Scene> {
                 }
             }
             "shape" => parse_shape(child, &base_dir, &mut world, &mut mats),
+            // シーン直下の emitter は環境マップ（envmap / constant）
+            "emitter" => {
+                if let Some(e) = parse_scene_emitter(child, &base_dir) {
+                    env = Some(e);
+                }
+            }
             // レンダリング設定ブロックは無視（このレンダラーは CLI で制御する）
             "integrator" | "sampler" | "film" | "default" | "rfilter" => {}
             other => warn(&format!("unsupported element <{}>, skipped", other)),
@@ -163,7 +171,37 @@ pub fn load_scene(path: &str, config: &RenderConfig) -> io::Result<Scene> {
     });
 
     world.build_lights(&mats);
-    Ok(Scene { cam, world, mats, env: None })
+    Ok(Scene { cam, world, mats, env })
+}
+
+/// シーン直下の `<emitter>`（環境マップ）を `EnvMap` にマップする。
+/// `envmap`（ファイル）と `constant`（定数色）に対応。`scale` を放射輝度に乗算する。
+fn parse_scene_emitter(el: &Element, base_dir: &Path) -> Option<EnvMap> {
+    if el.child_tag("transform").is_some() {
+        warn("envmap to_world rotation is unsupported; ignored");
+    }
+    let scale = el.float("scale").unwrap_or(1.0);
+    match el.typ() {
+        "envmap" => {
+            let filename = el.string("filename")?;
+            let resolved = resolve_path(base_dir, filename);
+            match EnvMap::from_hdr(resolved.to_string_lossy().as_ref()) {
+                Ok(m) => Some(m.scaled(scale)),
+                Err(e) => {
+                    warn(&format!("failed to load envmap '{}': {}; ignored", resolved.display(), e));
+                    None
+                }
+            }
+        }
+        "constant" => {
+            let radiance = el.color("radiance").unwrap_or(Color::new(1.0, 1.0, 1.0));
+            Some(EnvMap::constant(radiance).scaled(scale))
+        }
+        other => {
+            warn(&format!("unsupported scene emitter type '{}', ignored", other));
+            None
+        }
+    }
 }
 
 /// XML を要素ツリーに解析する。
@@ -558,6 +596,51 @@ mod tests {
         let inst = scene.world.instances[0];
         let p = inst.xform.apply_point(Vec3::new(0.0, 0.0, 0.0));
         assert!((p - Vec3::new(10.0, 0.0, 0.0)).len() < 1e-9);
+    }
+
+    #[test]
+    fn constant_emitter_sets_uniform_env() {
+        let scene = load(
+            r#"<scene version="3.0.0">
+              <emitter type="constant"><rgb name="radiance" value="0.1,0.2,0.4"/></emitter>
+              <shape type="sphere"><bsdf type="diffuse"/></shape>
+            </scene>"#,
+        );
+        let env = scene.env.expect("constant emitter should set env");
+        let a = env.sample(Vec3::new(0.0, 1.0, 0.0));
+        let b = env.sample(Vec3::new(1.0, 0.0, 0.0));
+        // 定数なので方向によらず同じ放射輝度
+        assert!((a.r() - 0.1).abs() < 1e-9 && (a.g() - 0.2).abs() < 1e-9 && (a.b() - 0.4).abs() < 1e-9);
+        assert!((b.r() - 0.1).abs() < 1e-9 && (b.b() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn emitter_scale_multiplies_radiance() {
+        let scene = load(
+            r#"<scene version="3.0.0">
+              <emitter type="constant">
+                <rgb name="radiance" value="1,1,1"/>
+                <float name="scale" value="3"/>
+              </emitter>
+            </scene>"#,
+        );
+        let c = scene.env.unwrap().sample(Vec3::new(0.0, 1.0, 0.0));
+        assert!((c.r() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn envmap_file_loads() {
+        let exr = concat!(env!("CARGO_MANIFEST_DIR"), "/sample/env.exr");
+        let xml = format!(
+            r#"<scene version="3.0.0">
+              <emitter type="envmap"><string name="filename" value="{}"/></emitter>
+              <shape type="sphere"><bsdf type="diffuse"/></shape>
+            </scene>"#,
+            exr
+        );
+        let scene = load(&xml);
+        let env = scene.env.expect("envmap file should load");
+        assert!(env.width > 1 && env.height > 1);
     }
 
     #[test]

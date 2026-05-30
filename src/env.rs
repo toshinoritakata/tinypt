@@ -40,9 +40,25 @@ impl EnvMap {
         } else {
             read_hdr(path)?
         };
-        let w = img.width;
-        let h = img.height;
-        let data = img.data;
+        Ok(Self::from_pixels(img.width, img.height, img.data))
+    }
+
+    /// 一様な定数色の環境マップ（1×1）。`constant` emitter 用。
+    pub fn constant(color: Color) -> Self {
+        Self::from_pixels(1, 1, vec![color])
+    }
+
+    /// 放射輝度を `factor` 倍した環境マップを返す（`scale` 属性用）。
+    pub fn scaled(self, factor: f64) -> Self {
+        if factor == 1.0 {
+            return self;
+        }
+        let data = self.data.iter().map(|c| *c * factor).collect();
+        Self::from_pixels(self.width, self.height, data)
+    }
+
+    /// リニア RGB ピクセル列から環境マップとサンプリング用 CDF を構築する。
+    pub fn from_pixels(w: usize, h: usize, data: Vec<Color>) -> Self {
         let mut row_cdf = vec![0.0; h + 1];
         let mut col_cdf = vec![0.0; h * (w + 1)];
         let mut total = 0.0;
@@ -62,14 +78,14 @@ impl EnvMap {
             total += row_sum;
             row_cdf[y + 1] = total;
         }
-        Ok(Self {
+        Self {
             width: w,
             height: h,
             data,
             row_cdf,
             col_cdf,
             total_weight: total,
-        })
+        }
     }
 
     /// 方向 `dir` から環境マップの放射輝度をバイリニア補間でサンプリングする。

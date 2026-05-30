@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 環境マップ(envmap)で照らすシーン。面光源なし、env.exr が背景兼ライト。
+     金属球に環境が映り込む。使い方: tinypt --scene sample/env_scene.xml -o out.ppm -->
+<scene version="3.0.0">
+  <sensor type="perspective">
+    <float name="fov" value="40"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0, 1.2, 4" target="0, 0.5, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 地面（大球） -->
+  <shape type="sphere">
+    <point name="center" x="0" y="-1000" z="0"/>
+    <float name="radius" value="1000"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.5, 0.5, 0.5"/></bsdf>
+  </shape>
+
+  <!-- Metal（左）— 環境が映り込む -->
+  <shape type="sphere">
+    <point name="center" x="-1.2" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="conductor"><srgb name="specular_reflectance" value="0.9, 0.9, 0.9"/></bsdf>
+  </shape>
+
+  <!-- GGX（中央）— 粗い反射で環境を拡散的に反映 -->
+  <shape type="sphere">
+    <point name="center" x="0" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="roughconductor">
+      <string name="distribution" value="ggx"/>
+      <float name="alpha" value="0.15"/>
+      <srgb name="specular_reflectance" value="0.95, 0.78, 0.35"/>
+    </bsdf>
+  </shape>
+
+  <!-- 拡散（右）— 環境光で照らされる -->
+  <shape type="sphere">
+    <point name="center" x="1.2" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.8, 0.3, 0.3"/></bsdf>
+  </shape>
+
+  <!-- 環境マップ（背景兼ライト） -->
+  <emitter type="envmap">
+    <string name="filename" value="env.exr"/>
+    <float name="scale" value="1.0"/>
+  </emitter>
+</scene>
