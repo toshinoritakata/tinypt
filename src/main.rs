@@ -3,7 +3,7 @@
 //! コマンドライン引数を解析し、シーン構築 → レンダリング → 後処理 → 画像出力を実行する。
 //! 対応フォーマット: PPM / HDR (Radiance) / EXR (ACEScg)
 
-use tinypt::{apply_exposure_tonemap, build_scene, ckpt_path, denoise, render, resolve_pixels, write_image, write_image_pixels, RenderConfig, Tonemap};
+use tinypt::{build_scene, ckpt_path, denoise, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
 
 /// コマンドライン引数を解析して `RenderConfig` に反映する。
 fn parse_args(config: &mut RenderConfig) {
@@ -101,32 +101,16 @@ fn main() -> std::io::Result<()> {
     let output = render(&scene, &config, &ckpt_file)?;
 
     // 4. 後処理パイプライン
-    //    - EXR/HDR はリニアのまま出力するためトーンマップ不要
-    //    - PPM 出力時のみ露出補正・トーンマップを適用
-    let lower = config.output_path.to_ascii_lowercase();
-    let is_exr = lower.ends_with(".exr");
-    let is_hdr = lower.ends_with(".hdr");
-    let apply_tonemap = !is_exr && !is_hdr && (config.tonemap != Tonemap::None || config.exposure != 0.0);
-
+    //    蓄積バッファを一度だけリニア RGB に解決 → （オプションで）デノイズ →
+    //    フォーマットが色空間・トーンマップ・ガンマを所有して出力。
+    let mut pixels = resolve_pixels(config.width, config.height, &output.acc, &output.acc_w);
     if config.denoise_enabled {
-        // デノイズ有効: 蓄積バッファ → ピクセル解決 → OIDN デノイズ → トーンマップ → 出力
-        let pixels = resolve_pixels(config.width, config.height, &output.acc, &output.acc_w);
         eprintln!("Denoising with Intel OIDN...");
-        let mut denoised = denoise::denoise_oidn(&pixels, config.width, config.height);
-        if apply_tonemap {
-            denoised = apply_exposure_tonemap(&denoised, config.exposure, config.tonemap);
-        }
-        write_image_pixels(&config.output_path, config.width, config.height, &denoised)?;
-    } else {
-        // デノイズ無効: 蓄積バッファから直接出力
-        if apply_tonemap {
-            let pixels = resolve_pixels(config.width, config.height, &output.acc, &output.acc_w);
-            let tm = apply_exposure_tonemap(&pixels, config.exposure, config.tonemap);
-            write_image_pixels(&config.output_path, config.width, config.height, &tm)?;
-        } else {
-            write_image(&config.output_path, config.width, config.height, &output.acc, &output.acc_w)?;
-        }
+        pixels = denoise::denoise_oidn(&pixels, config.width, config.height);
     }
+    let settings = OutputSettings { exposure: config.exposure, tonemap: config.tonemap };
+    OutputFormat::from_path(&config.output_path)
+        .write(&config.output_path, config.width, config.height, &pixels, settings)?;
 
     // 5. レンダリング完了後、チェックポイントファイルを削除
     let _ = std::fs::remove_file(&ckpt_file);
