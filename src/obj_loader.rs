@@ -103,14 +103,7 @@ pub fn load_obj_triangles(path: &str, mat_id: usize) -> std::io::Result<Vec<Tria
     let (p0, t0) = parse_obj_positions_and_tris(path)?;
     let mut tris: Vec<Triangle> = Vec::with_capacity(t0.len());
     for [i0, i1, i2] in t0 {
-        let e1 = p0[i1] - p0[i0];
-        let e2 = p0[i2] - p0[i0];
-        tris.push(Triangle {
-            v0_0: p0[i0], v1_0: p0[i1], v2_0: p0[i2],
-            v0_1: p0[i0], v1_1: p0[i1], v2_1: p0[i2],
-            e1_0: e1, e2_0: e2, e1_1: e1, e2_1: e2,
-            mat_id,
-        });
+        tris.push(Triangle::new_static(p0[i0], p0[i1], p0[i2], mat_id));
     }
     Ok(tris)
 }

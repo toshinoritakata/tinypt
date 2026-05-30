@@ -27,7 +27,7 @@ use quick_xml::reader::Reader;
 
 use crate::config::RenderConfig;
 use crate::env::EnvMap;
-use crate::geometry::Sphere;
+use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
 use crate::obj_loader::load_obj_triangles;
@@ -340,7 +340,9 @@ fn parse_lookat(el: &Element) -> Option<(Vec3, Vec3, Vec3)> {
     Some((origin, target, up))
 }
 
-/// `shape` を World へ追加する（sphere / obj メッシュ）。
+/// `shape` を World へ追加する。
+/// `sphere` は解析的プリミティブ、`obj` / `rectangle` / `cube` / `disk` は
+/// 三角形メッシュ + インスタンス（`to_world` 変換）として配置する。
 fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<Material>) {
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
     let mat = if let Some(em) = el.child_tag("emitter") {
@@ -353,13 +355,21 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
     };
     let mat_id = mats.len();
 
-    match el.typ() {
+    // メッシュ系シェープの三角形（正準形オブジェクト空間）。
+    let tris: Vec<Triangle> = match el.typ() {
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
             mats.push(mat);
             world.spheres.push(Sphere { c: center, r: radius, mat_id });
+            return;
         }
+        // Mitsuba 正準形: 中心原点・法線 +Z・[-1,1]² の正方形
+        "rectangle" => unit_rectangle_tris(mat_id),
+        // Mitsuba 正準形: [-1,1]³ の立方体
+        "cube" => unit_cube_tris(mat_id),
+        // Mitsuba 正準形: z=0 平面の半径 1 の円盤
+        "disk" => unit_disk_tris(mat_id),
         "obj" => {
             let filename = match el.string("filename") {
                 Some(f) => f,
@@ -369,26 +379,87 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
                 }
             };
             let resolved = resolve_path(base_dir, filename);
-            let tris = match load_obj_triangles(resolved.to_string_lossy().as_ref(), mat_id) {
+            match load_obj_triangles(resolved.to_string_lossy().as_ref(), mat_id) {
                 Ok(t) => t,
                 Err(e) => {
                     warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
                     return;
                 }
-            };
-            // to_world 変換（なければ恒等）でインスタンス配置する。
-            let xform = el
-                .child_tag("transform")
-                .map(parse_transform)
-                .unwrap_or_else(Transform::identity);
-
-            mats.push(mat);
-            let mesh_id = world.meshes.len();
-            world.meshes.push(Mesh::new(tris));
-            world.instances.push(Instance { mesh_id, xform, mat_override: None });
+            }
         }
-        other => warn(&format!("unsupported shape type '{}', skipped", other)),
+        other => {
+            warn(&format!("unsupported shape type '{}', skipped", other));
+            return;
+        }
+    };
+
+    // to_world 変換（なければ恒等）でメッシュをインスタンス配置する。
+    let xform = el
+        .child_tag("transform")
+        .map(parse_transform)
+        .unwrap_or_else(Transform::identity);
+    mats.push(mat);
+    let mesh_id = world.meshes.len();
+    world.meshes.push(Mesh::new(tris));
+    world.instances.push(Instance { mesh_id, xform, mat_override: None });
+}
+
+/// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
+fn unit_rectangle_tris(mat_id: usize) -> Vec<Triangle> {
+    let a = Vec3::new(-1.0, -1.0, 0.0);
+    let b = Vec3::new(1.0, -1.0, 0.0);
+    let c = Vec3::new(1.0, 1.0, 0.0);
+    let d = Vec3::new(-1.0, 1.0, 0.0);
+    vec![
+        Triangle::new_static(a, b, c, mat_id),
+        Triangle::new_static(a, c, d, mat_id),
+    ]
+}
+
+/// Mitsuba `cube`: [-1,1]³ の立方体（12 三角形）。
+fn unit_cube_tris(mat_id: usize) -> Vec<Triangle> {
+    let v = [
+        Vec3::new(-1.0, -1.0, -1.0),
+        Vec3::new(1.0, -1.0, -1.0),
+        Vec3::new(1.0, 1.0, -1.0),
+        Vec3::new(-1.0, 1.0, -1.0),
+        Vec3::new(-1.0, -1.0, 1.0),
+        Vec3::new(1.0, -1.0, 1.0),
+        Vec3::new(1.0, 1.0, 1.0),
+        Vec3::new(-1.0, 1.0, 1.0),
+    ];
+    let quads = [
+        [0, 1, 2, 3],
+        [4, 7, 6, 5],
+        [0, 4, 5, 1],
+        [1, 5, 6, 2],
+        [2, 6, 7, 3],
+        [3, 7, 4, 0],
+    ];
+    let mut tris = Vec::with_capacity(12);
+    for q in quads {
+        tris.push(Triangle::new_static(v[q[0]], v[q[1]], v[q[2]], mat_id));
+        tris.push(Triangle::new_static(v[q[0]], v[q[2]], v[q[3]], mat_id));
     }
+    tris
+}
+
+/// Mitsuba `disk`: z=0 平面の半径 1 の円盤（ファン三角形化）。
+fn unit_disk_tris(mat_id: usize) -> Vec<Triangle> {
+    let n = 64;
+    let center = Vec3::new(0.0, 0.0, 0.0);
+    let mut tris = Vec::with_capacity(n);
+    for i in 0..n {
+        let a0 = std::f64::consts::TAU * (i as f64) / (n as f64);
+        let a1 = std::f64::consts::TAU * ((i + 1) as f64) / (n as f64);
+        tris.push(Triangle::new_static(
+            center,
+            Vec3::new(a0.cos(), a0.sin(), 0.0),
+            Vec3::new(a1.cos(), a1.sin(), 0.0),
+            mat_id,
+        ));
+    }
+    tris
 }
 
 /// ファイル名を XML のあるディレクトリ基準で解決する（絶対パスはそのまま）。
@@ -635,6 +706,22 @@ mod tests {
         assert_eq!(config.spp, 256);
         assert_eq!(config.max_bounces, 12);
         assert_eq!(config.rr_start, 5);
+    }
+
+    #[test]
+    fn parses_parametric_shapes() {
+        let scene = load(
+            r#"<scene version="3.0.0">
+              <shape type="rectangle"><bsdf type="diffuse"/></shape>
+              <shape type="cube"><bsdf type="diffuse"/></shape>
+              <shape type="disk"><bsdf type="diffuse"/></shape>
+            </scene>"#,
+        );
+        assert_eq!(scene.world.meshes.len(), 3);
+        assert_eq!(scene.world.instances.len(), 3);
+        assert_eq!(scene.world.meshes[0].tris.len(), 2); // rectangle
+        assert_eq!(scene.world.meshes[1].tris.len(), 12); // cube
+        assert_eq!(scene.world.meshes[2].tris.len(), 64); // disk
     }
 
     #[test]

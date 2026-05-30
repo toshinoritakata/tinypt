@@ -195,6 +195,19 @@ impl Sphere {
 }
 
 impl Triangle {
+    /// 静止三角形（モーションブラーなし）を 3 頂点から構築する。
+    /// シャッター開/閉に同一頂点を設定し、エッジを事前計算する。
+    pub fn new_static(v0: Vec3, v1: Vec3, v2: Vec3, mat_id: usize) -> Self {
+        let e1 = v1 - v0;
+        let e2 = v2 - v0;
+        Self {
+            v0_0: v0, v1_0: v1, v2_0: v2,
+            v0_1: v0, v1_1: v1, v2_1: v2,
+            e1_0: e1, e2_0: e2, e1_1: e1, e2_1: e2,
+            mat_id,
+        }
+    }
+
     /// シャッター時間 `time` での補間頂点を返す（モーションブラー用）。
     pub fn vertices_at(&self, time: f64) -> (Vec3, Vec3, Vec3) {
         let t = time;
