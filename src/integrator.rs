@@ -14,7 +14,7 @@
 use crate::constants::path::{FIREFLY_CLAMP, MAX_BOUNCES, RR_START_BOUNCE};
 use crate::constants::{RAY_EPSILON, RAY_T_MAX};
 use crate::env::EnvMap;
-use crate::material::{ggx_eval, ggx_pdf, Material};
+use crate::material::{BsdfSample, Material};
 use crate::math::{Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
@@ -78,76 +78,40 @@ pub fn radiance(world: &World, mats: &[Material], env: Option<&EnvMap>, ray: Ray
             path_throughput = path_throughput / p;
         }
 
-        // マテリアルに応じた散乱処理
-        match mats[hit.mat_id] {
-            Material::DiffuseLight { emit } => {
-                // 発光体に命中: 放射輝度を蓄積しパス終了
-                let contrib = path_throughput.hadamard(emit).clamp_luminance(FIREFLY_CLAMP);
+        let mat = mats[hit.mat_id];
+
+        // 発光体に命中: 放射輝度を蓄積しパス終了
+        if let Some(emit) = mat.emitted() {
+            let contrib = path_throughput.hadamard(emit).clamp_luminance(FIREFLY_CLAMP);
+            accumulated_radiance = accumulated_radiance + contrib;
+            break;
+        }
+
+        let n = oriented_normal(hit.n, ray.d);
+
+        // NEE（Next Event Estimation）はデルタ散乱マテリアルでは行わない
+        if !mat.is_delta() {
+            // NEE: Environment map
+            if let Some(env_map) = env {
+                let contrib = nee_environment(world, env_map, &mat, path_throughput, hit.p, n, ray, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
-                break;
             }
-            Material::Lambert { albedo: _ } | Material::Subsurface { albedo: _, .. } => {
-                // 拡散面 / サブサーフェス: NEE + コサイン重み付き半球サンプリング
-                let n = oriented_normal(hit.n, ray.d);
-
-                // NEE: Environment map
-                if let Some(env_map) = env {
-                    let contrib = nee_environment(world, env_map, &mats[hit.mat_id], path_throughput, hit.p, n, ray, rng);
-                    accumulated_radiance = accumulated_radiance + contrib;
-                }
-
-                // NEE: Area lights
-                if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
-                    let contrib = nee_area_light(world, &mats[hit.mat_id], path_throughput, hit.p, n, ray, &ls, rng);
-                    accumulated_radiance = accumulated_radiance + contrib;
-                }
-
-                if let Some((scattered_ray, attenuation)) = mats[hit.mat_id].scatter(&ray, &hit, rng) {
-                    let cos = n.dot(scattered_ray.d).max(0.0);
-                    last_bsdf_pdf = cos / std::f64::consts::PI;
-                    last_non_delta = true;
-                    path_throughput = path_throughput.hadamard(attenuation);
-                    ray = scattered_ray;
-                } else {
-                    break;
-                }
+            // NEE: Area lights
+            if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
+                let contrib = nee_area_light(world, &mat, path_throughput, hit.p, n, ray, &ls);
+                accumulated_radiance = accumulated_radiance + contrib;
             }
-            Material::Ggx { albedo: _, alpha } => {
-                // GGX マイクロファセットモデル: NEE + VNDF サンプリング
-                let n = oriented_normal(hit.n, ray.d);
+        }
 
-                // NEE: Environment map
-                if let Some(env_map) = env {
-                    let contrib = nee_environment(world, env_map, &mats[hit.mat_id], path_throughput, hit.p, n, ray, rng);
-                    accumulated_radiance = accumulated_radiance + contrib;
-                }
-
-                // NEE: Area lights
-                if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
-                    let contrib = nee_area_light(world, &mats[hit.mat_id], path_throughput, hit.p, n, ray, &ls, rng);
-                    accumulated_radiance = accumulated_radiance + contrib;
-                }
-
-                if let Some((scattered_ray, attenuation)) = mats[hit.mat_id].scatter(&ray, &hit, rng) {
-                    let wo = (-ray.d).norm();
-                    last_bsdf_pdf = ggx_pdf(alpha.max(1e-3), n, wo, scattered_ray.d);
-                    last_non_delta = true;
-                    path_throughput = path_throughput.hadamard(attenuation);
-                    ray = scattered_ray;
-                } else {
-                    break;
-                }
+        // BSDF サンプリング: 散乱レイ・スループット重み・PDF を BSDF から取得
+        match mat.sample(&ray, &hit, rng) {
+            Some(BsdfSample { scattered, weight, pdf, is_delta }) => {
+                last_bsdf_pdf = pdf;
+                last_non_delta = !is_delta;
+                path_throughput = path_throughput.hadamard(weight);
+                ray = scattered;
             }
-            _ => { // デルタ散乱マテリアル（Metal / Dielectric）: NEE 不要、BSDF のみ
-                if let Some((scattered_ray, attenuation)) = mats[hit.mat_id].scatter(&ray, &hit, rng) {
-                    last_non_delta = false;
-                    last_bsdf_pdf = 0.0;
-                    path_throughput = path_throughput.hadamard(attenuation);
-                    ray = scattered_ray;
-                } else {
-                    break;
-                }
-            }
+            None => break,
         }
     }
 
@@ -186,7 +150,7 @@ fn nee_environment(
         return Color::new(0.0, 0.0, 0.0);
     }
 
-    let (f, pdf_bsdf) = bsdf_eval_pdf(mat, n, (-ray.d).norm(), wi);
+    let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), wi, n);
     let w = mis_weight(pdf_env, pdf_bsdf);
     path_throughput.hadamard(f).hadamard(li) * (cos * w / pdf_env)
 }
@@ -203,7 +167,6 @@ fn nee_area_light(
     n: Vec3,
     ray: Ray,
     ls: &LightSample,
-    _rng: &mut Rng,
 ) -> Color {
     let to_light = ls.position - hit_p;
     let dist2 = to_light.dot(to_light);
@@ -224,7 +187,7 @@ fn nee_area_light(
         return Color::new(0.0, 0.0, 0.0);
     }
 
-    let (f, pdf_bsdf) = bsdf_eval_pdf(mat, n, (-ray.d).norm(), wi);
+    let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), wi, n);
     if ls.pdf <= 0.0 {
         return Color::new(0.0, 0.0, 0.0);
     }
@@ -243,26 +206,4 @@ fn mis_weight(pdf_a: f64, pdf_b: f64) -> f64 {
     let a2 = pdf_a * pdf_a;
     let b2 = pdf_b * pdf_b;
     if a2 + b2 > 0.0 { a2 / (a2 + b2) } else { 0.0 }
-}
-
-/// マテリアルの BSDF 値と PDF を同時に評価する（NEE での MIS 計算用）。
-fn bsdf_eval_pdf(mat: &Material, n: Vec3, wo: Vec3, wi: Vec3) -> (Color, f64) {
-    match *mat {
-        Material::Lambert { albedo } | Material::Subsurface { albedo, .. } => {
-            let cos = n.dot(wi).max(0.0);
-            if cos <= 0.0 {
-                (Color::new(0.0, 0.0, 0.0), 0.0)
-            } else {
-                let f = albedo * (1.0 / std::f64::consts::PI);
-                let pdf = cos / std::f64::consts::PI;
-                (f, pdf)
-            }
-        }
-        Material::Ggx { albedo, alpha } => {
-            let f = ggx_eval(albedo, alpha.max(1e-3), n, wo, wi);
-            let pdf = ggx_pdf(alpha.max(1e-3), n, wo, wi);
-            (f, pdf)
-        }
-        _ => (Color::new(0.0, 0.0, 0.0), 0.0),
-    }
 }
