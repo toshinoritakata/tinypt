@@ -80,4 +80,8 @@
     </transform>
     <emitter type="area"><rgb name="radiance" value="4.6, 3.9, 2.0"/></emitter>
   </shape>
+
+  <!-- 背景を黒に（前面の開口から手続き的な空が差し込まないように）。
+       これが無いと env 未指定時のフォールバック sky() が環境光として漏れ込む。 -->
+  <emitter type="constant"><rgb name="radiance" value="0, 0, 0"/></emitter>
 </scene>
