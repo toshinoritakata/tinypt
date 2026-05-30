@@ -12,6 +12,7 @@ crossbeam = "0.8"
 crossbeam-channel = "0.5"
 image = { version = "0.25", features = ["exr"] }
 exr = "1.7"
+quick-xml = "0.37"
 oidn = { version = "2.3", optional = true }
 
 [profile.release]

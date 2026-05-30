@@ -21,6 +21,8 @@ pub struct RenderConfig {
     pub output_path: String,
     /// 環境マップのファイルパス（HDR/EXR）
     pub env_map_path: Option<String>,
+    /// シーンファイルのパス（Mitsuba XML サブセット。None ならハードコードのデフォルトシーン）
+    pub scene_path: Option<String>,
     /// Intel OIDN デノイズの有効/無効
     pub denoise_enabled: bool,
     /// 適応的サンプリングの有効/無効
@@ -71,6 +73,7 @@ impl RenderConfig {
             scene_hash: 0x4859503000000001u64, // 'HYP0' prefix
             output_path: "hyperion_min.ppm".to_string(),
             env_map_path: None,
+            scene_path: None,
             denoise_enabled: true,
             adaptive_enabled: false,
             adaptive_min_spp: 8,

@@ -335,6 +335,7 @@ mod tests {
             scene_hash: 0,
             output_path: String::new(),
             env_map_path: None,
+            scene_path: None,
             denoise_enabled: false,
             adaptive_enabled: false,
             adaptive_min_spp: 1,

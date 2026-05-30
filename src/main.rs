@@ -3,7 +3,7 @@
 //! コマンドライン引数を解析し、シーン構築 → レンダリング → 後処理 → 画像出力を実行する。
 //! 対応フォーマット: PPM / HDR (Radiance) / EXR (ACEScg)
 
-use tinypt::{build_scene, ckpt_path, denoise, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
+use tinypt::{build_scene, ckpt_path, denoise, load_scene, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
 
 /// コマンドライン引数を解析して `RenderConfig` に反映する。
 fn parse_args(config: &mut RenderConfig) {
@@ -25,6 +25,11 @@ fn parse_args(config: &mut RenderConfig) {
             "--env" => {
                 if let Some(v) = args.next() {
                     config.env_map_path = Some(v);
+                }
+            }
+            "--scene" => {
+                if let Some(v) = args.next() {
+                    config.scene_path = Some(v);
                 }
             }
             "--no-env" => {
@@ -95,7 +100,11 @@ fn main() -> std::io::Result<()> {
     let ckpt_file = ckpt_path(config.scene_hash);
 
     // 2. シーン構築（カメラ・ジオメトリ・マテリアル・環境マップ）
-    let scene = build_scene(&config);
+    //    --scene 指定時は Mitsuba XML サブセットから、なければハードコードのデフォルトシーン。
+    let scene = match &config.scene_path {
+        Some(path) => load_scene(path, &config)?,
+        None => build_scene(&config),
+    };
 
     // 3. レンダリング実行（マルチスレッド・タイルベース）
     let output = render(&scene, &config, &ckpt_file)?;

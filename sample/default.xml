@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- tinypt のハードコードされたデフォルトシーン (src/scene.rs) を Mitsuba XML サブセットで再現したもの。
+     shape の順序はデフォルトシーンと一致させてあり、同一の出力が得られる。
+     使い方: tinypt --scene sample/default.xml -o out.ppm -->
+<scene version="3.0.0">
+  <sensor type="perspective">
+    <float name="fov" value="40"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0, 1.2, 4" target="0, 0.5, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 地面（大球） -->
+  <shape type="sphere">
+    <point name="center" x="0" y="-1000" z="0"/>
+    <float name="radius" value="1000"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.5, 0.5, 0.5"/></bsdf>
+  </shape>
+
+  <!-- Lambert（左端） -->
+  <shape type="sphere">
+    <point name="center" x="-1.8" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.8, 0.3, 0.3"/></bsdf>
+  </shape>
+
+  <!-- Metal（左中） -->
+  <shape type="sphere">
+    <point name="center" x="-0.6" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="conductor"><srgb name="specular_reflectance" value="0.8, 0.8, 0.8"/></bsdf>
+  </shape>
+
+  <!-- GGX（右中）— 粗い金属（ゴールド、α=0.25） -->
+  <shape type="sphere">
+    <point name="center" x="0.6" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="roughconductor">
+      <string name="distribution" value="ggx"/>
+      <float name="alpha" value="0.25"/>
+      <srgb name="specular_reflectance" value="0.95, 0.78, 0.35"/>
+    </bsdf>
+  </shape>
+
+  <!-- Glass（右端） -->
+  <shape type="sphere">
+    <point name="center" x="1.8" y="0.5" z="0"/>
+    <float name="radius" value="0.5"/>
+    <bsdf type="dielectric">
+      <float name="int_ior" value="1.5"/>
+      <rgb name="absorption" value="0.02, 0.05, 0.02"/>
+    </bsdf>
+  </shape>
+
+  <!-- 発光球（上方） -->
+  <shape type="sphere">
+    <point name="center" x="0" y="3" z="-1"/>
+    <float name="radius" value="0.8"/>
+    <emitter type="area"><rgb name="radiance" value="8, 7, 5"/></emitter>
+  </shape>
+</scene>
