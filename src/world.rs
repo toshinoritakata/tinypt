@@ -122,25 +122,27 @@ impl World {
 
     /// 発光マテリアルからライトサンプリング構造（CDF）を構築する。
     /// 各ライトの重み = 表面積 × 放射輝度の輝度値。
+    ///
+    /// シェープ別の面積計算は [`Light::area`] に委譲する（[`Self::sample_light`] と共有）。
     pub fn build_lights(&mut self, mats: &[Material]) {
-        self.lights.clear();
-        self.light_cdf.clear();
-        self.light_total = 0.0;
+        let mut lights: Vec<LightInfo> = Vec::new();
+        let mut cdf: Vec<f64> = Vec::new();
+        let mut total = 0.0;
+
+        let mut add = |light: Light, emit: Color, area: f64| {
+            let weight = area * emit.luminance();
+            if weight > 0.0 {
+                total += weight;
+                lights.push(LightInfo { light, emit, weight });
+                cdf.push(total);
+            }
+        };
 
         // Spheres
         for (idx, s) in self.spheres.iter().enumerate() {
             if let Some(emit) = material_emit(mats.get(s.mat_id)) {
-                let area = 4.0 * std::f64::consts::PI * s.r * s.r;
-                let weight = area * emit.luminance();
-                if weight > 0.0 {
-                    self.light_total += weight;
-                    self.lights.push(LightInfo {
-                        light: Light::Sphere { idx },
-                        emit,
-                        weight,
-                    });
-                    self.light_cdf.push(self.light_total);
-                }
+                let light = Light::Sphere { idx };
+                add(light, emit, light.area(self, 0.5));
             }
         }
 
@@ -153,28 +155,15 @@ impl World {
             for (tri_id, tri) in mesh.tris.iter().enumerate() {
                 let mat_id = inst.mat_override.unwrap_or(tri.mat_id);
                 if let Some(emit) = material_emit(mats.get(mat_id)) {
-                    let (v0, v1, v2) = tri.vertices_at(0.5);
-                    let v0w = inst.xform.apply_point(v0);
-                    let v1w = inst.xform.apply_point(v1);
-                    let v2w = inst.xform.apply_point(v2);
-                    let area = 0.5 * (v1w - v0w).cross(v2w - v0w).len();
-                    let weight = area * emit.luminance();
-                    if weight > 0.0 {
-                        self.light_total += weight;
-                        self.lights.push(LightInfo {
-                            light: Light::Triangle {
-                                mesh_id: inst.mesh_id,
-                                tri_id,
-                                inst_id,
-                            },
-                            emit,
-                            weight,
-                        });
-                        self.light_cdf.push(self.light_total);
-                    }
+                    let light = Light::Triangle { mesh_id: inst.mesh_id, tri_id, inst_id };
+                    add(light, emit, light.area(self, 0.5));
                 }
             }
         }
+
+        self.lights = lights;
+        self.light_cdf = cdf;
+        self.light_total = total;
     }
 
     /// CDF を使ってライトを重点的にサンプリングし、位置・法線・放射輝度・PDF を返す。
@@ -188,42 +177,8 @@ impl World {
         let info = self.lights[idx];
         let pdf_select = info.weight / self.light_total;
 
-        let (pos, normal, area) = match info.light {
-            Light::Sphere { idx } => {
-                let s = self.spheres.get(idx)?;
-                let u = rng.next_f64();
-                let v = rng.next_f64();
-                let z = 1.0 - 2.0 * u;
-                let r = (1.0 - z * z).max(0.0).sqrt();
-                let phi = std::f64::consts::TAU * v;
-                let dir = Vec3::new(r * phi.cos(), z, r * phi.sin());
-                let pos = s.c + dir * s.r;
-                let area = 4.0 * std::f64::consts::PI * s.r * s.r;
-                (pos, dir, area)
-            }
-            Light::Triangle { mesh_id, tri_id, inst_id } => {
-                let mesh = self.meshes.get(mesh_id)?;
-                let tri = mesh.tris.get(tri_id)?;
-                let inst = self.instances.get(inst_id)?;
-                let (v0, v1, v2) = tri.vertices_at(time);
-                let v0w = inst.xform.apply_point(v0);
-                let v1w = inst.xform.apply_point(v1);
-                let v2w = inst.xform.apply_point(v2);
-
-                let u = rng.next_f64();
-                let v = rng.next_f64();
-                let su = u.sqrt();
-                let b0 = 1.0 - su;
-                let b1 = v * su;
-                let b2 = 1.0 - b0 - b1;
-                let pos = v0w * b0 + v1w * b1 + v2w * b2;
-
-                let n = (v1w - v0w).cross(v2w - v0w);
-                let area = 0.5 * n.len();
-                let normal = if area > 0.0 { n / (2.0 * area) } else { Vec3::new(0.0, 1.0, 0.0) };
-                (pos, normal, area)
-            }
-        };
+        // シェープ別の表面サンプリングは Light に委譲（build_lights と共有）
+        let (pos, normal, area) = info.light.sample_surface(self, time, rng)?;
 
         if area <= 0.0 {
             return None;
@@ -255,10 +210,85 @@ impl World {
 }
 
 #[derive(Clone, Copy)]
-/// ライトが参照するジオメトリの種類。
+/// ライトが参照するジオメトリの種類（World 内のインデックス参照）。
+///
+/// シェープ別の発光面の幾何（面積・表面サンプリング）はこの型のメソッドに集約され、
+/// CDF 構築（[`World::build_lights`]）とライトサンプリング（[`World::sample_light`]）の
+/// 両方から共有される。新しい発光シェープの追加はここに 1 アームを足すだけで済む。
 pub enum Light {
     Sphere { idx: usize },
     Triangle { mesh_id: usize, tri_id: usize, inst_id: usize },
+}
+
+impl Light {
+    /// 発光面の表面積を返す（モーションブラー対応のため `time` に依存）。
+    /// ジオメトリが見つからない場合は 0。
+    fn area(&self, world: &World, time: f64) -> f64 {
+        match *self {
+            Light::Sphere { idx } => {
+                world.spheres.get(idx).map_or(0.0, |s| 4.0 * std::f64::consts::PI * s.r * s.r)
+            }
+            Light::Triangle { mesh_id, tri_id, inst_id } => {
+                match tri_world_verts(world, mesh_id, tri_id, inst_id, time) {
+                    Some((v0, v1, v2)) => 0.5 * (v1 - v0).cross(v2 - v0).len(),
+                    None => 0.0,
+                }
+            }
+        }
+    }
+
+    /// 発光面を一様サンプリングし、`(位置, 法線, 面積)` を返す。
+    /// ジオメトリが見つからない場合は `None`。
+    fn sample_surface(&self, world: &World, time: f64, rng: &mut Rng) -> Option<(Vec3, Vec3, f64)> {
+        match *self {
+            Light::Sphere { idx } => {
+                let s = world.spheres.get(idx)?;
+                let u = rng.next_f64();
+                let v = rng.next_f64();
+                let z = 1.0 - 2.0 * u;
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let phi = std::f64::consts::TAU * v;
+                let dir = Vec3::new(r * phi.cos(), z, r * phi.sin());
+                let pos = s.c + dir * s.r;
+                let area = 4.0 * std::f64::consts::PI * s.r * s.r;
+                Some((pos, dir, area))
+            }
+            Light::Triangle { mesh_id, tri_id, inst_id } => {
+                let (v0w, v1w, v2w) = tri_world_verts(world, mesh_id, tri_id, inst_id, time)?;
+                let u = rng.next_f64();
+                let v = rng.next_f64();
+                let su = u.sqrt();
+                let b0 = 1.0 - su;
+                let b1 = v * su;
+                let b2 = 1.0 - b0 - b1;
+                let pos = v0w * b0 + v1w * b1 + v2w * b2;
+
+                let n = (v1w - v0w).cross(v2w - v0w);
+                let area = 0.5 * n.len();
+                let normal = if area > 0.0 { n / (2.0 * area) } else { Vec3::new(0.0, 1.0, 0.0) };
+                Some((pos, normal, area))
+            }
+        }
+    }
+}
+
+/// 三角形のワールド空間頂点を `time` における（インスタンス変換適用後の）位置で返す。
+fn tri_world_verts(
+    world: &World,
+    mesh_id: usize,
+    tri_id: usize,
+    inst_id: usize,
+    time: f64,
+) -> Option<(Vec3, Vec3, Vec3)> {
+    let mesh = world.meshes.get(mesh_id)?;
+    let tri = mesh.tris.get(tri_id)?;
+    let inst = world.instances.get(inst_id)?;
+    let (v0, v1, v2) = tri.vertices_at(time);
+    Some((
+        inst.xform.apply_point(v0),
+        inst.xform.apply_point(v1),
+        inst.xform.apply_point(v2),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -303,4 +333,49 @@ fn cdf_search(cdf: &[f64], x: f64) -> usize {
         }
     }
     lo
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Sphere;
+
+    fn emissive_sphere_world(c: Vec3, r: f64) -> World {
+        let mut world = World::new();
+        let mats = vec![Material::DiffuseLight { emit: Color::new(3.0, 4.0, 5.0) }];
+        world.spheres.push(Sphere { c, r, mat_id: 0 });
+        world.build_lights(&mats);
+        world
+    }
+
+    /// build_lights の重み = 面積 × 輝度（Light::area と共有された面積計算）。
+    #[test]
+    fn sphere_light_weight_is_area_times_luminance() {
+        let r = 2.0;
+        let world = emissive_sphere_world(Vec3::new(0.0, 0.0, 0.0), r);
+        assert_eq!(world.lights.len(), 1);
+        let area = 4.0 * std::f64::consts::PI * r * r;
+        let lum = Color::new(3.0, 4.0, 5.0).luminance();
+        assert!((world.light_total - area * lum).abs() < 1e-9);
+    }
+
+    /// sample_light のサンプルは球面上にあり、法線は外向き、PDF は有限正値。
+    #[test]
+    fn sphere_light_samples_lie_on_surface() {
+        let c = Vec3::new(0.0, 0.0, 0.0);
+        let r = 1.5;
+        let world = emissive_sphere_world(c, r);
+        let mut rng = Rng::new(5);
+        let p = Vec3::new(5.0, 0.0, 0.0);
+        let mut got = 0;
+        for _ in 0..2000 {
+            if let Some(ls) = world.sample_light(&mut rng, 0.0, p) {
+                got += 1;
+                assert!(((ls.position - c).len() - r).abs() < 1e-9, "off surface");
+                assert!(ls.normal.dot(ls.position - c) > 0.0, "normal not outward");
+                assert!(ls.pdf > 0.0 && ls.pdf.is_finite(), "bad pdf");
+            }
+        }
+        assert!(got > 0, "no valid light samples");
+    }
 }

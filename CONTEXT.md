@@ -19,8 +19,12 @@ A BSDF whose scattering is a Dirac distribution — perfect mirror (Metal) or re
 _Avoid_: specular (ambiguous — GGX is "specular" but not delta), singular.
 
 **Emitter / emitted radiance**:
-A surface that contributes light. Queried via `Material::emitted() -> Option<Color>`; only `DiffuseLight` returns `Some`.
+A surface that contributes light, from the *material* side. Queried via `Material::emitted() -> Option<Color>`; only `DiffuseLight` returns `Some`. Distinct from a **Light**, which is the *geometry* side.
 _Avoid_: light material, glow.
+
+**Light**:
+A reference to an emitting primitive for sampling, from the *geometry* side: `Light::Sphere { idx }` or `Light::Triangle { mesh_id, tri_id, inst_id }` indexing into the `World`. Owns the per-shape geometry of emission — `area` and `sample_surface` — shared by CDF construction (`build_lights`) and light sampling (`sample_light`). A new emitting shape is one new arm here.
+_Avoid_: emitter (reserved for the material side), light source.
 
 ### Estimation
 
