@@ -37,3 +37,11 @@ participating medium; our conductors use `albedo` as Schlick F0 where
 Mitsuba defaults to complex IOR (read `reflectance`/`specular_reflectance`
 instead); our `Subsurface` is a simplified hack, not Mitsuba's BSSRDF;
 spectral inputs are read as RGB triples.
+
+A loaded scene with no environment emitter defaults to a **black**
+background (Mitsuba semantics), deliberately *not* the procedural `sky()`
+gradient the built-in `build_scene` falls back to — otherwise the sky would
+leak in as ambient light through any open/interior scene (e.g. the Cornell
+box). The parametric Mitsuba shapes (`rectangle`, `cube`, `disk`) are
+generated as canonical-form triangle meshes placed by a `to_world`
+transform, reusing the mesh+instance path.

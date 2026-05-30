@@ -20,3 +20,7 @@ already captured by `OutputSettings { exposure, tonemap }` from the
 
 If `render` is later decomposed so a sub-function reads only a coherent subset
 of fields, revisit this — the bundle would then earn its keep.
+
+**Update:** `scene_path`, `max_bounces`, and `rr_start` have since been added
+(now 20 fields). They were added flat, consistent with this decision; the
+struct grew but was not split.

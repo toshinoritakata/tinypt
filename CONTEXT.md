@@ -48,7 +48,10 @@ The Mitsuba term for the camera, mapped to `Camera`. A `perspective` sensor carr
 _Avoid_: viewpoint, eye.
 
 **Shape**:
-The Mitsuba term for a renderable primitive (`sphere`, `obj` mesh), mapped to our `Sphere`/`Mesh`+`Instance`. A shape carries a child `bsdf` and optionally a child `area` `emitter`.
+The Mitsuba term for a renderable primitive, mapped onto our geometry. `sphere` becomes a `Sphere`; `obj` and the parametric shapes `rectangle` / `cube` / `disk` become a `Mesh` + `Instance` placed by a `to_world` `Transform`. The parametric shapes are generated in Mitsuba's canonical form (rectangle: XY `[-1,1]²`; cube: `[-1,1]³`; disk: unit disk at z=0). A shape carries a child `bsdf` and optionally a child `area` `emitter`.
+
+**Transform**:
+An object→world affine transform (`Transform`): a general linear part (`Mat3`) plus a translation, with the inverse and inverse-transpose precomputed for ray and normal transforms. Composed from Mitsuba `translate` / `rotate` (any axis) / `scale` (non-uniform) / `matrix` operations; handles arbitrary rotation, non-uniform scale, and shear.
 
 ## Conventions
 
@@ -56,10 +59,8 @@ The Mitsuba term for a renderable primitive (`sphere`, `obj` mesh), mapped to ou
 - Normal orientation (the entering/exiting decision) is handled **inside** the BSDF, not by the integrator.
 - `wo` is the outgoing direction `(-ray.d).norm()`, pointing back toward where the ray came from.
 - In scene files, `<rgb>` colour values are **linear** (read straight into `Color`); `<srgb>` values are **sRGB** (gamma-decoded via `from_srgb`). A scene file uses `<srgb>` to reproduce a `from_srgb` albedo and `<rgb>` for scene-referred radiance.
-
-- `eval` returns the BSDF value `f` **without** the cosine term; the cosine is folded into `BsdfSample.weight` and applied explicitly by the integrator in NEE.
-- Normal orientation (the entering/exiting decision) is handled **inside** the BSDF, not by the integrator.
-- `wo` is the outgoing direction `(-ray.d).norm()`, pointing back toward where the ray came from.
+- **Colour encoding is symmetric**: input decodes with the exact piecewise sRGB curve (`srgb_to_linear`) and PPM output encodes with its exact inverse (`linear_to_srgb`) — not a `1/2.2` approximation. HDR/EXR stay linear.
+- **Background**: a scene file with no environment emitter defaults to a **black** background (Mitsuba semantics). The built-in default scene (via `build_scene`) instead falls back to the procedural `sky()` gradient.
 
 ## Example dialogue
 
