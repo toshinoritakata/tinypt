@@ -17,6 +17,8 @@
 //! - 色: `<rgb>` はリニア、`<srgb>` は sRGB（ガンマ展開）。
 //! - 未対応の要素・型は警告してスキップ／フォールバック（寛容）。必須フィールド欠落のみ既定値。
 //! - スペクトルは扱わず RGB トリプルとして読む。
+//! - 環境 emitter が無ければ背景は黒（Mitsuba 準拠）。組み込みデフォルトシーンの
+//!   手続き的な `sky()` フォールバックは適用しない。
 
 use std::collections::HashMap;
 use std::io;
@@ -210,6 +212,10 @@ pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
             aspect,
         )
     });
+
+    // Mitsuba 準拠: 環境 emitter が無ければ背景は黒。
+    // （未指定だと integrator が手続き的な sky() を返し、開いたシーンに環境光が漏れ込むため）
+    let env = Some(env.unwrap_or_else(|| EnvMap::constant(Color::new(0.0, 0.0, 0.0))));
 
     world.build_lights(&mats);
     Ok(Scene { cam, world, mats, env })
@@ -773,6 +779,19 @@ mod tests {
         // 定数なので方向によらず同じ放射輝度
         assert!((a.r() - 0.1).abs() < 1e-9 && (a.g() - 0.2).abs() < 1e-9 && (a.b() - 0.4).abs() < 1e-9);
         assert!((b.r() - 0.1).abs() < 1e-9 && (b.b() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_env_emitter_defaults_to_black_background() {
+        let scene = load(
+            r#"<scene version="3.0.0">
+              <shape type="sphere"><bsdf type="diffuse"/></shape>
+            </scene>"#,
+        );
+        // Mitsuba 準拠で背景は黒（sky() フォールバックは使わない）
+        let env = scene.env.expect("env should default to a black constant");
+        let c = env.sample(Vec3::new(0.3, 0.8, 0.1));
+        assert!(c.r() == 0.0 && c.g() == 0.0 && c.b() == 0.0);
     }
 
     #[test]

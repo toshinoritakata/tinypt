@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- tinypt のハードコードされたデフォルトシーン (src/scene.rs) を Mitsuba XML サブセットで再現したもの。
-     shape の順序はデフォルトシーンと一致させてあり、同一の出力が得られる。
+     ジオメトリ・材質・カメラは shape 順序まで一致。ただし背景は黒（Mitsuba 準拠）で、
+     組み込みシーンの手続き的な空グラデーションとは異なる（XML では sky() を表現できないため）。
      使い方: tinypt --scene sample/default.xml -o out.ppm -->
 <scene version="3.0.0">
   <!-- レンダリング設定もシーンファイルから読み込む（CLI 明示値が優先）。 -->

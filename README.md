@@ -119,6 +119,7 @@ tinypt --scene sample/default.xml -o output.ppm
 
 - **色**: `<rgb>` はリニア、`<srgb>` は sRGB (ガンマ展開)。
 - **CLI 優先**: `--spp` 等の明示値はシーンファイルの設定を上書きする。
+- **背景**: 環境 emitter が無ければ黒 (Mitsuba 準拠)。組み込みシーンの手続き的な空は使わない。
 - 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。
 - スペクトルや `<default>`/`$param` 置換、環境マップの `to_world` 回転は未対応。
 
@@ -126,9 +127,10 @@ tinypt --scene sample/default.xml -o output.ppm
 
 | ファイル | 内容 |
 |---|---|
-| `sample/default.xml` | 組み込みデフォルトシーンと同一 (球5個 + 面光源) |
+| `sample/default.xml` | 組み込みデフォルトシーン相当 (球5個 + 面光源、背景は黒) |
 | `sample/mesh.xml` | OBJ メッシュ (立方体) + transform/instance |
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
+| `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
 
 ```bash
 tinypt --scene sample/mesh.xml -o mesh.ppm
