@@ -180,6 +180,15 @@ pub fn srgb_to_linear(c: f64) -> f64 {
         ((c + 0.055) / 1.055).powf(2.4)
     }
 }
+
+/// リニアの 1 成分を sRGB にエンコードする（`srgb_to_linear` の逆関数）。
+pub fn linear_to_srgb(c: f64) -> f64 {
+    if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
 /// ベクトル `v` を法線 `n` に対して反射する: R = v - 2(v·n)n
 pub fn reflect(v: Vec3, n: Vec3) -> Vec3 { v - 2.0 * v.dot(n) * n }
 /// Snell の法則に基づく屈折。全反射の場合は `None` を返す。

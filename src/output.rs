@@ -4,7 +4,7 @@
 //! 蓄積バッファを一度だけ [`resolve_pixels`] でリニア RGB に解決し、フォーマットに
 //! 渡すだけでよい（露出・トーンマップ・色空間・ガンマの判断はフォーマット内部）。
 //!
-//! - **PPM**: 露出補正 → トーンマップ → sRGB ガンマ補正 (γ=2.2) → 8bit
+//! - **PPM**: 露出補正 → トーンマップ → sRGB エンコード（入力デコードと対称） → 8bit
 //! - **HDR**: リニア RGB を RGBE エンコーディングで出力（シーン参照値を保存）
 //! - **EXR**: リニア sRGB → ACEScg 変換後に float32 で出力（シーン参照値を保存）
 //!
@@ -18,7 +18,7 @@ use crate::aces::srgb_to_acescg_pixels;
 use crate::config::Tonemap;
 use crate::exr::write_exr;
 use crate::hdr::write_hdr;
-use crate::math::{clamp, Color};
+use crate::math::{clamp, linear_to_srgb, Color};
 use crate::task::idx;
 
 /// 出力時の色調整設定（LDR フォーマットにのみ適用される）。
@@ -113,9 +113,9 @@ fn tonemap(c: Color, tonemap: Tonemap) -> Color {
     }
 }
 
-/// リニア値を sRGB ガンマ補正（γ=2.2 近似）して 8bit に量子化する。
+/// リニア値を sRGB エンコード（入力の `srgb_to_linear` と対称）して 8bit に量子化する。
 fn to_u8(x: f64) -> u8 {
-    let v = clamp(x, 0.0, 1.0).powf(1.0 / 2.2);
+    let v = linear_to_srgb(clamp(x, 0.0, 1.0));
     (v * 255.0 + 0.5) as u8
 }
 
@@ -159,15 +159,18 @@ mod tests {
         assert!((px[1].r() - 0.0).abs() < 1e-12); // 0/max(1.0) = 0、NaN にならない
     }
 
-    /// PPM は露出 0・トーンマップ None でも sRGB ガンマを適用する。
-    /// リニア 0.5 → 0.5^(1/2.2)·255 ≈ 186。
+    /// PPM は露出 0・トーンマップ None でも sRGB エンコードを適用する。
+    /// 入力の srgb_to_linear と対称な正確な sRGB カーブを使う。
     #[test]
-    fn ppm_applies_srgb_gamma() {
-        let expected = (clamp(0.5_f64, 0.0, 1.0).powf(1.0 / 2.2) * 255.0 + 0.5) as u8;
+    fn ppm_applies_srgb_encode() {
+        let expected = (linear_to_srgb(0.5) * 255.0 + 0.5) as u8;
         assert_eq!(to_u8(0.5), expected);
         assert_eq!(to_u8(0.0), 0);
         assert_eq!(to_u8(1.0), 255);
         assert!(to_u8(2.0) == 255); // クランプ
+        // sRGB は srgb_to_linear の逆: round-trip が一致する
+        let lin = crate::math::srgb_to_linear(0.6);
+        assert!((linear_to_srgb(lin) - 0.6).abs() < 1e-9);
     }
 
     /// HDR 書き出し → 読み戻しでリニア値が概ね保存される（RGBE 往復）。
