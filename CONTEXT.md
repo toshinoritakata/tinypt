@@ -37,7 +37,25 @@ Combining BSDF sampling and light sampling with the power heuristic (β=2). Need
 **Throughput** (`weight`):
 The accumulated attenuation along a path, `f·cos/pdf` folded together. Carried in `BsdfSample.weight` and multiplied into the path's running throughput.
 
+### Scene description
+
+**Scene file**:
+An external description of a `Scene` (shapes, BSDFs, emitters, sensor), loaded as a subset of the Mitsuba renderer's XML format (see [ADR-0002](docs/adr/0002-mitsuba-xml-scene-format.md)). Distinct from the **default scene** built in code by `build_scene`.
+_Avoid_: scene graph, scene format.
+
+**Sensor**:
+The Mitsuba term for the camera, mapped to `Camera`. A `perspective` sensor carries `fov`, a `to_world` transform (via `lookat`), and optional `aperture_radius`/`focus_distance` for depth of field.
+_Avoid_: viewpoint, eye.
+
+**Shape**:
+The Mitsuba term for a renderable primitive (`sphere`, `obj` mesh), mapped to our `Sphere`/`Mesh`+`Instance`. A shape carries a child `bsdf` and optionally a child `area` `emitter`.
+
 ## Conventions
+
+- `eval` returns the BSDF value `f` **without** the cosine term; the cosine is folded into `BsdfSample.weight` and applied explicitly by the integrator in NEE.
+- Normal orientation (the entering/exiting decision) is handled **inside** the BSDF, not by the integrator.
+- `wo` is the outgoing direction `(-ray.d).norm()`, pointing back toward where the ray came from.
+- In scene files, `<rgb>` colour values are **linear** (read straight into `Color`); `<srgb>` values are **sRGB** (gamma-decoded via `from_srgb`). A scene file uses `<srgb>` to reproduce a `from_srgb` albedo and `<rgb>` for scene-referred radiance.
 
 - `eval` returns the BSDF value `f` **without** the cosine term; the cosine is folded into `BsdfSample.weight` and applied explicitly by the integrator in NEE.
 - Normal orientation (the entering/exiting decision) is handled **inside** the BSDF, not by the integrator.
