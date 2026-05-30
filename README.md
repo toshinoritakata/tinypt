@@ -70,7 +70,7 @@ tinypt [オプション]
 |---|---|---|
 | `--scene PATH` | — | Mitsuba XML シーンファイル (未指定で組み込みシーン) |
 | `--spp N` | 512 | サンプル数 (samples per pixel) |
-| `-o, --out PATH` | `tinypt_min.ppm` | 出力ファイル (拡張子で形式を自動判定) |
+| `-o, --out PATH` | `out.ppm` | 出力ファイル (拡張子で形式を自動判定) |
 | `--env PATH` | — | HDR/EXR 環境マップ |
 | `--no-env` | — | 環境マップを無効化 |
 | `--denoise` / `--no-denoise` | 有効 | Intel OIDN デノイズ |

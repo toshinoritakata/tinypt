@@ -77,7 +77,7 @@ impl RenderConfig {
             checkpoint_enabled: false,
             checkpoint_every_tasks: 128,
             scene_hash: 0x4859503000000001u64, // 'HYP0' prefix
-            output_path: "hyperion_min.ppm".to_string(),
+            output_path: "out.ppm".to_string(),
             env_map_path: None,
             scene_path: None,
             denoise_enabled: true,
