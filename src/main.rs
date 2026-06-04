@@ -3,7 +3,7 @@
 //! コマンドライン引数を解析し、シーン構築 → レンダリング → 後処理 → 画像出力を実行する。
 //! 対応フォーマット: PPM / HDR (Radiance) / EXR (ACEScg)
 
-use tinypt::{build_scene, ckpt_path, denoise, load_scene, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
+use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
 
 /// CLI で明示的に指定された値（シーンファイルの設定より優先させる）。
 #[derive(Default)]
@@ -119,7 +119,7 @@ fn main() -> std::io::Result<()> {
         }
         scene
     } else {
-        build_scene(&config)
+        build_default_scene(&config)
     };
     let ckpt_file = ckpt_path(config.scene_hash);
 

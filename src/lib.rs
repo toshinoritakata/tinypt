@@ -40,4 +40,4 @@ pub use config::{RenderConfig, Tonemap};
 pub use output::{resolve_pixels, OutputFormat, OutputSettings};
 pub use mitsuba::load_scene;
 pub use render::render;
-pub use scene::build_scene;
+pub use scene::build_default_scene;

@@ -23,7 +23,7 @@ pub struct Scene {
 }
 
 /// レンダリング設定からデフォルトシーンを構築する。
-pub fn build_scene(config: &RenderConfig) -> Scene {
+pub fn build_default_scene(config: &RenderConfig) -> Scene {
     let eye    = Vec3::new(0.0, 1.2, 4.0);
     let target = Vec3::new(0.0, 0.5, 0.0);
     let aspect = config.width as f64 / config.height as f64;
