@@ -298,7 +298,8 @@ impl Bvh {
                 let start = n.start as usize;
                 let end = start + n.count as usize;
                 for &ti in &self.indices[start..end] {
-                    if let Some(h) = tris[ti].hit(r, tmin, tmax) {
+                    if let Some(mut h) = tris[ti].hit(r, tmin, tmax) {
+                        h.prim_id = ti;
                         tmax = h.t;
                         best = Some(h);
                     }

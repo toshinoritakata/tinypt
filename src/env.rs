@@ -13,8 +13,8 @@ use std::io;
 
 use crate::exr::read_exr;
 use crate::hdr::read_hdr;
-use crate::math::{clamp, Color, Vec3};
-use crate::rng::Rng;
+use crate::math::{cdf_search, clamp, Color, Vec3};
+use crate::rng::{uniform_sphere_dir, Rng};
 
 /// 環境マップ（サンプリング用 CDF 付き）。
 pub struct EnvMap {
@@ -90,14 +90,7 @@ impl EnvMap {
 
     /// 方向 `dir` から環境マップの放射輝度をバイリニア補間でサンプリングする。
     pub fn sample(&self, dir: Vec3) -> Color {
-        let d = dir.norm();
-        let theta = clamp(d.y, -1.0, 1.0).acos();
-        let mut phi = d.z.atan2(d.x);
-        if phi < 0.0 {
-            phi += std::f64::consts::TAU;
-        }
-        let u = phi / std::f64::consts::TAU;
-        let v = theta / std::f64::consts::PI;
+        let (u, v, _theta) = dir_to_uv(dir);
 
         let x = u * (self.width as f64);
         let y = v * (self.height as f64 - 1.0);
@@ -157,14 +150,7 @@ impl EnvMap {
         if self.total_weight <= 0.0 {
             return 1.0 / (4.0 * std::f64::consts::PI);
         }
-        let d = dir.norm();
-        let theta = clamp(d.y, -1.0, 1.0).acos();
-        let mut phi = d.z.atan2(d.x);
-        if phi < 0.0 {
-            phi += std::f64::consts::TAU;
-        }
-        let u = phi / std::f64::consts::TAU;
-        let v = theta / std::f64::consts::PI;
+        let (u, v, theta) = dir_to_uv(dir);
         let x = (u * (self.width as f64)).floor().clamp(0.0, (self.width - 1) as f64) as usize;
         let y = (v * (self.height as f64)).floor().clamp(0.0, (self.height - 1) as f64) as usize;
 
@@ -182,29 +168,53 @@ impl EnvMap {
     }
 }
 
-fn cdf_search(cdf: &[f64], x: f64) -> usize {
-    let mut lo = 0usize;
-    let mut hi = cdf.len().saturating_sub(1);
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        if cdf[mid] <= x {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
+/// 方向を等距離円筒図法の (u, v) ＋ θ（天頂角）に変換する。`sample` と `pdf` で共有される、
+/// `sample_dir` の (u,v)→方向マッピング（下記）の逆写像。
+fn dir_to_uv(dir: Vec3) -> (f64, f64, f64) {
+    let d = dir.norm();
+    let theta = clamp(d.y, -1.0, 1.0).acos();
+    let mut phi = d.z.atan2(d.x);
+    if phi < 0.0 {
+        phi += std::f64::consts::TAU;
     }
-    lo
+    let u = phi / std::f64::consts::TAU;
+    let v = theta / std::f64::consts::PI;
+    (u, v, theta)
 }
 
 /// 球面上の一様サンプリング（CDF が無効な場合のフォールバック）。
 fn sample_uniform_env(env: &EnvMap, rng: &mut Rng) -> (Vec3, Color, f64) {
-    let u = rng.next_f64();
-    let v = rng.next_f64();
-    let z = 1.0 - 2.0 * u;
-    let r = (1.0 - z * z).max(0.0).sqrt();
-    let phi = std::f64::consts::TAU * v;
-    let dir = Vec3::new(r * phi.cos(), z, r * phi.sin());
+    let dir = uniform_sphere_dir(rng);
     let radiance = env.sample(dir);
     let pdf = 1.0 / (4.0 * std::f64::consts::PI);
     (dir, radiance, pdf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sample_dir` が (u,v) から方向を作るのに使うマッピング（本体はインライン、
+    /// ここではテスト用に複製）が `dir_to_uv` の逆写像であることを確認する。
+    /// 両者が独立に発散すると MIS の重みが静かに壊れるため、明示的な往復テストを置く。
+    fn uv_to_dir(u: f64, v: f64) -> Vec3 {
+        let theta = std::f64::consts::PI * v;
+        let phi = std::f64::consts::TAU * u;
+        let sin_theta = theta.sin();
+        Vec3::new(phi.cos() * sin_theta, theta.cos(), phi.sin() * sin_theta)
+    }
+
+    #[test]
+    fn dir_to_uv_round_trips_with_sample_dir_mapping() {
+        for i in 0..7 {
+            for j in 0..5 {
+                let u = (i as f64 + 0.5) / 7.0;
+                let v = (j as f64 + 0.5) / 5.0;
+                let dir = uv_to_dir(u, v);
+                let (u2, v2, _theta) = dir_to_uv(dir);
+                assert!((u - u2).abs() < 1e-9, "u mismatch at ({u}, {v}): got {u2}");
+                assert!((v - v2).abs() < 1e-9, "v mismatch at ({u}, {v}): got {v2}");
+            }
+        }
+    }
 }

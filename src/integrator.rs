@@ -63,6 +63,7 @@ pub fn radiance(
     let mut ray = ray;
     let mut last_bsdf_pdf = 0.0;     // 前バウンスの BSDF PDF（MIS 用）
     let mut last_non_delta = false;   // 前バウンスが非デルタ散乱か（MIS 適用判定）
+    let mut last_p = ray.o;           // 前バウンスのシェーディング点（面光源 MIS の light_pdf 計算用）
 
     for bounce in 0..limits.max_bounces {
         // レイとシーンの交差判定
@@ -98,7 +99,14 @@ pub fn radiance(
 
         // 発光体に命中: 放射輝度を蓄積しパス終了
         if let Some(emit) = mat.emitted() {
-            let contrib = path_throughput.hadamard(emit).clamp_luminance(FIREFLY_CLAMP);
+            let mut contrib = path_throughput.hadamard(emit);
+            // 非デルタ散乱後なら、NEE で同じ光源をサンプリング済みなので MIS 重みを適用
+            if last_non_delta {
+                let pdf_light = world.light_pdf(last_p, ray.time, &hit);
+                let w = mis_weight(last_bsdf_pdf, pdf_light);
+                contrib = contrib * w;
+            }
+            let contrib = contrib.clamp_luminance(FIREFLY_CLAMP);
             accumulated_radiance = accumulated_radiance + contrib;
             break;
         }
@@ -124,6 +132,7 @@ pub fn radiance(
             Some(BsdfSample { scattered, weight, pdf, is_delta }) => {
                 last_bsdf_pdf = pdf;
                 last_non_delta = !is_delta;
+                last_p = hit.p;
                 path_throughput = path_throughput.hadamard(weight);
                 ray = scattered;
             }
@@ -198,7 +207,9 @@ fn nee_area_light(
     }
 
     let shadow = Ray { o: hit_p + RAY_EPSILON * wi, d: wi, time: ray.time };
-    let tmax = (dist - RAY_EPSILON).max(RAY_EPSILON);
+    // 原点を ε 前進させているため、ライト面は新原点から dist−ε に位置する。
+    // tmax を dist−2ε にしないと丸め次第でライト自身に遮蔽判定される
+    let tmax = (dist - 2.0 * RAY_EPSILON).max(RAY_EPSILON);
     if world.hit(shadow, RAY_EPSILON, tmax).is_some() {
         return Color::new(0.0, 0.0, 0.0);
     }

@@ -172,6 +172,26 @@ impl Mat3 {
 /// スカラーを [a, b] にクランプする。
 pub fn clamp(x: f64, a: f64, b: f64) -> f64 { x.max(a).min(b) }
 
+/// 累積分布関数 `cdf` 内で `x` 以下の最大インデックスを二分探索で返す。
+/// `cdf` は非減少列であること（`env::EnvMap` と `world::World` のライトサンプリングで共有）。
+///
+/// `cdf` は先頭に 0.0 を持つ配列 [0, w0, w0+w1, …] であることを前提とする。
+/// 各要素は累積和であり、戻り値は cdf[i] <= x < cdf[i+1] を満たすバケットの
+/// インデックス i（= 選択される要素の添字）。
+pub fn cdf_search(cdf: &[f64], x: f64) -> usize {
+    let mut lo = 0usize;
+    let mut hi = cdf.len().saturating_sub(1);
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if cdf[mid] <= x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// sRGB の 1 成分をリニアに変換する（IEC 61966-2-1 規格に準拠）。
 pub fn srgb_to_linear(c: f64) -> f64 {
     if c <= 0.04045 {

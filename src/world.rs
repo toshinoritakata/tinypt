@@ -10,18 +10,22 @@
 use crate::bvh::Bvh;
 use crate::geometry::{Hit, Sphere, Triangle};
 use crate::material::Material;
-use crate::math::{Color, Vec3};
+use crate::math::{cdf_search, Color, Vec3};
 use crate::ray::Ray;
-use crate::rng::Rng;
+use crate::rng::{uniform_sphere_dir, Rng};
 use crate::transform::Transform;
 
 
 /// 三角形メッシュ（メッシュ単位の BVH 付き）。
+///
+/// 三角形配列と、それを対象に構築した BVH を対で保持する。BVH は自身の構築元と
+/// 異なる三角形配列を渡されると壊れるため、その対応関係はこの型の外に出さない
+/// （`bvh` が非公開なのはそのため）。交差判定は [`Mesh::hit`] を通して行う。
 pub struct Mesh {
     /// メッシュの三角形リスト
     pub tris: Vec<Triangle>,
     /// メッシュ内の BVH（高速交差判定用）
-    pub bvh: Bvh,
+    bvh: Bvh,
 }
 
 impl Mesh {
@@ -29,6 +33,11 @@ impl Mesh {
     pub fn new(tris: Vec<Triangle>) -> Self {
         let bvh = Bvh::build(&tris);
         Self { tris, bvh }
+    }
+
+    /// メッシュ内三角形に対するレイ交差判定（オブジェクト空間）。
+    pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        self.bvh.hit(&self.tris, r, tmin, tmax)
     }
 }
 
@@ -46,19 +55,29 @@ pub struct Instance {
 }
 
 /// ジオメトリ・インスタンス・ライトの集合体。
+///
+/// ジオメトリの追加は [`add_sphere`](World::add_sphere) /
+/// [`add_mesh_instance`](World::add_mesh_instance) を通して行い、全て追加し終えたら
+/// 必ず [`build_lights`](World::build_lights) を呼ぶこと。フィールドが非公開なのは、
+/// 「追加してから CDF を構築し忘れる」という呼び出し側の不変条件違反を防ぐため。
 pub struct World {
     /// シーン内の球プリミティブ
-    pub spheres: Vec<Sphere>,
+    spheres: Vec<Sphere>,
     /// メッシュ（三角形群 + BVH）
-    pub meshes: Vec<Mesh>,
+    meshes: Vec<Mesh>,
     /// メッシュのインスタンス（トランスフォーム付き）
-    pub instances: Vec<Instance>,
+    instances: Vec<Instance>,
     /// 発光プリミティブのリスト
-    pub lights: Vec<LightInfo>,
+    lights: Vec<LightInfo>,
     /// ライト選択用の累積分布関数（CDF）
-    pub light_cdf: Vec<f64>,
+    light_cdf: Vec<f64>,
     /// CDF の総重み
-    pub light_total: f64,
+    light_total: f64,
+    /// 球インデックス → lights 上の ID（発光体でなければ None）。
+    /// `light_pdf` が BSDF サンプリングで命中した発光体を逆引きするために使う。
+    sphere_light_id: Vec<Option<usize>>,
+    /// (インスタンス ID, メッシュ内三角形 ID) → lights 上の ID。
+    tri_light_id: std::collections::HashMap<(usize, usize), usize>,
 }
 
 impl World {
@@ -71,7 +90,46 @@ impl World {
             lights: Vec::new(),
             light_cdf: Vec::new(),
             light_total: 0.0,
+            sphere_light_id: Vec::new(),
+            tri_light_id: std::collections::HashMap::new(),
         }
+    }
+
+    /// 球プリミティブを追加し、その `World::spheres` 上のインデックスを返す。
+    pub fn add_sphere(&mut self, sphere: Sphere) -> usize {
+        let idx = self.spheres.len();
+        self.spheres.push(sphere);
+        idx
+    }
+
+    /// 三角形群からメッシュを構築し、`xform` で配置したインスタンスを追加する。
+    /// 追加したインスタンスの ID を返す。
+    pub fn add_mesh_instance(&mut self, tris: Vec<Triangle>, xform: Transform, mat_override: Option<usize>) -> usize {
+        let mesh_id = self.meshes.len();
+        self.meshes.push(Mesh::new(tris));
+        let inst_id = self.instances.len();
+        self.instances.push(Instance { mesh_id, xform, mat_override });
+        inst_id
+    }
+
+    /// 球プリミティブの一覧を返す。
+    pub fn spheres(&self) -> &[Sphere] {
+        &self.spheres
+    }
+
+    /// メッシュの一覧を返す。
+    pub fn meshes(&self) -> &[Mesh] {
+        &self.meshes
+    }
+
+    /// メッシュインスタンスの一覧を返す。
+    pub fn instances(&self) -> &[Instance] {
+        &self.instances
+    }
+
+    /// 登録済みライトの一覧を返す（`build_lights` 実行後に有効）。
+    pub fn lights(&self) -> &[LightInfo] {
+        &self.lights
     }
 
     /// ワールド内の全ジオメトリに対するレイ交差判定。
@@ -83,7 +141,7 @@ impl World {
         let mut best: Option<Hit> = None;
 
         // Instances: ray -> object space
-        for inst in &self.instances {
+        for (inst_id, inst) in self.instances.iter().enumerate() {
             let mesh = match self.meshes.get(inst.mesh_id) {
                 Some(m) => m,
                 None => continue,
@@ -95,7 +153,7 @@ impl World {
             let r_obj = Ray { o: o_obj, d: d_obj, time: r.time };
 
             // Object-space BVH
-            if let Some(h_obj) = mesh.bvh.hit(&mesh.tris, r_obj, tmin, 1e30) {
+            if let Some(h_obj) = mesh.hit(r_obj, tmin, 1e30) {
                 let p_world = inst.xform.apply_point(h_obj.p);
                 let n_world = inst.xform.apply_normal(h_obj.n);
 
@@ -104,14 +162,22 @@ impl World {
                 if t_world > tmin && t_world < closest {
                     closest = t_world;
                     let mat_id = inst.mat_override.unwrap_or(h_obj.mat_id);
-                    best = Some(Hit { t: t_world, p: p_world, n: n_world, mat_id });
+                    best = Some(Hit {
+                        t: t_world,
+                        p: p_world,
+                        n: n_world,
+                        mat_id,
+                        prim_id: h_obj.prim_id,
+                        inst_id: Some(inst_id),
+                    });
                 }
             }
         }
 
         // Spheres
-        for s in &self.spheres {
-            if let Some(h) = s.hit(r, tmin, closest) {
+        for (idx, s) in self.spheres.iter().enumerate() {
+            if let Some(mut h) = s.hit(r, tmin, closest) {
+                h.prim_id = idx;
                 closest = h.t;
                 best = Some(h);
             }
@@ -126,23 +192,34 @@ impl World {
     /// シェープ別の面積計算は [`Light::area`] に委譲する（[`Self::sample_light`] と共有）。
     pub fn build_lights(&mut self, mats: &[Material]) {
         let mut lights: Vec<LightInfo> = Vec::new();
-        let mut cdf: Vec<f64> = Vec::new();
+        // cdf_search は先頭に 0.0 を持つ配列（[0, w0, w0+w1, …]）を前提とする
+        // （env.rs と同じ規約）。
+        let mut cdf: Vec<f64> = vec![0.0];
         let mut total = 0.0;
+        let mut sphere_light_id: Vec<Option<usize>> = vec![None; self.spheres.len()];
+        let mut tri_light_id: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
 
-        let mut add = |light: Light, emit: Color, area: f64| {
+        let mut add = |light: Light, emit: Color, area: f64| -> Option<usize> {
             let weight = area * emit.luminance();
             if weight > 0.0 {
                 total += weight;
+                let id = lights.len();
                 lights.push(LightInfo { light, emit, weight });
                 cdf.push(total);
+                Some(id)
+            } else {
+                None
             }
         };
 
         // Spheres
         for (idx, s) in self.spheres.iter().enumerate() {
-            if let Some(emit) = material_emit(mats.get(s.mat_id)) {
+            if let Some(emit) = mats.get(s.mat_id).and_then(|m| m.emitted()) {
                 let light = Light::Sphere { idx };
-                add(light, emit, light.area(self, 0.5));
+                let area = light.area(self, 0.5);
+                if let Some(id) = add(light, emit, area) {
+                    sphere_light_id[idx] = Some(id);
+                }
             }
         }
 
@@ -154,9 +231,12 @@ impl World {
             };
             for (tri_id, tri) in mesh.tris.iter().enumerate() {
                 let mat_id = inst.mat_override.unwrap_or(tri.mat_id);
-                if let Some(emit) = material_emit(mats.get(mat_id)) {
+                if let Some(emit) = mats.get(mat_id).and_then(|m| m.emitted()) {
                     let light = Light::Triangle { mesh_id: inst.mesh_id, tri_id, inst_id };
-                    add(light, emit, light.area(self, 0.5));
+                    let area = light.area(self, 0.5);
+                    if let Some(id) = add(light, emit, area) {
+                        tri_light_id.insert((inst_id, tri_id), id);
+                    }
                 }
             }
         }
@@ -164,6 +244,46 @@ impl World {
         self.lights = lights;
         self.light_cdf = cdf;
         self.light_total = total;
+        self.sphere_light_id = sphere_light_id;
+        self.tri_light_id = tri_light_id;
+    }
+
+    /// BSDF サンプリングで発光体に命中した際の、光源選択の立体角 PDF を計算する（MIS 用）。
+    ///
+    /// `sample_light` が返す `LightSample.pdf` と同一の値を、逆方向（命中結果 `hit` から）
+    /// 再構成する。`from` は前バウンスのシェーディング点、`time` はレイの time。
+    /// `hit` が発光体でない、または `build_lights` 未実行なら 0 を返す。
+    pub fn light_pdf(&self, from: Vec3, time: f64, hit: &Hit) -> f64 {
+        if self.light_total <= 0.0 {
+            return 0.0;
+        }
+        let light_id = match hit.inst_id {
+            None => self.sphere_light_id.get(hit.prim_id).copied().flatten(),
+            Some(inst_id) => self.tri_light_id.get(&(inst_id, hit.prim_id)).copied(),
+        };
+        let light_id = match light_id {
+            Some(id) => id,
+            None => return 0.0,
+        };
+        let info = &self.lights[light_id];
+        let area = info.light.area(self, time);
+        if area <= 0.0 {
+            return 0.0;
+        }
+        let to_light = hit.p - from;
+        let dist2 = to_light.dot(to_light);
+        if dist2 <= 1e-12 {
+            return 0.0;
+        }
+        let dist = dist2.sqrt();
+        let wi = to_light / dist;
+        let cos_light = hit.n.dot(-wi).max(0.0);
+        if cos_light <= 0.0 {
+            return 0.0;
+        }
+        let pdf_select = info.weight / self.light_total;
+        let pdf_area = 1.0 / area;
+        pdf_select * pdf_area * dist2 / cos_light
     }
 
     /// CDF を使ってライトを重点的にサンプリングし、位置・法線・放射輝度・PDF を返す。
@@ -243,12 +363,7 @@ impl Light {
         match *self {
             Light::Sphere { idx } => {
                 let s = world.spheres.get(idx)?;
-                let u = rng.next_f64();
-                let v = rng.next_f64();
-                let z = 1.0 - 2.0 * u;
-                let r = (1.0 - z * z).max(0.0).sqrt();
-                let phi = std::f64::consts::TAU * v;
-                let dir = Vec3::new(r * phi.cos(), z, r * phi.sin());
+                let dir = uniform_sphere_dir(rng);
                 let pos = s.c + dir * s.r;
                 let area = 4.0 * std::f64::consts::PI * s.r * s.r;
                 Some((pos, dir, area))
@@ -312,29 +427,6 @@ pub struct LightSample {
     pub pdf: f64,
 }
 
-/// マテリアルが発光体なら放射輝度を返す。
-fn material_emit(mat: Option<&Material>) -> Option<Color> {
-    match mat {
-        Some(Material::DiffuseLight { emit }) => Some(*emit),
-        _ => None,
-    }
-}
-
-/// CDF 内で値 `x` 以下の最大インデックスを二分探索で返す。
-fn cdf_search(cdf: &[f64], x: f64) -> usize {
-    let mut lo = 0usize;
-    let mut hi = cdf.len().saturating_sub(1);
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        if cdf[mid] <= x {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +469,176 @@ mod tests {
             }
         }
         assert!(got > 0, "no valid light samples");
+    }
+
+    /// `light_pdf` は `sample_light` の逆演算: サンプルされた点への Hit を作って
+    /// `light_pdf` に渡すと、`sample_light` が返した pdf と一致しなければならない。
+    /// これは BSDF サンプリングが発光体に命中した際の MIS 重み付けが正しく機能する
+    /// ための前提条件で、この一致が壊れると面光源の寄与が二重計上/過小評価される。
+    #[test]
+    fn light_pdf_matches_sample_light_pdf() {
+        let c = Vec3::new(0.0, 0.0, 0.0);
+        let r = 1.5;
+        let world = emissive_sphere_world(c, r);
+        let mut rng = Rng::new(7);
+        let from = Vec3::new(5.0, 0.0, 0.0);
+        let mut checked = 0;
+        for _ in 0..500 {
+            if let Some(ls) = world.sample_light(&mut rng, 0.0, from) {
+                let hit = Hit {
+                    t: 0.0,
+                    p: ls.position,
+                    n: ls.normal,
+                    mat_id: 0,
+                    prim_id: 0,
+                    inst_id: None,
+                };
+                let pdf = world.light_pdf(from, 0.0, &hit);
+                assert!((pdf - ls.pdf).abs() < 1e-9 * ls.pdf.max(1.0), "light_pdf {} != sample_light pdf {}", pdf, ls.pdf);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no valid light samples");
+    }
+
+    /// 発光体でないヒット（`inst_id`/`prim_id` が既知の発光体と一致しない）に対しては 0 を返す。
+    #[test]
+    fn light_pdf_is_zero_for_non_emitting_hit() {
+        let world = emissive_sphere_world(Vec3::new(0.0, 0.0, 0.0), 1.5);
+        let hit = Hit {
+            t: 0.0,
+            p: Vec3::new(10.0, 0.0, 0.0),
+            n: Vec3::new(1.0, 0.0, 0.0),
+            mat_id: 0,
+            prim_id: 3, // no sphere at this index
+            inst_id: None,
+        };
+        assert_eq!(world.light_pdf(Vec3::new(5.0, 0.0, 0.0), 0.0, &hit), 0.0);
+    }
+
+    /// `Mesh::hit`（BVH 経由）は全三角形を線形探索するブルートフォースと同じ最近接ヒットを返す。
+    /// `Mesh` が三角形配列と BVH の対応関係を自分で保証しているからこそ書ける回帰テスト。
+    #[test]
+    fn mesh_hit_matches_brute_force() {
+        let mut rng = Rng::new(42);
+        let mut rand_range = |lo: f64, hi: f64| lo + rng.next_f64() * (hi - lo);
+
+        let mut tris = Vec::new();
+        for _ in 0..200 {
+            let center = Vec3::new(rand_range(-5.0, 5.0), rand_range(-5.0, 5.0), rand_range(-5.0, 5.0));
+            let v0 = center + Vec3::new(rand_range(-1.0, 1.0), rand_range(-1.0, 1.0), rand_range(-1.0, 1.0));
+            let v1 = center + Vec3::new(rand_range(-1.0, 1.0), rand_range(-1.0, 1.0), rand_range(-1.0, 1.0));
+            let v2 = center + Vec3::new(rand_range(-1.0, 1.0), rand_range(-1.0, 1.0), rand_range(-1.0, 1.0));
+            tris.push(Triangle::new_static(v0, v1, v2, 0));
+        }
+        let mesh = Mesh::new(tris.clone());
+
+        let mut checked_hits = 0;
+        for _ in 0..500 {
+            let o = Vec3::new(rand_range(-8.0, 8.0), rand_range(-8.0, 8.0), rand_range(-8.0, 8.0));
+            let d = Vec3::new(rand_range(-1.0, 1.0), rand_range(-1.0, 1.0), rand_range(-1.0, 1.0)).norm();
+            let r = Ray { o, d, time: 0.0 };
+
+            let via_bvh = mesh.hit(r, 1e-6, 1e30);
+
+            let mut brute: Option<Hit> = None;
+            let mut closest = 1e30;
+            for tri in &tris {
+                if let Some(h) = tri.hit(r, 1e-6, closest) {
+                    closest = h.t;
+                    brute = Some(h);
+                }
+            }
+
+            match (via_bvh, brute) {
+                (Some(a), Some(b)) => {
+                    checked_hits += 1;
+                    assert!((a.t - b.t).abs() < 1e-9, "t mismatch: bvh={} brute={}", a.t, b.t);
+                    assert!((a.p - b.p).len() < 1e-9, "p mismatch");
+                }
+                (None, None) => {}
+                (a, b) => panic!("hit disagreement: bvh={:?}, brute={:?}", a.map(|h| h.t), b.map(|h| h.t)),
+            }
+        }
+        assert!(checked_hits > 0, "no rays hit any triangle; test is vacuous");
+    }
+
+    /// 回帰テスト: NEE のシャドウレイは、原点を ε だけライト方向へ前進させても
+    /// tmax を dist−2ε に取っておけば、サンプルした光源自身を誤って遮蔽物として
+    /// 検出しない（tmax が dist−ε のままだと丸め次第で約半数が自己遮蔽してしまい、
+    /// Cornell box が暗くなる/バンディングが出るバグがあった）。
+    #[test]
+    fn shadow_ray_does_not_self_hit_sampled_light() {
+        use crate::constants::RAY_EPSILON;
+        use crate::transform::Transform;
+
+        let mut world = World::new();
+        // y=1.98 に、下向き法線（-Y）の矩形光源を三角形2枚で構成する。
+        let m = |x: f64, z: f64| Vec3::new(0.35 * x, 1.98, 0.35 * z);
+        let tris = vec![
+            Triangle::new_static(m(-1.0, -1.0), m(1.0, -1.0), m(1.0, 1.0), 0),
+            Triangle::new_static(m(-1.0, -1.0), m(1.0, 1.0), m(-1.0, 1.0), 0),
+        ];
+        world.add_mesh_instance(tris, Transform::identity(), None);
+        let mats = vec![Material::DiffuseLight { emit: Color::new(4.6, 3.9, 2.0) }];
+        world.build_lights(&mats);
+
+        let mut rng = Rng::new(123);
+        let p = Vec3::new(0.0, 1.4, -1.0);
+        let mut sampled = 0;
+        for _ in 0..2000 {
+            if let Some(ls) = world.sample_light(&mut rng, 0.0, p) {
+                sampled += 1;
+                let to = ls.position - p;
+                let dist = to.dot(to).sqrt();
+                let wi = to / dist;
+                let shadow = Ray { o: p + RAY_EPSILON * wi, d: wi, time: 0.0 };
+                let tmax = (dist - 2.0 * RAY_EPSILON).max(RAY_EPSILON);
+                assert!(world.hit(shadow, RAY_EPSILON, tmax).is_none(), "shadow ray must not self-hit the sampled light");
+            }
+        }
+        assert!(sampled > 0, "no light samples drawn");
+    }
+
+    /// 回帰テスト: `light_cdf` は先頭に 0.0 を持つ規約（cdf_search が前提とする
+    /// [0, w0, w0+w1, …]）で構築されなければならない。先頭の 0.0 を欠くと
+    /// cdf_search が常にインデックス 0 を返し、2 光源の場合は 2 番目の光源が
+    /// 一切選ばれなくなる（面積比によらない偏ったサンプリングになる）。
+    #[test]
+    fn sample_light_selects_lights_area_proportionally() {
+        let mut world = World::new();
+        let c1 = Vec3::new(-5.0, 0.0, 0.0);
+        let r1 = 1.0;
+        let c2 = Vec3::new(5.0, 0.0, 0.0);
+        let r2 = 2.0;
+        world.spheres.push(Sphere { c: c1, r: r1, mat_id: 0 });
+        world.spheres.push(Sphere { c: c2, r: r2, mat_id: 0 });
+        let mats = vec![Material::DiffuseLight { emit: Color::new(1.0, 1.0, 1.0) }];
+        world.build_lights(&mats);
+
+        let mut rng = Rng::new(123);
+        let p = Vec3::new(0.0, 0.0, 10.0);
+        let n = 10_000;
+        let mut count1 = 0;
+        let mut count2 = 0;
+        for _ in 0..n {
+            if let Some(ls) = world.sample_light(&mut rng, 0.0, p) {
+                if (ls.position - c1).len() < (ls.position - c2).len() {
+                    count1 += 1;
+                } else {
+                    count2 += 1;
+                }
+            }
+        }
+        // sample_light は法線が p を向いていないサンプルを内部で棄却する（可視半球の
+        // みを受理）ため、分母は総試行回数 n ではなく採択されたサンプル数にする。
+        // 棄却率は両光源でほぼ等しいため、採択後の内訳は面積比をそのまま反映する。
+        let accepted = count1 + count2;
+        assert!(accepted > n / 4, "too few accepted samples ({}) to be meaningful", accepted);
+        let frac1 = count1 as f64 / accepted as f64;
+        let frac2 = count2 as f64 / accepted as f64;
+        // 面積比: 4π·1² : 4π·2² = 1 : 4 -> 選択確率 0.2 : 0.8
+        assert!((frac1 - 0.2).abs() < 0.05, "sphere1 fraction {} not near 0.2", frac1);
+        assert!((frac2 - 0.8).abs() < 0.05, "sphere2 fraction {} not near 0.8", frac2);
     }
 }

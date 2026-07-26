@@ -353,7 +353,7 @@ mod tests {
     /// 下向きレイが床（法線 +Y）に当たる状況の Hit を作る。
     fn floor_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0 };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None };
         (ray, hit)
     }
 

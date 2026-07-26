@@ -4,6 +4,8 @@
 //! 各ピクセル・サンプルに対して決定論的なシードを生成し、
 //! 再現可能なレンダリング結果を保証する。
 
+use crate::math::Vec3;
+
 #[derive(Clone, Copy)]
 /// PCG32 ベースの乱数生成器。
 pub struct Rng { state: u64 }
@@ -34,6 +36,17 @@ impl Rng {
         let u = hi | lo;
         (u as f64) * (1.0 / ((1u64 << 53) as f64))
     }
+}
+
+/// 単位球面上の一様サンプリング（`env::EnvMap` の一様フォールバックと
+/// `world::Light::sample_surface` の球面光サンプリングで共有）。
+pub fn uniform_sphere_dir(rng: &mut Rng) -> Vec3 {
+    let u = rng.next_f64();
+    let v = rng.next_f64();
+    let z = 1.0 - 2.0 * u;
+    let r = (1.0 - z * z).max(0.0).sqrt();
+    let phi = std::f64::consts::TAU * v;
+    Vec3::new(r * phi.cos(), z, r * phi.sin())
 }
 
 /// ピクセル座標 (px, py) とサンプルインデックス s から決定論的シードを導出する。

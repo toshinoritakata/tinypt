@@ -44,39 +44,39 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
     let id_ground = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.5, 0.5, 0.5),
     });
-    world.spheres.push(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: id_ground });
+    world.add_sphere(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: id_ground });
 
     // Lambert（左端）
     let id_lambert = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.8, 0.3, 0.3),
     });
-    world.spheres.push(Sphere { c: Vec3::new(-1.8, 0.5, 0.0), r: 0.5, mat_id: id_lambert });
+    world.add_sphere(Sphere { c: Vec3::new(-1.8, 0.5, 0.0), r: 0.5, mat_id: id_lambert });
 
     // Metal（左中）
     let id_metal = push(&mut mats, Material::Metal {
         albedo: Color::from_srgb(0.8, 0.8, 0.8),
     });
-    world.spheres.push(Sphere { c: Vec3::new(-0.6, 0.5, 0.0), r: 0.5, mat_id: id_metal });
+    world.add_sphere(Sphere { c: Vec3::new(-0.6, 0.5, 0.0), r: 0.5, mat_id: id_metal });
 
     // GGX（右中）— 粗い金属（ゴールド、α=0.25）
     let id_ggx = push(&mut mats, Material::Ggx {
         albedo: Color::from_srgb(0.95, 0.78, 0.35),
         alpha: 0.25,
     });
-    world.spheres.push(Sphere { c: Vec3::new(0.6, 0.5, 0.0), r: 0.5, mat_id: id_ggx });
+    world.add_sphere(Sphere { c: Vec3::new(0.6, 0.5, 0.0), r: 0.5, mat_id: id_ggx });
 
     // Glass（右端）
     let id_glass = push(&mut mats, Material::Dielectric {
         ior: 1.5,
         absorption: Color::new(0.02, 0.05, 0.02),
     });
-    world.spheres.push(Sphere { c: Vec3::new(1.8, 0.5, 0.0), r: 0.5, mat_id: id_glass });
+    world.add_sphere(Sphere { c: Vec3::new(1.8, 0.5, 0.0), r: 0.5, mat_id: id_glass });
 
     // 発光球（上方）
     let id_light = push(&mut mats, Material::DiffuseLight {
         emit: Color::new(8.0, 7.0, 5.0),
     });
-    world.spheres.push(Sphere { c: Vec3::new(0.0, 3.0, -1.0), r: 0.8, mat_id: id_light });
+    world.add_sphere(Sphere { c: Vec3::new(0.0, 3.0, -1.0), r: 0.8, mat_id: id_light });
 
     world.build_lights(&mats);
 

@@ -20,6 +20,12 @@ pub struct Hit {
     pub n: Vec3,
     /// 交差したマテリアルのインデックス
     pub mat_id: usize,
+    /// ヒットしたプリミティブのインデックス（球: World::spheres 上の位置、
+    /// 三角形: メッシュ内の三角形インデックス）。呼び出し側（World::hit）が設定する。
+    pub prim_id: usize,
+    /// メッシュインスタンス経由のヒットなら Some(inst_id)、球なら None。
+    /// 呼び出し側（World::hit）が設定する。
+    pub inst_id: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -190,7 +196,7 @@ impl Sphere {
         }
         let p = r.at(t);
         let n = (p - self.c) / self.r;
-        Some(Hit { t, p, n, mat_id: self.mat_id })
+        Some(Hit { t, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None })
     }
 }
 
@@ -269,6 +275,6 @@ impl Triangle {
 
         let p = r.at(thit);
         let n = e1.cross(e2).norm();
-        Some(Hit { t: thit, p, n, mat_id: self.mat_id })
+        Some(Hit { t: thit, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None })
     }
 }

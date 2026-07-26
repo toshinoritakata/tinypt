@@ -36,7 +36,7 @@ use crate::obj_loader::load_obj_triangles;
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
-use crate::world::{Instance, Mesh, World};
+use crate::world::World;
 
 /// パース済み XML 要素（タグ名・属性・子要素）。
 struct Element {
@@ -129,52 +129,84 @@ fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// Mitsuba XML サブセットを読み込み、[`Scene`] を構築する。
+/// シーンファイル（`<film>`/`<sampler>`/`<integrator>`）が要求する設定値。
+/// `None` の項目は XML に記述が無かったことを示し、呼び出し側の既定値を維持する。
+#[derive(Default, Clone, Copy, Debug)]
+pub struct SceneSettings {
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub spp: Option<usize>,
+    pub max_bounces: Option<usize>,
+    pub rr_start: Option<usize>,
+}
+
+impl SceneSettings {
+    /// `config` へ反映する。`None` の項目は変更しない。
+    pub fn apply(&self, config: &mut RenderConfig) {
+        if let Some(w) = self.width {
+            config.width = w;
+        }
+        if let Some(h) = self.height {
+            config.height = h;
+        }
+        if let Some(spp) = self.spp {
+            config.spp = spp;
+        }
+        if let Some(m) = self.max_bounces {
+            config.max_bounces = m;
+        }
+        if let Some(r) = self.rr_start {
+            config.rr_start = r;
+        }
+    }
+}
+
+/// Mitsuba XML サブセット文字列を解析し、[`Scene`] と [`SceneSettings`] を返す。
 ///
-/// `<film>`（解像度）・`<sampler>`（spp）・`<integrator>`（max_depth / rr_depth）を
-/// `config` に反映する。XML に無い項目は `config` の既定値を維持する。CLI 明示値で
-/// 上書きしたい場合は呼び出し側で行う（[`crate::load_scene`] の利用側参照）。
-pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
-    let xml = std::fs::read_to_string(path)?;
-    let root = parse_tree(&xml)?;
+/// ファイル I/O を含まない純粋な関数（`parse_tree` の上に構築）なので、テストは
+/// 一時ファイルを介さず XML 文字列を直接渡せる。`base_dir` は `obj`/環境マップの
+/// 相対パス解決に使う基準ディレクトリ。`base_config` は `<film>` 未指定時の
+/// フォールバック解像度（アスペクト比計算用）——書き換えない。
+pub fn load_scene_from_str(xml: &str, base_dir: &Path, base_config: &RenderConfig) -> io::Result<(Scene, SceneSettings)> {
+    let root = parse_tree(xml)?;
     if root.tag != "scene" {
         return Err(err("root element is not <scene>"));
     }
 
-    // 1st pass: レンダリング設定（film / sampler / integrator）を config に反映。
+    // 1st pass: レンダリング設定（film / sampler / integrator）を settings に集める。
+    let mut settings = SceneSettings::default();
     for child in &root.children {
         match child.tag.as_str() {
             "film" => {
                 if let Some(w) = child.int("width") {
-                    config.width = w.max(1);
+                    settings.width = Some(w.max(1));
                 }
                 if let Some(h) = child.int("height") {
-                    config.height = h.max(1);
+                    settings.height = Some(h.max(1));
                 }
             }
             "sampler" => {
                 if let Some(n) = child.int("sample_count") {
-                    config.spp = n.max(1);
+                    settings.spp = Some(n.max(1));
                 }
             }
             "integrator" => {
                 // Mitsuba の max_depth/rr_depth に対応（max_depth=-1 の無制限は未対応＝既定維持）
                 if let Some(d) = child.int("max_depth") {
-                    config.max_bounces = d.max(1);
+                    settings.max_bounces = Some(d.max(1));
                 }
                 if let Some(r) = child.int("rr_depth") {
-                    config.rr_start = r;
+                    settings.rr_start = Some(r);
                 }
             }
             _ => {}
         }
     }
 
-    // OBJ パスは XML ファイルのあるディレクトリからの相対で解決する。
-    let base_dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
-
-    // アスペクト比は（film 反映後の）解像度から求める。
-    let aspect = config.width as f64 / config.height as f64;
+    // アスペクト比は settings（film 指定）があればそれを、無ければ base_config を使う。
+    let width = settings.width.unwrap_or(base_config.width);
+    let height = settings.height.unwrap_or(base_config.height);
+    let aspect = width as f64 / height as f64;
     let mut world = World::new();
     let mut mats: Vec<Material> = Vec::new();
     let mut cam: Option<Camera> = None;
@@ -189,10 +221,10 @@ pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
                     warn(&format!("unsupported sensor type '{}', ignored", child.typ()));
                 }
             }
-            "shape" => parse_shape(child, &base_dir, &mut world, &mut mats),
+            "shape" => parse_shape(child, base_dir, &mut world, &mut mats),
             // シーン直下の emitter は環境マップ（envmap / constant）
             "emitter" => {
-                if let Some(e) = parse_scene_emitter(child, &base_dir) {
+                if let Some(e) = parse_scene_emitter(child, base_dir) {
                     env = Some(e);
                 }
             }
@@ -218,7 +250,19 @@ pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
     let env = Some(env.unwrap_or_else(|| EnvMap::constant(Color::new(0.0, 0.0, 0.0))));
 
     world.build_lights(&mats);
-    Ok(Scene { cam, world, mats, env })
+    Ok((Scene { cam, world, mats, env }, settings))
+}
+
+/// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
+/// アダプタ）。読み取った設定値は `config` に反映する（`None` の項目は現状維持）。
+/// CLI 明示値で上書きしたい場合は呼び出し側で行う（[`crate::load_scene`] の利用側参照）。
+pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
+    let xml = std::fs::read_to_string(path)?;
+    // OBJ パスは XML ファイルのあるディレクトリからの相対で解決する。
+    let base_dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+    let (scene, settings) = load_scene_from_str(&xml, &base_dir, config)?;
+    settings.apply(config);
+    Ok(scene)
 }
 
 /// シーン直下の `<emitter>`（環境マップ）を `EnvMap` にマップする。
@@ -367,7 +411,7 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
             mats.push(mat);
-            world.spheres.push(Sphere { c: center, r: radius, mat_id });
+            world.add_sphere(Sphere { c: center, r: radius, mat_id });
             return;
         }
         // Mitsuba 正準形: 中心原点・法線 +Z・[-1,1]² の正方形
@@ -405,9 +449,7 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
         .map(parse_transform)
         .unwrap_or_else(Transform::identity);
     mats.push(mat);
-    let mesh_id = world.meshes.len();
-    world.meshes.push(Mesh::new(tris));
-    world.instances.push(Instance { mesh_id, xform, mat_override: None });
+    world.add_mesh_instance(tris, xform, None);
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -606,17 +648,7 @@ mod tests {
     }
 
     fn load(xml: &str) -> Scene {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        // 並列テストでファイル名が衝突しないよう、プロセス ID + 連番で一意化する
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("tinypt_mitsuba_{}_{}.xml", std::process::id(), n));
-        let path = path.to_str().unwrap().to_string();
-        std::fs::write(&path, xml).unwrap();
-        let scene = load_scene(&path, &mut cfg()).unwrap();
-        std::fs::remove_file(&path).ok();
-        scene
+        load_scene_from_str(xml, Path::new("."), &cfg()).unwrap().0
     }
 
     #[test]
@@ -652,13 +684,13 @@ mod tests {
             </scene>"#,
         );
 
-        assert_eq!(scene.world.spheres.len(), 3);
+        assert_eq!(scene.world.spheres().len(), 3);
         assert_eq!(scene.mats.len(), 3);
         assert!(matches!(scene.mats[0], Material::Lambert { .. }));
         assert!(matches!(scene.mats[1], Material::Ggx { alpha, .. } if (alpha - 0.25).abs() < 1e-12));
         assert!(matches!(scene.mats[2], Material::DiffuseLight { .. }));
         // area emitter は build_lights でライトとして登録される
-        assert_eq!(scene.world.lights.len(), 1);
+        assert_eq!(scene.world.lights().len(), 1);
     }
 
     #[test]
@@ -683,13 +715,7 @@ mod tests {
 
     #[test]
     fn reads_film_sampler_integrator_into_config() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static C: AtomicUsize = AtomicUsize::new(0);
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("tinypt_cfg_{}_{}.xml", std::process::id(), n));
-        std::fs::write(
-            &path,
+        let (_scene, settings) = load_scene_from_str(
             r#"<scene version="3.0.0">
               <integrator type="path">
                 <integer name="max_depth" value="12"/>
@@ -702,11 +728,12 @@ mod tests {
               </film>
               <shape type="sphere"><bsdf type="diffuse"/></shape>
             </scene>"#,
+            Path::new("."),
+            &cfg(),
         )
         .unwrap();
         let mut config = cfg();
-        load_scene(path.to_str().unwrap(), &mut config).unwrap();
-        std::fs::remove_file(&path).ok();
+        settings.apply(&mut config);
         assert_eq!(config.width, 800);
         assert_eq!(config.height, 600);
         assert_eq!(config.spp, 256);
@@ -723,11 +750,11 @@ mod tests {
               <shape type="disk"><bsdf type="diffuse"/></shape>
             </scene>"#,
         );
-        assert_eq!(scene.world.meshes.len(), 3);
-        assert_eq!(scene.world.instances.len(), 3);
-        assert_eq!(scene.world.meshes[0].tris.len(), 2); // rectangle
-        assert_eq!(scene.world.meshes[1].tris.len(), 12); // cube
-        assert_eq!(scene.world.meshes[2].tris.len(), 64); // disk
+        assert_eq!(scene.world.meshes().len(), 3);
+        assert_eq!(scene.world.instances().len(), 3);
+        assert_eq!(scene.world.meshes()[0].tris.len(), 2); // rectangle
+        assert_eq!(scene.world.meshes()[1].tris.len(), 12); // cube
+        assert_eq!(scene.world.meshes()[2].tris.len(), 64); // disk
     }
 
     #[test]
@@ -739,6 +766,8 @@ mod tests {
         let obj = dir.join(format!("tinypt_m2_{}_{}.obj", std::process::id(), n));
         std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
         let objname = obj.file_name().unwrap().to_string_lossy().into_owned();
+        // XML 自体はファイル不要（load_scene_from_str）。obj だけは obj_loader が
+        // ファイルパスを要求するため実ファイルとして書き出す。
         let xml = format!(
             r#"<scene version="3.0.0">
               <shape type="obj">
@@ -749,18 +778,15 @@ mod tests {
             </scene>"#,
             objname
         );
-        let xmlpath = dir.join(format!("tinypt_m2_{}_{}.xml", std::process::id(), n));
-        std::fs::write(&xmlpath, &xml).unwrap();
-        let scene = load_scene(xmlpath.to_str().unwrap(), &mut cfg()).unwrap();
+        let scene = load_scene_from_str(&xml, &dir, &cfg()).unwrap().0;
         std::fs::remove_file(&obj).ok();
-        std::fs::remove_file(&xmlpath).ok();
 
-        assert_eq!(scene.world.meshes.len(), 1);
-        assert_eq!(scene.world.instances.len(), 1);
-        assert_eq!(scene.world.meshes[0].tris.len(), 1);
+        assert_eq!(scene.world.meshes().len(), 1);
+        assert_eq!(scene.world.instances().len(), 1);
+        assert_eq!(scene.world.meshes()[0].tris.len(), 1);
         assert_eq!(scene.mats.len(), 1);
         // 頂点 v0=(0,0,0) は translate(10,0,0) でワールド (10,0,0) になる
-        let inst = scene.world.instances[0];
+        let inst = scene.world.instances()[0];
         let p = inst.xform.apply_point(Vec3::new(0.0, 0.0, 0.0));
         assert!((p - Vec3::new(10.0, 0.0, 0.0)).len() < 1e-9);
     }
