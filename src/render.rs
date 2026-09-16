@@ -110,7 +110,7 @@ fn sample_pixel(
     limits: PathLimits,
     config: &RenderConfig,
 ) -> (Color, f64) {
-    let mut rng = Rng::new(seed_for(x as u32, y as u32, t.sample_start as u32) ^ config.seed);
+    let mut rng = Rng::new(seed_for(x as u32, y as u32, t.sample_start as u32, config.seed));
     let mut c = Color::new(0.0, 0.0, 0.0);
 
     let sample_once = |rng: &mut Rng| -> Color {
@@ -584,53 +584,93 @@ mod tests {
         h
     }
 
-    /// 蓄積バッファのハッシュ。`quantize` なら各値を 1e-9 単位に丸めてからハッシュする。
+    /// 蓄積バッファのハッシュ。`quantize` なら有限値を 1e-9 単位に丸めてからハッシュする。
     ///
     /// ゴールデン比較には丸めた値を使う。macOS の最適化ビルドは同じ引数の sin/cos を
     /// `__sincos_stret` にまとめるため、debug と release で数画素の値が最終 ulp だけ
     /// 異なる（出力の 8bit PPM は同一）。スレッド数比較は同一ビルド内なのでビット単位で行う。
+    ///
+    /// 丸めは有限かつ |x| < 1e9 の値だけに適用し、それ以外（NaN・±inf・巨大値）は
+    /// 生ビットを別タグで混ぜる。`NaN as i64` が 0 になり NaN と 0 が区別できなくなるのを防ぐ。
     fn buffer_hash(out: &RenderOutput, quantize: bool) -> u64 {
-        let mut bytes = Vec::with_capacity(out.acc.len() * 32);
+        let mut bytes = Vec::with_capacity(out.acc.len() * 36);
         for (c, w) in out.acc.iter().zip(&out.acc_w) {
             let v: Vec3 = (*c).into();
             for x in [v.x, v.y, v.z, *w] {
-                let bits = if quantize { ((x * 1e9).round() as i64) as u64 } else { x.to_bits() };
-                bytes.extend_from_slice(&bits.to_le_bytes());
+                if quantize && x.is_finite() && x.abs() < 1e9 {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&((x * 1e9).round() as i64).to_le_bytes());
+                } else {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&x.to_bits().to_le_bytes());
+                }
             }
         }
         fnv64(bytes)
     }
 
-    /// ゴールデン値。sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した
-    /// 蓄積バッファのハッシュ（1e-9 単位に丸め）と、それを `--tonemap none` 相当で書いた PPM のハッシュ。
-    /// `RENDER_REVISION` と対で更新する（片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 1;
-    const GOLDEN_BUFFER_HASH: u64 = 0xc986_0384_44f5_2318;
-    const GOLDEN_PPM_HASH: u64 = 0xa29f_d0bf_355c_3fe2;
-
-    /// 出力（蓄積バッファと PPM バイト列）が既知の値から変わっていないことを固定する。
-    /// 浮動小数点演算の決定性（Rust は FMA 縮約や fast-math をしない）に依拠する。
-    /// 別プラットフォームで libm（sin/cos/pow 等）の丸めが違うと値が変わりうる。
-    /// 1 / 3 / 利用可能スレッド数のいずれでも同じ値になることも確認する。
+    /// 丸めハッシュは NaN / ±inf / 0 を区別し、ulp 程度の差は同一視する。
     #[test]
-    fn golden_cornell_output_is_unchanged() {
-        let mut config = RenderConfig::default();
-        let scene = crate::mitsuba::load_scene("sample/cornell.xml", &mut config).expect("load sample/cornell.xml");
-        config.width = 48;
-        config.height = 48;
-        config.spp = 2;
-        config.seed = 0;
-        config.tile = 16;
-        config.morton_enabled = true;
-        config.adaptive_enabled = false;
-        config.checkpoint_enabled = false;
+    fn buffer_hash_distinguishes_non_finite() {
+        let make = |x: f64| RenderOutput { acc: vec![Color::new(x, 0.5, 0.25)], acc_w: vec![1.0] };
+        let h = |x: f64| buffer_hash(&make(x), true);
+        let zero = h(0.0);
+        assert_ne!(h(f64::NAN), zero);
+        assert_ne!(h(f64::INFINITY), zero);
+        assert_ne!(h(f64::NEG_INFINITY), zero);
+        assert_ne!(h(f64::INFINITY), h(f64::NEG_INFINITY));
+        assert_ne!(h(f64::NAN), h(f64::INFINITY));
+        let x = 0.3945;
+        assert_eq!(h(x), h(f64::from_bits(x.to_bits() + 1)), "ulp difference must not change the quantized hash");
+        assert_ne!(h(x), h(x + 1e-6));
+    }
 
+    /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
+    const GOLDEN_REVISION: u32 = 2;
+
+    /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
+    /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
+    const GOLDEN_CORNELL: (u64, u64) = (0x464e_e7d7_13d1_3df2, 0xfc1b_b376_da34_236a);
+
+    /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
+    const GOLDEN_SPHERES: (u64, u64) = (0x716e_39c0_f75c_3599, 0x5ebf_8a33_3aa6_8c53);
+
+    /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
+    /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。
+    const GOLDEN_SPHERES_XML: &str = r#"<scene version="3.0.0">
+      <integrator type="path"><integer name="max_depth" value="8"/><integer name="rr_depth" value="3"/></integrator>
+      <sensor type="perspective">
+        <float name="fov" value="40"/>
+        <float name="aperture_radius" value="0.05"/>
+        <float name="focus_distance" value="3.5"/>
+        <transform name="to_world"><lookat origin="0, 1.2, 4" target="0, 0.5, 0" up="0, 1, 0"/></transform>
+      </sensor>
+      <shape type="sphere"><point name="center" x="0" y="-1000" z="0"/><float name="radius" value="1000"/>
+        <bsdf type="diffuse"><srgb name="reflectance" value="0.5, 0.5, 0.5"/></bsdf></shape>
+      <shape type="sphere"><point name="center" x="-1.8" y="0.5" z="0"/><float name="radius" value="0.5"/>
+        <bsdf type="diffuse"><srgb name="reflectance" value="0.8, 0.3, 0.3"/></bsdf></shape>
+      <shape type="sphere"><point name="center" x="-0.6" y="0.5" z="0"/><float name="radius" value="0.5"/>
+        <bsdf type="conductor"><srgb name="specular_reflectance" value="0.8, 0.8, 0.8"/></bsdf></shape>
+      <shape type="sphere"><point name="center" x="0.6" y="0.5" z="0"/><float name="radius" value="0.5"/>
+        <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.25"/>
+          <srgb name="specular_reflectance" value="0.95, 0.78, 0.35"/></bsdf></shape>
+      <shape type="sphere"><point name="center" x="1.8" y="0.5" z="0"/><float name="radius" value="0.5"/>
+        <bsdf type="dielectric"><float name="int_ior" value="1.5"/><rgb name="absorption" value="0.02, 0.05, 0.02"/></bsdf></shape>
+      <shape type="sphere"><point name="center" x="0" y="3" z="-1"/><float name="radius" value="0.8"/>
+        <emitter type="area"><rgb name="radiance" value="8, 7, 5"/></emitter></shape>
+      <emitter type="constant"><rgb name="radiance" value="0.4, 0.5, 0.7"/></emitter>
+    </scene>"#;
+
+    /// 小さく描画し、スレッド数 1 / 3 / 利用可能数で出力がビット単位で同じことを確かめてから、
+    /// ゴールデン値と比較する。浮動小数点演算の決定性（Rust は FMA 縮約や fast-math をしない）に
+    /// 依拠する。別プラットフォームで libm（sin/cos/pow 等）の丸めが違うと値が変わりうる。
+    fn check_golden(name: &str, scene: &Scene, config: &RenderConfig, golden: (u64, u64)) {
         let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(2);
         let mut hashes = Vec::new();
         for threads in [1, 3, max_threads] {
-            let out = render_with_threads(&scene, &config, "", threads).unwrap();
+            let out = render_with_threads(scene, config, "", threads).unwrap();
             let pixels = crate::output::resolve_pixels(config.width, config.height, &out.acc, &out.acc_w);
-            let path = std::env::temp_dir().join(format!("tinypt_golden_{}_{}.ppm", std::process::id(), threads));
+            let path = std::env::temp_dir().join(format!("tinypt_golden_{}_{}_{}.ppm", name, std::process::id(), threads));
             let path = path.to_string_lossy().into_owned();
             let settings = crate::output::OutputSettings { exposure: 0.0, tonemap: crate::config::Tonemap::None };
             crate::output::OutputFormat::Ppm.write(&path, config.width, config.height, &pixels, settings).unwrap();
@@ -639,22 +679,54 @@ mod tests {
             hashes.push((threads, buffer_hash(&out, false), buffer_hash(&out, true), fnv64(ppm)));
         }
         for &(threads, exact, _, p) in &hashes[1..] {
-            assert_eq!((exact, p), (hashes[0].1, hashes[0].3), "output depends on thread count ({} vs 1)", threads);
+            assert_eq!((exact, p), (hashes[0].1, hashes[0].3), "{}: output depends on thread count ({} vs 1)", name, threads);
         }
         let (_, _, buffer, ppm) = hashes[0];
         assert_eq!(
             crate::constants::RENDER_REVISION, GOLDEN_REVISION,
-            "RENDER_REVISION was bumped: re-record GOLDEN_BUFFER_HASH / GOLDEN_PPM_HASH for the new output \
-             (current: 0x{:016x} / 0x{:016x}) and set GOLDEN_REVISION to match",
-            buffer, ppm
+            "RENDER_REVISION was bumped: re-record the golden hashes for the new output \
+             ({}: 0x{:016x} / 0x{:016x}) and set GOLDEN_REVISION to match",
+            name, buffer, ppm
         );
         assert!(
-            buffer == GOLDEN_BUFFER_HASH && ppm == GOLDEN_PPM_HASH,
-            "rendered output changed: buffer hash 0x{:016x} (golden 0x{:016x}), PPM hash 0x{:016x} (golden 0x{:016x}).\n\
+            (buffer, ppm) == golden,
+            "{}: rendered output changed: buffer hash 0x{:016x} (golden 0x{:016x}), PPM hash 0x{:016x} (golden 0x{:016x}).\n\
              If this change is meant to alter the output, bump constants::RENDER_REVISION (so old checkpoints \
-             are not resumed) and update GOLDEN_BUFFER_HASH / GOLDEN_PPM_HASH in src/render.rs to the new values.\n\
+             are not resumed) and update the GOLDEN_* hashes in src/render.rs to the new values.\n\
              If it is not meant to alter the output, this is a regression.",
-            buffer, GOLDEN_BUFFER_HASH, ppm, GOLDEN_PPM_HASH
+            name, buffer, golden.0, ppm, golden.1
         );
+    }
+
+    fn golden_config(config: &mut RenderConfig, width: usize, height: usize) {
+        config.width = width;
+        config.height = height;
+        config.spp = 2;
+        config.seed = 0;
+        config.tile = 16;
+        config.morton_enabled = true;
+        config.adaptive_enabled = false;
+        config.checkpoint_enabled = false;
+    }
+
+    /// Cornell box（面光源・長方形/立方体インスタンス・黒背景）の出力を固定する。
+    #[test]
+    fn golden_cornell_output_is_unchanged() {
+        let mut config = RenderConfig::default();
+        let scene = crate::mitsuba::load_scene("sample/cornell.xml", &mut config).expect("load sample/cornell.xml");
+        golden_config(&mut config, 48, 48);
+        check_golden("cornell", &scene, &config, GOLDEN_CORNELL);
+    }
+
+    /// 球シーン（GGX・ガラス・金属・球光源・constant 環境光・DOF）の出力を固定する。
+    #[test]
+    fn golden_spheres_output_is_unchanged() {
+        let mut config = RenderConfig::default();
+        golden_config(&mut config, 64, 36);
+        let (scene, settings) = crate::mitsuba::load_scene_from_str(GOLDEN_SPHERES_XML, std::path::Path::new("."), &config)
+            .expect("parse golden spheres scene");
+        settings.apply(&mut config);
+        golden_config(&mut config, 64, 36);
+        check_golden("spheres", &scene, &config, GOLDEN_SPHERES);
     }
 }

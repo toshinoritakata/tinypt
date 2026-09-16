@@ -6,13 +6,16 @@
 //! ## ライトサンプリング
 //! 発光マテリアルを持つプリミティブから CDF を構築し、
 //! 面積 × 輝度に比例した確率でライトを選択する。
+//! 選んだライト上の点は `Light::sample` で求める。球光源は参照点から見える円錐を立体角一様に
+//! サンプリングし（参照点が球の内部なら表面積一様）、三角形光源は表面積一様。
+//! PDF は `Light::pdf_omega` に一本化され、`sample_light` と `light_pdf` が共有する。
 
 use crate::bvh::Bvh;
 use crate::geometry::{Hit, Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{cdf_search, Color, Vec3};
 use crate::ray::Ray;
-use crate::rng::{uniform_sphere_dir, Rng};
+use crate::rng::Rng;
 use crate::transform::Transform;
 
 
@@ -273,24 +276,8 @@ impl World {
             None => return 0.0,
         };
         let info = &self.lights[light_id];
-        let area = info.light.area(self, time);
-        if area <= 0.0 {
-            return 0.0;
-        }
-        let to_light = hit.p - from;
-        let dist2 = to_light.dot(to_light);
-        if dist2 <= 1e-12 {
-            return 0.0;
-        }
-        let dist = dist2.sqrt();
-        let wi = to_light / dist;
-        let cos_light = hit.n.dot(-wi).max(0.0);
-        if cos_light <= 0.0 {
-            return 0.0;
-        }
         let pdf_select = info.weight / self.light_total;
-        let pdf_area = 1.0 / area;
-        pdf_select * pdf_area * dist2 / cos_light
+        pdf_select * info.light.pdf_omega(self, time, from, hit.p, hit.n)
     }
 
     /// CDF を使ってライトを重点的にサンプリングし、位置・法線・放射輝度・PDF を返す。
@@ -304,27 +291,11 @@ impl World {
         let info = self.lights[idx];
         let pdf_select = info.weight / self.light_total;
 
-        // シェープ別の表面サンプリングは Light に委譲（build_lights と共有）
-        let (pos, normal, area) = info.light.sample_surface(self, time, rng)?;
-
-        if area <= 0.0 {
-            return None;
-        }
-        let to_light = pos - p;
-        let dist2 = to_light.dot(to_light);
-        if dist2 <= 1e-12 {
-            return None;
-        }
-        let dist = dist2.sqrt();
-        let wi = to_light / dist;
-        let cos_light = normal.dot(-wi).max(0.0);
-        if cos_light <= 0.0 {
-            return None;
-        }
-        let pdf_area = 1.0 / area;
-        let pdf_omega = pdf_area * dist2 / cos_light;
-        let pdf = pdf_select * pdf_omega;
-        if pdf <= 0.0 {
+        // シェープ別のサンプリングと PDF は Light に委譲する。PDF は light_pdf と同じ関数で
+        // 求めるので、BSDF サンプリング側の MIS 重みと常に一致する。
+        let (pos, normal) = info.light.sample(self, time, p, rng)?;
+        let pdf = pdf_select * info.light.pdf_omega(self, time, p, pos, normal);
+        if !(pdf > 0.0 && pdf.is_finite()) {
             return None;
         }
         Some(LightSample {
@@ -364,16 +335,45 @@ impl Light {
         }
     }
 
-    /// 発光面を一様サンプリングし、`(位置, 法線, 面積)` を返す。
-    /// ジオメトリが見つからない場合は `None`。
-    fn sample_surface(&self, world: &World, time: f64, rng: &mut Rng) -> Option<(Vec3, Vec3, f64)> {
+    /// 参照点 `from` から発光面上の点をサンプリングし、`(位置, 外向き法線)` を返す。
+    /// 対応する立体角 PDF（選択確率を除く）は [`Light::pdf_omega`] が与える。
+    ///
+    /// - 球: `from` が球の外なら、`from` から見える円錐（立体角）を一様サンプリングする。
+    ///   球の内部（境界を含む）なら表面積一様サンプリングにフォールバックする。
+    /// - 三角形: 表面積一様サンプリング。
+    fn sample(&self, world: &World, time: f64, from: Vec3, rng: &mut Rng) -> Option<(Vec3, Vec3)> {
         match *self {
             Light::Sphere { idx } => {
                 let s = world.spheres.get(idx)?;
-                let dir = uniform_sphere_dir(rng);
-                let pos = s.c + dir * s.r;
-                let area = 4.0 * std::f64::consts::PI * s.r * s.r;
-                Some((pos, dir, area))
+                let u = rng.next_f64();
+                let v = rng.next_f64();
+                match sphere_cone(s, from) {
+                    Some(cone) => {
+                        // PBRT v4 の球の円錐サンプリング（小さな円錐では sin² の一次近似で精度を保つ）
+                        let (sin2_theta, cos_theta) = if cone.sin2_max < SMALL_CONE_SIN2 {
+                            let sin2 = cone.sin2_max * u;
+                            (sin2, (1.0 - sin2).max(0.0).sqrt())
+                        } else {
+                            let cos = (cone.cos_max - 1.0) * u + 1.0;
+                            ((1.0 - cos * cos).max(0.0), cos)
+                        };
+                        // 円錐内の方向 θ に対応する球面上の点の、球中心から見た角 α
+                        let cos_alpha = sin2_theta / cone.sin2_max.sqrt()
+                            + cos_theta * (1.0 - sin2_theta / cone.sin2_max).max(0.0).sqrt();
+                        let sin_alpha = (1.0 - cos_alpha * cos_alpha).max(0.0).sqrt();
+                        let phi = std::f64::consts::TAU * v;
+                        let (t, b) = orthonormal_basis(cone.axis);
+                        let n = -(t * (sin_alpha * phi.cos()) + b * (sin_alpha * phi.sin()) + cone.axis * cos_alpha);
+                        Some((s.c + n * s.r, n))
+                    }
+                    None => {
+                        let z = 1.0 - 2.0 * u;
+                        let r = (1.0 - z * z).max(0.0).sqrt();
+                        let phi = std::f64::consts::TAU * v;
+                        let n = Vec3::new(r * phi.cos(), z, r * phi.sin());
+                        Some((s.c + n * s.r, n))
+                    }
+                }
             }
             Light::Triangle { mesh_id, tri_id, inst_id } => {
                 let (v0w, v1w, v2w) = tri_world_verts(world, mesh_id, tri_id, inst_id, time)?;
@@ -386,12 +386,88 @@ impl Light {
                 let pos = v0w * b0 + v1w * b1 + v2w * b2;
 
                 let n = (v1w - v0w).cross(v2w - v0w);
-                let area = 0.5 * n.len();
-                let normal = if area > 0.0 { n / (2.0 * area) } else { Vec3::new(0.0, 1.0, 0.0) };
-                Some((pos, normal, area))
+                let len = n.len();
+                let normal = if len > 0.0 { n / len } else { Vec3::new(0.0, 1.0, 0.0) };
+                Some((pos, normal))
             }
         }
     }
+
+    /// 参照点 `from` から発光面上の点 `pos`（法線 `normal`）への方向の立体角 PDF
+    /// （ライト選択確率を除く）。[`Light::sample`] のサンプル分布と一致する。
+    /// その方向がサンプルされえない（裏向き・退化）場合は 0。
+    fn pdf_omega(&self, world: &World, time: f64, from: Vec3, pos: Vec3, normal: Vec3) -> f64 {
+        let to_light = pos - from;
+        let dist2 = to_light.dot(to_light);
+        if dist2 <= 1e-12 {
+            return 0.0;
+        }
+        let wi = to_light / dist2.sqrt();
+        let cos_light = normal.dot(-wi);
+        match *self {
+            Light::Sphere { idx } => {
+                let Some(s) = world.spheres.get(idx) else { return 0.0 };
+                match sphere_cone(s, from) {
+                    // 外部: 見える側（cos_light > 0）の点だけがサンプルされ、円錐内で一様
+                    Some(cone) => {
+                        if cos_light <= 0.0 {
+                            0.0
+                        } else {
+                            1.0 / (std::f64::consts::TAU * cone.one_minus_cos_max)
+                        }
+                    }
+                    // 内部: 表面積一様。内側からは外向き法線と逆向きに見えるので |cos| を使う
+                    None => {
+                        let area = 4.0 * std::f64::consts::PI * s.r * s.r;
+                        let c = cos_light.abs();
+                        if c <= 0.0 || area <= 0.0 { 0.0 } else { dist2 / (area * c) }
+                    }
+                }
+            }
+            Light::Triangle { .. } => {
+                let area = self.area(world, time);
+                if cos_light <= 0.0 || area <= 0.0 { 0.0 } else { dist2 / (area * cos_light) }
+            }
+        }
+    }
+}
+
+/// 円錐サンプリングで sin²θmax の一次近似に切り替える閾値（PBRT v4 と同じ。約 1.5°）。
+const SMALL_CONE_SIN2: f64 = 0.00068523;
+
+/// 球の外部の点から見た円錐。
+struct SphereCone {
+    /// 参照点から球中心への単位ベクトル
+    axis: Vec3,
+    sin2_max: f64,
+    cos_max: f64,
+    /// 1 − cosθmax（小さな円錐では sin²θmax/2 で精度を保つ）
+    one_minus_cos_max: f64,
+}
+
+/// `from` が球の外部なら、`from` から球を見込む円錐を返す。内部（境界を含む）なら `None`。
+fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
+    let to_c = s.c - from;
+    let dc2 = to_c.dot(to_c);
+    let r2 = s.r * s.r;
+    if dc2 <= r2 {
+        return None;
+    }
+    let sin2_max = r2 / dc2;
+    let cos_max = (1.0 - sin2_max).max(0.0).sqrt();
+    let one_minus_cos_max = if sin2_max < SMALL_CONE_SIN2 { 0.5 * sin2_max } else { 1.0 - cos_max };
+    if one_minus_cos_max <= 0.0 {
+        return None;
+    }
+    Some(SphereCone { axis: to_c / dc2.sqrt(), sin2_max, cos_max, one_minus_cos_max })
+}
+
+/// 単位ベクトル `w` に直交する正規直交基底 (t, b)。
+fn orthonormal_basis(w: Vec3) -> (Vec3, Vec3) {
+    let a = if w.x.abs() > 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+    let t = w.cross(a).norm();
+    let b = t.cross(w);
+    (t, b)
 }
 
 /// 三角形のワールド空間頂点を `time` における（インスタンス変換適用後の）位置で返す。
@@ -437,6 +513,7 @@ pub struct LightSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rng::uniform_sphere_dir;
     use crate::geometry::Sphere;
 
     fn emissive_sphere_world(c: Vec3, r: f64) -> World {
@@ -654,6 +731,111 @@ mod tests {
             }
         }
         assert!(checked > 0, "no valid light samples");
+    }
+
+    /// 参照点のバリエーション: 近い外部・遠い外部（sin²θmax が小円錐近似の閾値未満）・
+    /// 表面すれすれの外部・内部（中心付近と表面付近）。
+    fn sphere_light_reference_points() -> Vec<(&'static str, Vec3)> {
+        vec![
+            ("near outside", Vec3::new(2.5, 0.7, -0.4)),
+            ("far outside (small cone)", Vec3::new(300.0, -50.0, 120.0)),
+            ("just outside", Vec3::new(1.5 + 1e-3, 0.0, 0.0)),
+            ("inside center", Vec3::new(0.1, -0.2, 0.05)),
+            // 表面から 0.2。表面ごく近傍（例 0.01）だと面積サンプリングの 1/pdf の分散が
+            // 対数発散し、有限サンプルの平均推定が安定しないため
+            ("inside near surface", Vec3::new(0.0, 1.3, 0.0)),
+        ]
+    }
+
+    /// 円錐サンプリング／内部フォールバックの両方で、sample_light の pdf は同じ点への light_pdf と一致し、
+    /// サンプル点は球面上にある。外部からのサンプルは参照点から見える側（cos_light > 0）にある。
+    #[test]
+    fn sphere_light_pdf_matches_for_cone_and_inside_fallback() {
+        let c = Vec3::new(0.0, 0.0, 0.0);
+        let r = 1.5;
+        let world = emissive_sphere_world(c, r);
+        let mut rng = Rng::new(21);
+        for (name, from) in sphere_light_reference_points() {
+            let inside = (from - c).len() <= r;
+            let mut got = 0;
+            for _ in 0..4000 {
+                let Some(ls) = world.sample_light(&mut rng, 0.0, from) else { continue };
+                got += 1;
+                assert!(((ls.position - c).len() - r).abs() < 1e-9, "{}: off surface", name);
+                if !inside {
+                    let wi = (ls.position - from).norm();
+                    assert!(ls.normal.dot(-wi) > 0.0, "{}: sampled a point not visible from outside", name);
+                }
+                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None };
+                let pdf = world.light_pdf(from, 0.0, &hit);
+                assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "{}: light_pdf {} != sample pdf {}", name, pdf, ls.pdf);
+            }
+            assert!(got > 3900, "{}: too many rejected samples ({} / 4000)", name, got);
+        }
+    }
+
+    /// light_pdf を立体角で積分すると 1（BSDF 側から見た光源の方向分布が正規化されている）。
+    /// 全球一様な方向にレイを飛ばし、光源に当たった点の light_pdf の平均 × 4π で推定する。
+    #[test]
+    fn sphere_light_pdf_integrates_to_one_over_solid_angle() {
+        let c = Vec3::new(0.0, 0.0, 0.0);
+        let r = 1.5;
+        let world = emissive_sphere_world(c, r);
+        let mut rng = Rng::new(99);
+        for (name, from) in sphere_light_reference_points() {
+            // 外部では円錐を少し広げたキャップ（立体角は円錐の 1.5 倍）、内部では全球に
+            // 一様な方向で推定する（遠い小円錐は全球一様だとほとんど当たらないため）
+            let axis = (c - from).norm();
+            let dc = (c - from).len();
+            let cap_cos = if dc > r {
+                let sin2 = (r / dc).powi(2);
+                let one_minus_cos = if sin2 < 1e-3 { 0.5 * sin2 } else { 1.0 - (1.0 - sin2).sqrt() };
+                1.0 - 1.5 * one_minus_cos
+            } else {
+                -1.0
+            };
+            let omega_cap = std::f64::consts::TAU * (1.0 - cap_cos);
+            let (t, b) = orthonormal_basis(axis);
+            let n = 400_000;
+            let mut sum = 0.0;
+            for _ in 0..n {
+                let z = 1.0 - rng.next_f64() * (1.0 - cap_cos);
+                let rr = (1.0 - z * z).max(0.0).sqrt();
+                let phi = std::f64::consts::TAU * rng.next_f64();
+                let d = t * (rr * phi.cos()) + b * (rr * phi.sin()) + axis * z;
+                if let Some(h) = world.hit(Ray { o: from, d, time: 0.0 }, 1e-9, 1e30) {
+                    sum += world.light_pdf(from, 0.0, &h);
+                }
+            }
+            let integral = sum / n as f64 * omega_cap;
+            assert!((integral - 1.0).abs() < 0.01, "{}: ∫pdf dω = {}", name, integral);
+        }
+    }
+
+    /// 円錐サンプリングの推定は不偏: E[cosθ / pdf] = ∫_cone cosθ dω = π·sin²θmax
+    /// （θ は球中心方向からの角）。内部フォールバックでは E[1/pdf] = 4π。
+    #[test]
+    fn sphere_light_estimates_are_unbiased() {
+        let c = Vec3::new(0.0, 0.0, 0.0);
+        let r = 1.5;
+        let world = emissive_sphere_world(c, r);
+        let mut rng = Rng::new(3);
+        let n = 200_000;
+        for (name, from) in sphere_light_reference_points() {
+            let dc = (c - from).len();
+            let axis = (c - from) / dc;
+            let mut sum = 0.0;
+            let inside = dc <= r;
+            for _ in 0..n {
+                if let Some(ls) = world.sample_light(&mut rng, 0.0, from) {
+                    let f = if inside { 1.0 } else { (ls.position - from).norm().dot(axis) };
+                    sum += f / ls.pdf;
+                }
+            }
+            let est = sum / n as f64;
+            let exact = if inside { 4.0 * std::f64::consts::PI } else { std::f64::consts::PI * (r / dc).powi(2) };
+            assert!((est / exact - 1.0).abs() < 0.01, "{}: estimate {} vs exact {}", name, est, exact);
+        }
     }
 
     /// 発光体でないヒット（`inst_id`/`prim_id` が既知の発光体と一致しない）に対しては 0 を返す。

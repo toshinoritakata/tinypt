@@ -3,7 +3,8 @@
 //! 単方向パストレーサーとして以下の機能を実装:
 //! - **NEE（Next Event Estimation）**: 各バウンスで光源を直接サンプリングし直接照明を推定
 //! - **MIS**: BSDF サンプリングと光源サンプリングを Power Heuristic (β=2) で統合
-//! - **Russian Roulette**: スループットに基づく確率的なパス打ち切り（不偏性を維持）
+//! - **Russian Roulette**: スループットに基づく確率的なパス打ち切り（不偏性を維持）。
+//!   発光・NEE の寄与を積んだ後、BSDF サンプリングの直前で判定する
 //! - **Firefly クランプ**: 異常に明るい寄与を輝度ベースでクランプ。MIS の両側（BSDF サンプリングで
 //!   光源/背景に当たった寄与と、NEE の寄与）に寄与単位で同じ閾値を掛け、対称に保つ
 //!
@@ -85,17 +86,6 @@ pub fn radiance(
             }
         };
 
-        // Russian Roulette: probabilistic path termination for unbiased rendering.
-        // The survival probability is based on the maximum throughput component,
-        // clamped to [0.05, 0.95] to avoid extreme variance.
-        if bounce >= limits.rr_start {
-            let p = path_throughput.r().max(path_throughput.g()).max(path_throughput.b()).min(0.95).max(0.05);
-            if rng.next_f64() > p {
-                break;
-            }
-            path_throughput = path_throughput / p;
-        }
-
         let mat = mats[hit.mat_id];
 
         // 発光体に命中: 放射輝度を蓄積しパス終了
@@ -130,6 +120,18 @@ pub fn radiance(
                 );
                 accumulated_radiance = accumulated_radiance + contrib;
             }
+        }
+
+        // Russian Roulette: 確率的にパスを打ち切る（生存時は 1/p で補償するので不偏）。
+        // この頂点での発光・NEE の寄与を積んだ後、続きのパス（BSDF サンプリング）を
+        // 延ばすかどうかだけを判定する。打ち切っても既に得た直接光は失われない。
+        // 生存確率はスループットの最大成分を [0.05, 0.95] にクランプしたもの。
+        if bounce >= limits.rr_start {
+            let p = path_throughput.r().max(path_throughput.g()).max(path_throughput.b()).min(0.95).max(0.05);
+            if rng.next_f64() > p {
+                break;
+            }
+            path_throughput = path_throughput / p;
         }
 
         // BSDF サンプリング: 散乱レイ・スループット重み・PDF を BSDF から取得
