@@ -4,7 +4,8 @@
 //! - **NEE（Next Event Estimation）**: 各バウンスで光源を直接サンプリングし直接照明を推定
 //! - **MIS**: BSDF サンプリングと光源サンプリングを Power Heuristic (β=2) で統合
 //! - **Russian Roulette**: スループットに基づく確率的なパス打ち切り（不偏性を維持）
-//! - **Firefly クランプ**: 異常に明るいサンプルを輝度ベースでクランプ
+//! - **Firefly クランプ**: 異常に明るい寄与を輝度ベースでクランプ。MIS の両側（BSDF サンプリングで
+//!   光源/背景に当たった寄与と、NEE の寄与）に寄与単位で同じ閾値を掛け、対称に保つ
 //!
 //! ## レンダリング方程式
 //! L_o(x, ω_o) = L_e(x, ω_o) + ∫ f(x, ω_i, ω_o) L_i(x, ω_i) cos(θ_i) dω_i
@@ -117,12 +118,16 @@ pub fn radiance(
         if !mat.is_delta() {
             // NEE: Environment map
             if let Some(env_map) = env {
-                let contrib = nee_environment(world, env_map, &mat, path_throughput, hit.p, n, ray, rng);
+                let occluded = |shadow: Ray| world.hit(shadow, RAY_EPSILON, RAY_T_MAX).is_some();
+                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, hit.p, n, ray, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
             if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
-                let contrib = nee_area_light(world, &mat, path_throughput, hit.p, n, ray, &ls);
+                let contrib = nee_area_light(
+                    |shadow: Ray, tmax: f64| world.hit(shadow, RAY_EPSILON, tmax).is_some(),
+                    &mat, path_throughput, hit.p, n, ray, &ls,
+                );
                 accumulated_radiance = accumulated_radiance + contrib;
             }
         }
@@ -154,8 +159,15 @@ use crate::world::LightSample;
 ///
 /// 環境マップから重点的にサンプリングした方向に対し、
 /// シャドウレイで遮蔽判定を行い、MIS 重みを適用して寄与を返す。
+///
+/// `occluded` はシャドウレイの遮蔽判定（通常は `world.hit`）。テストで呼び出し回数を
+/// 観測できるよう注入する。
+///
+/// サンプルした放射輝度が厳密にゼロ（黒背景の constant emitter など）なら、寄与は
+/// どうせ 0 なのでシャドウレイを撃たずに返す。`sample_dir` は必ず先に呼ぶので
+/// RNG 消費列は変わらず、出力はビット単位で同一のまま。
 fn nee_environment(
-    world: &World,
+    occluded: impl Fn(Ray) -> bool,
     env_map: &EnvMap,
     mat: &Material,
     path_throughput: Color,
@@ -166,26 +178,35 @@ fn nee_environment(
 ) -> Color {
     let (wi, li, pdf_env) = env_map.sample_dir(rng);
     let cos = n.dot(wi).max(0.0);
-    if cos <= 0.0 || pdf_env <= 0.0 {
+    if cos <= 0.0 || pdf_env <= 0.0 || is_black(li) {
         return Color::new(0.0, 0.0, 0.0);
     }
 
     let shadow = Ray { o: hit_p + RAY_EPSILON * wi, d: wi, time: ray.time };
-    if world.hit(shadow, RAY_EPSILON, RAY_T_MAX).is_some() {
+    if occluded(shadow) {
         return Color::new(0.0, 0.0, 0.0);
     }
 
     let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), wi, n);
     let w = mis_weight(pdf_env, pdf_bsdf);
-    path_throughput.hadamard(f).hadamard(li) * (cos * w / pdf_env)
+    // BSDF 側（背景ヒット）と同じ閾値でクランプし、MIS の両側を対称にする
+    (path_throughput.hadamard(f).hadamard(li) * (cos * w / pdf_env)).clamp_luminance(FIREFLY_CLAMP)
+}
+
+/// 全チャネルが厳密に 0 か。負値チャネルを含む色を誤って捨てないよう、
+/// 輝度ではなく成分ごとに判定する（スキップ前後で寄与が完全に同じになる条件）。
+fn is_black(c: Color) -> bool {
+    c.r() == 0.0 && c.g() == 0.0 && c.b() == 0.0
 }
 
 /// 面光源に対する NEE（Next Event Estimation / 直接照明推定）。
 ///
 /// CDF で選択されたライトの表面上をサンプリングし、
 /// シャドウレイで遮蔽判定後、MIS 重みを適用して寄与を返す。
+///
+/// `occluded(shadow, tmax)` はシャドウレイの遮蔽判定（通常は `world.hit`）。
 fn nee_area_light(
-    world: &World,
+    occluded: impl Fn(Ray, f64) -> bool,
     mat: &Material,
     path_throughput: Color,
     hit_p: Vec3,
@@ -210,7 +231,7 @@ fn nee_area_light(
     // 原点を ε 前進させているため、ライト面は新原点から dist−ε に位置する。
     // tmax を dist−2ε にしないと丸め次第でライト自身に遮蔽判定される
     let tmax = (dist - 2.0 * RAY_EPSILON).max(RAY_EPSILON);
-    if world.hit(shadow, RAY_EPSILON, tmax).is_some() {
+    if occluded(shadow, tmax) {
         return Color::new(0.0, 0.0, 0.0);
     }
 
@@ -220,7 +241,8 @@ fn nee_area_light(
     }
 
     let w = mis_weight(ls.pdf, pdf_bsdf);
-    path_throughput.hadamard(f).hadamard(ls.emit) * (cos * w / ls.pdf)
+    // BSDF 側（発光体ヒット）と同じ閾値でクランプし、MIS の両側を対称にする
+    (path_throughput.hadamard(f).hadamard(ls.emit) * (cos * w / ls.pdf)).clamp_luminance(FIREFLY_CLAMP)
 }
 
 /// Power Heuristic (β=2) による MIS 重みを計算する。
@@ -233,4 +255,112 @@ fn mis_weight(pdf_a: f64, pdf_b: f64) -> f64 {
     let a2 = pdf_a * pdf_a;
     let b2 = pdf_b * pdf_b;
     if a2 + b2 > 0.0 { a2 / (a2 + b2) } else { 0.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn floor_setup() -> (Material, Vec3, Vec3, Ray) {
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        let p = Vec3::new(0.0, 0.0, 0.0);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
+        (mat, p, n, ray)
+    }
+
+    /// 黒い env ではシャドウレイ（遮蔽判定）を一度も撃たず、寄与は 0。
+    /// RNG は sample_dir 単体と同じだけ消費される（出力のバイト一致の前提）。
+    #[test]
+    fn black_env_skips_shadow_ray_but_consumes_same_rng() {
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+        let (mat, p, n, ray) = floor_setup();
+        let calls = Cell::new(0usize);
+        let mut rng = Rng::new(42);
+        let mut reference = Rng::new(42);
+        for _ in 0..1000 {
+            let c = nee_environment(
+                |_| { calls.set(calls.get() + 1); false },
+                &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &mut rng,
+            );
+            let _ = env.sample_dir(&mut reference);
+            assert!(is_black(c));
+        }
+        assert_eq!(calls.get(), 0, "shadow rays cast against a black env");
+        assert_eq!(rng.next_u32(), reference.next_u32(), "RNG consumption must match sample_dir");
+    }
+
+    /// 非ゼロの env では従来どおりシャドウレイを撃ち、非遮蔽なら正の寄与を返す。
+    #[test]
+    fn nonblack_env_still_casts_shadow_rays() {
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        let (mat, p, n, ray) = floor_setup();
+        let calls = Cell::new(0usize);
+        let mut rng = Rng::new(42);
+        let mut total = 0.0;
+        for _ in 0..1000 {
+            let c = nee_environment(
+                |_| { calls.set(calls.get() + 1); false },
+                &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &mut rng,
+            );
+            total += c.luminance();
+        }
+        assert!(calls.get() > 0);
+        assert!(total > 0.0);
+    }
+
+    /// 環境 NEE の高輝度寄与は FIREFLY_CLAMP でクランプされる（BSDF 側と対称）。
+    #[test]
+    fn env_nee_contribution_is_clamped() {
+        let env = EnvMap::constant(Color::new(1e6, 1e6, 1e6));
+        let (mat, p, n, ray) = floor_setup();
+        let mut rng = Rng::new(7);
+        let mut max_l: f64 = 0.0;
+        for _ in 0..200 {
+            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &mut rng);
+            max_l = max_l.max(c.luminance());
+        }
+        assert!(max_l > 0.0);
+        assert!(max_l <= FIREFLY_CLAMP * (1.0 + 1e-12), "max luminance = {}", max_l);
+    }
+
+    /// 面光源 NEE の高輝度寄与は FIREFLY_CLAMP でクランプされ、色相（比率）は保たれる。
+    #[test]
+    fn area_light_nee_contribution_is_clamped() {
+        let (mat, p, n, ray) = floor_setup();
+        let ls = LightSample {
+            position: Vec3::new(0.0, 1.0, 0.0),
+            normal: Vec3::new(0.0, -1.0, 0.0),
+            emit: Color::new(2e5, 1e5, 5e4),
+            pdf: 1.0,
+        };
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &ls);
+        assert!((c.luminance() - FIREFLY_CLAMP).abs() < 1e-9, "luminance = {}", c.luminance());
+        assert!((c.r() / c.g() - 2.0).abs() < 1e-9);
+    }
+
+    /// 閾値以下の NEE 寄与はクランプの影響を受けない。
+    #[test]
+    fn dim_area_light_nee_contribution_is_unchanged() {
+        let (mat, p, n, ray) = floor_setup();
+        let ls = LightSample {
+            position: Vec3::new(0.0, 1.0, 0.0),
+            normal: Vec3::new(0.0, -1.0, 0.0),
+            emit: Color::new(1.0, 1.0, 1.0),
+            pdf: 1.0,
+        };
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &ls);
+        let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), Vec3::new(0.0, 1.0, 0.0), n);
+        let expected = f.r() * mis_weight(1.0, pdf_bsdf);
+        assert!((c.r() - expected).abs() < 1e-12, "{} vs {}", c.r(), expected);
+    }
+
+    /// 負値チャネルを含む色は黒扱いしない（寄与を変えないため輝度判定を使わない）。
+    #[test]
+    fn is_black_is_exact_per_channel() {
+        assert!(is_black(Color::new(0.0, 0.0, 0.0)));
+        assert!(!is_black(Color::new(0.0, 1e-300, 0.0)));
+        assert!(!is_black(Color::new(-0.1, 0.0, 0.0)));
+    }
 }
