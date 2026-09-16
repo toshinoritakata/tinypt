@@ -8,15 +8,21 @@ use crate::math::Vec3;
 
 #[derive(Clone, Copy)]
 /// PCG32 ベースの乱数生成器。
-pub struct Rng { state: u64 }
+pub struct Rng {
+    state: u64,
+    /// LCG のインクリメント（ストリーム選択子、常に奇数）
+    inc: u64,
+}
 impl Rng {
     /// シードから RNG を初期化する（任意の `u64`、0 も可）。
     ///
-    /// シードを SplitMix64 で攪拌してから PCG の推奨初期化（state=0 → 1 ステップ →
-    /// シード加算 → 1 ステップ）を行う。近いシード（隣接ピクセルなど）同士でも
-    /// 初期状態が十分に離れ、出力の先頭が相関しない。
+    /// シードから SplitMix64 で 2 つの独立な値を導き、一方をストリーム（インクリメント）、
+    /// もう一方を初期状態に使う（PCG の推奨初期化: state=0 → 1 ステップ → 加算 → 1 ステップ）。
+    /// 異なるシードは別々のストリームになるので、ピクセルごとの列が同じ周期列の
+    /// ずれた部分列として重なることがない。
     pub fn new(seed: u64) -> Self {
-        let mut rng = Self { state: 0 };
+        let inc = (splitmix64(seed ^ 0xA076_1D64_78BD_642F) << 1) | 1;
+        let mut rng = Self { state: 0, inc };
         rng.next_u32();
         rng.state = rng.state.wrapping_add(splitmix64(seed));
         rng.next_u32();
@@ -29,7 +35,7 @@ impl Rng {
         let old = self.state;
         self.state = old
             .wrapping_mul(6364136223846793005u64)
-            .wrapping_add(1442695040888963407u64);
+            .wrapping_add(self.inc);
         let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
         let rot = (old >> 59) as u32;
         xorshifted.rotate_right(rot)
@@ -121,6 +127,17 @@ mod tests {
         }
         let frac = same_bits as f64 / (n * 32) as f64;
         assert!((frac - 0.5).abs() < 0.01, "bit agreement {}", frac);
+    }
+
+    /// 異なるシードは異なるストリーム（奇数のインクリメント）を持つ。
+    #[test]
+    fn seeds_select_distinct_odd_streams() {
+        let mut incs = std::collections::HashSet::new();
+        for seed in 0..10_000u64 {
+            let r = Rng::new(seed);
+            assert_eq!(r.inc & 1, 1, "increment must be odd");
+            assert!(incs.insert(r.inc), "stream collision at seed {}", seed);
+        }
     }
 
     /// next_f64 の平均・分散が一様分布 [0,1) と整合する（1/2, 1/12）。

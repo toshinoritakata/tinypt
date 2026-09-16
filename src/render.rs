@@ -626,14 +626,14 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 3;
+    const GOLDEN_REVISION: u32 = 4;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
-    const GOLDEN_CORNELL: (u64, u64) = (0x464e_e7d7_13d1_3df2, 0xfc1b_b376_da34_236a);
+    const GOLDEN_CORNELL: (u64, u64) = (0xe0fb_0da2_b40a_e05c, 0xdbb2_11fe_7acf_2536);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
-    const GOLDEN_SPHERES: (u64, u64) = (0x8747_d670_a205_21a4, 0x1656_2071_8c8a_cd9c);
+    const GOLDEN_SPHERES: (u64, u64) = (0x1ecd_77bb_680f_b53b, 0x6320_0a66_44ac_088c);
 
     /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
     /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。

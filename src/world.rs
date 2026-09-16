@@ -7,7 +7,7 @@
 //! 発光マテリアルを持つプリミティブから CDF を構築し、
 //! 面積 × 輝度に比例した確率でライトを選択する。
 //! 選んだライト上の点は `Light::sample` で求める。球光源は参照点から見える円錐を立体角一様に
-//! サンプリングし（参照点が球の内部なら表面積一様）、三角形光源は表面積一様。
+//! サンプリングし（参照点が球の内部か表面から丸め誤差の距離以内なら表面積一様）、三角形光源は表面積一様。
 //! PDF は `Light::pdf_omega` に一本化され、`sample_light` と `light_pdf` が共有する。
 
 use crate::bvh::Bvh;
@@ -339,7 +339,7 @@ impl Light {
     /// 対応する立体角 PDF（選択確率を除く）は [`Light::pdf_omega`] が与える。
     ///
     /// - 球: `from` が球の外なら、`from` から見える円錐（立体角）を一様サンプリングする。
-    ///   球の内部（境界を含む）なら表面積一様サンプリングにフォールバックする。
+    ///   球の内部（境界を含む）・表面すれすれの外部なら表面積一様サンプリングにフォールバックする。
     /// - 三角形: 表面積一様サンプリング。
     fn sample(&self, world: &World, time: f64, from: Vec3, rng: &mut Rng) -> Option<(Vec3, Vec3)> {
         match *self {
@@ -349,14 +349,12 @@ impl Light {
                 let v = rng.next_f64();
                 match sphere_cone(s, from) {
                     Some(cone) => {
-                        // PBRT v4 の球の円錐サンプリング（小さな円錐では sin² の一次近似で精度を保つ）
-                        let (sin2_theta, cos_theta) = if cone.sin2_max < SMALL_CONE_SIN2 {
-                            let sin2 = cone.sin2_max * u;
-                            (sin2, (1.0 - sin2).max(0.0).sqrt())
-                        } else {
-                            let cos = (cone.cos_max - 1.0) * u + 1.0;
-                            ((1.0 - cos * cos).max(0.0), cos)
-                        };
+                        // 球の円錐サンプリング（PBRT v4 と同じ幾何）。cosθ を [cosθmax, 1] で一様に取る。
+                        // 1 − cosθ を直接持ち、sin²θ = (1 − cosθ)(1 + cosθ) とすることで、
+                        // 小さな円錐でも桁落ちせず近似も使わない（一次近似の偏りと分岐の不連続がない）。
+                        let one_minus_cos = u * cone.one_minus_cos_max;
+                        let cos_theta = 1.0 - one_minus_cos;
+                        let sin2_theta = (one_minus_cos * (2.0 - one_minus_cos)).max(0.0);
                         // 円錐内の方向 θ に対応する球面上の点の、球中心から見た角 α
                         let cos_alpha = sin2_theta / cone.sin2_max.sqrt()
                             + cos_theta * (1.0 - sin2_theta / cone.sin2_max).max(0.0).sqrt();
@@ -399,7 +397,11 @@ impl Light {
     fn pdf_omega(&self, world: &World, time: f64, from: Vec3, pos: Vec3, normal: Vec3) -> f64 {
         let to_light = pos - from;
         let dist2 = to_light.dot(to_light);
-        if dist2 <= 1e-12 {
+        // 距離の絶対しきい値（以前は 1e-12）は使わない。小さな球の表面すれすれの参照点では
+        // 正当なサンプルの多くが 1e-6 以内に落ち、シーンのスケール次第で棄却されてしまう。
+        // 円錐の pdf は距離に依らず、面積由来の pdf は d² → 0 で自然に 0 になるので、
+        // 方向が定義できない距離 0 だけを除く。
+        if !(dist2 > 0.0) {
             return 0.0;
         }
         let wi = to_light / dist2.sqrt();
@@ -416,7 +418,9 @@ impl Light {
                             1.0 / (std::f64::consts::TAU * cone.one_minus_cos_max)
                         }
                     }
-                    // 内部: 表面積一様。内側からは外向き法線と逆向きに見えるので |cos| を使う
+                    // 内部・表面すれすれの外部: 表面積一様。内側からは外向き法線と逆向きに見えるので |cos| を使う。
+                    // 外部から裏側の点がサンプルされた場合は、NEE のシャドウレイが同じ球の手前側に
+                    // 遮られて寄与 0 になるだけで、見える側の点の密度は変わらない（不偏）
                     None => {
                         let area = 4.0 * std::f64::consts::PI * s.r * s.r;
                         let c = cos_light.abs();
@@ -433,19 +437,29 @@ impl Light {
 }
 
 /// 円錐サンプリングで sin²θmax の一次近似に切り替える閾値（PBRT v4 と同じ。約 1.5°）。
-const SMALL_CONE_SIN2: f64 = 0.00068523;
+/// 表面すれすれとみなす sin²θmax の下限。これより大きい（参照点が球面から相対 ~5e-13 以内、
+/// 座標の数 ulp で位置関係が分解できない）と、円錐サンプリングをやめて表面積サンプリングに
+/// フォールバックする。
+///
+/// 以前の「表面すれすれでほぼ全サンプルが棄却される」問題（相対距離 1e-9 で 99.9%）の原因は
+/// 円錐そのものではなく `pdf_omega` の距離の絶対しきい値（dist² ≤ 1e-12）だった: 接点付近への
+/// サンプル距離は h/cosθ 程度まで小さくなる。これを外した後は、相対距離 1e-12 まで円錐サンプリングで
+/// 棄却 0・E[1/pdf] = Ω を確認している。面積サンプリングは外部から見える小さなキャップを
+/// ほとんど引けず（NEE が実質働かない）ので、フォールバックは本当に分解できない距離だけに限る。
+const NEAR_SURFACE_SIN2: f64 = 1.0 - 1e-12;
 
 /// 球の外部の点から見た円錐。
 struct SphereCone {
     /// 参照点から球中心への単位ベクトル
     axis: Vec3,
     sin2_max: f64,
-    cos_max: f64,
-    /// 1 − cosθmax（小さな円錐では sin²θmax/2 で精度を保つ）
+    /// 1 − cosθmax = sin²θmax / (1 + √(1 − sin²θmax))（桁落ちのない厳密な形）
     one_minus_cos_max: f64,
 }
 
-/// `from` が球の外部なら、`from` から球を見込む円錐を返す。内部（境界を含む）なら `None`。
+/// `from` が球の十分に外部なら、`from` から球を見込む円錐を返す。
+/// 内部（境界を含む）または表面すれすれ（sin²θmax > [`NEAR_SURFACE_SIN2`]）なら `None`
+/// （呼び出し側は表面積サンプリングにフォールバックする）。
 fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
     let to_c = s.c - from;
     let dc2 = to_c.dot(to_c);
@@ -454,12 +468,14 @@ fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
         return None;
     }
     let sin2_max = r2 / dc2;
-    let cos_max = (1.0 - sin2_max).max(0.0).sqrt();
-    let one_minus_cos_max = if sin2_max < SMALL_CONE_SIN2 { 0.5 * sin2_max } else { 1.0 - cos_max };
+    if !(sin2_max <= NEAR_SURFACE_SIN2) {
+        return None;
+    }
+    let one_minus_cos_max = sin2_max / (1.0 + (1.0 - sin2_max).sqrt());
     if one_minus_cos_max <= 0.0 {
         return None;
     }
-    Some(SphereCone { axis: to_c / dc2.sqrt(), sin2_max, cos_max, one_minus_cos_max })
+    Some(SphereCone { axis: to_c / dc2.sqrt(), sin2_max, one_minus_cos_max })
 }
 
 /// 単位ベクトル `w` に直交する正規直交基底 (t, b)。
@@ -836,6 +852,103 @@ mod tests {
             let exact = if inside { 4.0 * std::f64::consts::PI } else { std::f64::consts::PI * (r / dc).powi(2) };
             assert!((est / exact - 1.0).abs() < 0.01, "{}: estimate {} vs exact {}", name, est, exact);
         }
+    }
+
+    /// 旧実装の小円錐近似の閾値（sin²θmax）。この前後で推定値が不連続にならないことを確かめる。
+    const OLD_SMALL_CONE_SIN2: f64 = 0.00068523;
+
+    /// 中心 c・半径 r の球に対し、sin²θmax が `sin2` になる外部の参照点。
+    fn from_for_sin2(c: Vec3, r: f64, sin2: f64) -> Vec3 {
+        c + Vec3::new(0.3, 0.8, -0.52).norm() * (r / sin2.sqrt())
+    }
+
+    /// 1 − cosθmax は小さな円錐でも厳密（桁落ち・一次近似の誤差がない）。
+    #[test]
+    fn cone_one_minus_cos_max_is_exact() {
+        let s = Sphere { c: Vec3::new(0.3, -0.2, 0.1), r: 1.3, mat_id: 0 };
+        let t = OLD_SMALL_CONE_SIN2;
+        for sin2 in [0.5, 1e-2, t * (1.0 + 1e-3), t * (1.0 + 1e-9), t * (1.0 - 1e-9), t * (1.0 - 1e-3), 1e-5, 1e-8, 1e-12] {
+            let cone = sphere_cone(&s, from_for_sin2(s.c, s.r, sin2)).expect("outside");
+            let sin2 = cone.sin2_max; // 参照点の丸め後の実際の値で比較する
+            let reference = if sin2 >= 1e-4 {
+                1.0 - (1.0 - sin2).sqrt()
+            } else {
+                // 1 − √(1 − x) = x/2 + x²/8 + x³/16 + 5x⁴/128 + …
+                sin2 / 2.0 + sin2 * sin2 / 8.0 + sin2.powi(3) / 16.0 + 5.0 * sin2.powi(4) / 128.0
+            };
+            let rel = (cone.one_minus_cos_max / reference - 1.0).abs();
+            assert!(rel < 1e-11, "sin²θmax={:e}: 1−cosθmax {:e} vs reference {:e} (rel {:e})", sin2, cone.one_minus_cos_max, reference, rel);
+        }
+    }
+
+    /// 小さな円錐でも推定が偏らず、旧近似の閾値の前後で連続:
+    /// E[cosθ/pdf] = π·sin²θmax を相対 2e-5 で満たす（旧実装は閾値未満で −1.7e-4 の偏り）。
+    /// cosθ/pdf = (1 − u·(1−cosθmax))·2π(1−cosθmax) は u に線形なので、統計誤差は (1−cosθmax) 倍に縮み
+    /// 小さな円錐では 1e-6 未満になる。
+    #[test]
+    fn small_cone_estimate_is_unbiased_and_continuous() {
+        let c = Vec3::new(0.3, -0.2, 0.1);
+        let r = 1.3;
+        let world = emissive_sphere_world(c, r);
+        let t = OLD_SMALL_CONE_SIN2;
+        let mut pdfs = Vec::new();
+        for sin2 in [t * (1.0 - 1e-3), t * (1.0 - 1e-9), t * (1.0 + 1e-9), t * (1.0 + 1e-3), 1e-6, 1e-9] {
+            let from = from_for_sin2(c, r, sin2);
+            let dc = (c - from).len();
+            let axis = (c - from) / dc;
+            let sin2_actual = (r / dc).powi(2);
+            let mut rng = Rng::new(17);
+            let n = 200_000;
+            let mut sum = 0.0;
+            let mut pdf0 = 0.0;
+            for _ in 0..n {
+                let ls = world.sample_light(&mut rng, 0.0, from).expect("cone sample must not be rejected");
+                sum += (ls.position - from).norm().dot(axis) / ls.pdf;
+                pdf0 = ls.pdf;
+            }
+            let est = sum / n as f64;
+            let exact = std::f64::consts::PI * sin2_actual;
+            assert!((est / exact - 1.0).abs() < 2e-5, "sin²θmax={:e}: E[cosθ/pdf] {:e} vs π·sin² {:e} (rel {:e})", sin2, est, exact, est / exact - 1.0);
+            pdfs.push(pdf0 * sin2_actual); // pdf ∝ 1/sin²（小円錐）なので正規化して連続性を見る
+        }
+        // 閾値のすぐ下とすぐ上（sin² の相対差 2e-9）で正規化 pdf が連続
+        assert!((pdfs[1] / pdfs[2] - 1.0).abs() < 1e-6, "discontinuity at the old threshold: {} vs {}", pdfs[1], pdfs[2]);
+    }
+
+    /// 表面すれすれの外部の参照点でもサンプルがほぼ棄却されず（旧実装は r(1+1e-9) で 99.9% 棄却）、
+    /// pdf は light_pdf と一致する。円錐サンプリングの範囲では、全サンプルが参照点から見える側にあり
+    /// E[1/pdf] = Ω（円錐の立体角）が厳密に成り立つ（面積フォールバックに落ちると見える側をほぼ引けない）。
+    #[test]
+    fn near_surface_reference_points_keep_light_samples() {
+      // 標準的な球・原点から離れた小さな球・大きな球（丸めの効き方が座標の大きさで変わるため）
+      for (c, r) in [(Vec3::new(0.3, -0.2, 0.1), 1.3), (Vec3::new(1000.0, 500.0, -300.0), 0.05), (Vec3::new(-20.0, 3.0, 7.0), 1000.0)] {
+        let world = emissive_sphere_world(c, r);
+        let dir = Vec3::new(0.3, 0.8, -0.52).norm();
+        for eps in [1e-3, 1e-5, 1e-6, 6e-7, 1e-7, 1e-9, 1e-11, 1e-12, 1e-14, 0.0, -1e-9] {
+            let from = c + dir * (r * (1.0 + eps));
+            let cone = sphere_cone(&world.spheres[0], from);
+            let mut rng = Rng::new(5);
+            let n = 20_000;
+            let (mut got, mut sum_inv) = (0usize, 0.0);
+            for _ in 0..n {
+                let Some(ls) = world.sample_light(&mut rng, 0.0, from) else { continue };
+                got += 1;
+                sum_inv += 1.0 / ls.pdf;
+                if cone.is_some() {
+                    let wi = (ls.position - from).norm();
+                    assert!(ls.normal.dot(-wi) > 0.0, "r={} eps={:e}: cone sample on the hidden side", r, eps);
+                }
+                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None };
+                let pdf = world.light_pdf(from, 0.0, &hit);
+                assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "r={} eps={:e}: light_pdf {} != sample pdf {}", r, eps, pdf, ls.pdf);
+            }
+            assert!(got as f64 >= 0.99 * n as f64, "r={} eps={:e}: {} / {} samples rejected (cone: {})", r, eps, n - got, n, cone.is_some());
+            if let Some(cone) = cone {
+                let omega = std::f64::consts::TAU * cone.one_minus_cos_max;
+                assert!((sum_inv / got as f64 / omega - 1.0).abs() < 1e-9, "eps={:e}: E[1/pdf] {} vs Ω {}", eps, sum_inv / got as f64, omega);
+            }
+        }
+      }
     }
 
     /// 発光体でないヒット（`inst_id`/`prim_id` が既知の発光体と一致しない）に対しては 0 を返す。

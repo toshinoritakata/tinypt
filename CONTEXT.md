@@ -23,7 +23,7 @@ A surface that contributes light, from the *material* side. Queried via `Materia
 _Avoid_: light material, glow.
 
 **Light**:
-A reference to an emitting primitive for sampling, from the *geometry* side: `Light::Sphere { idx }` or `Light::Triangle { mesh_id, tri_id, inst_id }` indexing into the `World`. Owns the per-shape geometry of emission — `area` (used for the CDF weights in `build_lights`), `sample` (a point on the light as seen from a reference point) and `pdf_omega` (the solid-angle pdf of that sampling) — so `sample_light` and `light_pdf` share one pdf and MIS weights always agree. Spheres are sampled uniformly within the cone they subtend from an outside reference point, falling back to uniform area sampling from inside; triangles use uniform area sampling. A new emitting shape is one new arm here.
+A reference to an emitting primitive for sampling, from the *geometry* side: `Light::Sphere { idx }` or `Light::Triangle { mesh_id, tri_id, inst_id }` indexing into the `World`. Owns the per-shape geometry of emission — `area` (used for the CDF weights in `build_lights`), `sample` (a point on the light as seen from a reference point) and `pdf_omega` (the solid-angle pdf of that sampling) — so `sample_light` and `light_pdf` share one pdf and MIS weights always agree. Spheres are sampled uniformly within the cone they subtend from an outside reference point (exact in f64, no small-cone approximation), falling back to uniform area sampling from inside or from within rounding distance of the surface (sin²θmax > 1 − 1e-12); triangles use uniform area sampling. A new emitting shape is one new arm here.
 _Avoid_: emitter (reserved for the material side), light source.
 
 ### Estimation
