@@ -14,7 +14,7 @@
 //! - **Metal**: 完全鏡面反射（デルタ BSDF）
 //! - **Dielectric**: 屈折体（フレネル + Beer-Lambert 吸収、デルタ BSDF）
 //! - **GGX**: マイクロファセットモデル（VNDF サンプリング + Smith 遮蔽関数）
-//! - **Subsurface**: 簡易サブサーフェス散乱（指数分布による散乱距離）
+//! - **Subsurface**: 簡易サブサーフェス（現状は Lambert と同一の拡散反射。`scatter_dist` は未使用の予約パラメータ）
 //! - **DiffuseLight**: 拡散発光体（散乱なし、放射輝度を返す）
 
 use std::f64::consts::PI;
@@ -36,7 +36,7 @@ pub enum Material {
     Dielectric { ior: f64, absorption: Color },
     /// GGX マイクロファセット（粗さパラメータ alpha）
     Ggx     { albedo: Color, alpha: f64 },
-    /// 簡易サブサーフェス散乱
+    /// 簡易サブサーフェス（現状は Lambert と同一の拡散反射。`scatter_dist` は予約で未使用）
     Subsurface { albedo: Color, scatter_dist: f64 },
     /// 拡散面光源
     DiffuseLight { emit: Color },
@@ -44,7 +44,7 @@ pub enum Material {
 
 /// BSDF サンプリングの結果。
 ///
-/// 散乱レイは原点込みで保持するため、透過（Dielectric）やサブサーフェスの
+/// 散乱レイは原点込みで保持するため、透過（Dielectric）などの
 /// 原点ずらしは BSDF 内部に閉じ、積分器はレイ構築の知識を持たない。
 pub struct BsdfSample {
     /// 散乱レイ（原点ずらしを含む）
@@ -179,19 +179,15 @@ impl Material {
                     is_delta: false,
                 })
             }
-            Material::Subsurface { albedo, scatter_dist } => {
-                let scale = scatter_dist.max(1e-4);
-                let u = rng.next_f64().max(1e-12);
-                let dist = -u.ln() * scale;
-
-                let normal_out = hit.n;
-                let d = sample_cosine_hemisphere(normal_out, rng);
-
-                let att = *albedo * (-dist / scale).exp();
-                let origin = hit.p - normal_out * dist + RAY_EPSILON * d;
+            Material::Subsurface { albedo, .. } => {
+                // 向き補正済み n 周りのコサイン半球サンプリングで Lambert と同じ契約に揃える:
+                // weight = f·cos/pdf = albedo、pdf = eval() の pdf、原点は hit.p（NEE と同一点）。
+                // 以前は散乱距離ぶん原点を面の内側へずらしていたが、NEE のシャドウレイ
+                // （hit.p 起点）と別の点を推定して MIS が不整合になるため撤去した。
+                let d = sample_cosine_hemisphere(n, rng);
                 Some(BsdfSample {
-                    scattered: Ray { o: origin, d, time: ray_in.time },
-                    weight: att,
+                    scattered: Ray { o: hit.p + RAY_EPSILON * d, d, time: ray_in.time },
+                    weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
                 })
@@ -459,6 +455,73 @@ mod tests {
         // ∫ pdf dω ≈ (1/N) Σ pdf / (1/2π) = (2π/N) Σ pdf
         let integral = 2.0 * PI * sum / n_samples as f64;
         assert!((integral - 1.0).abs() < 0.02, "integral = {}", integral);
+    }
+
+    /// 下から上向きのレイが床（幾何法線 +Y）の裏面に当たる状況の Hit を作る。
+    fn floor_backface_hit() -> (Ray, Hit) {
+        let ray = Ray { o: Vec3::new(0.0, -1.0, 0.0), d: Vec3::new(0.0, 1.0, 0.0), time: 0.0 };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None };
+        (ray, hit)
+    }
+
+    fn subsurface() -> Material {
+        Material::Subsurface { albedo: Color::new(0.8, 0.5, 0.3), scatter_dist: 0.2 }
+    }
+
+    /// Subsurface: sample() の PDF は eval() の PDF と一致する（表面・裏面の両方）。
+    #[test]
+    fn subsurface_sample_pdf_matches_eval() {
+        let mat = subsurface();
+        for (ray, hit) in [floor_hit(), floor_backface_hit()] {
+            let n = if hit.n.dot(ray.d) < 0.0 { hit.n } else { -hit.n };
+            let wo = (-ray.d).norm();
+            let mut rng = Rng::new(5);
+            for _ in 0..1000 {
+                let s = mat.sample(&ray, &hit, &mut rng).unwrap();
+                let (_, pdf_eval) = mat.eval(wo, s.scattered.d, n);
+                assert!((s.pdf - pdf_eval).abs() < 1e-9, "{} vs {}", s.pdf, pdf_eval);
+            }
+        }
+    }
+
+    /// Subsurface: weight == f·cos/pdf（期待値が albedo/2 に落ちていた不整合への回帰テスト）。
+    #[test]
+    fn subsurface_weight_matches_f_cos_over_pdf() {
+        let mat = subsurface();
+        let (ray, hit) = floor_hit();
+        let n = hit.n;
+        let wo = (-ray.d).norm();
+        let mut rng = Rng::new(13);
+        for _ in 0..1000 {
+            let s = mat.sample(&ray, &hit, &mut rng).unwrap();
+            let wi = s.scattered.d;
+            let (f, pdf) = mat.eval(wo, wi, n);
+            if pdf <= 1e-9 {
+                continue;
+            }
+            let expected = f * (n.dot(wi).max(0.0) / pdf);
+            assert!((s.weight.r() - expected.r()).abs() < 1e-9, "{} vs {}", s.weight.r(), expected.r());
+            assert!((s.weight.g() - expected.g()).abs() < 1e-9);
+            assert!((s.weight.b() - expected.b()).abs() < 1e-9);
+        }
+    }
+
+    /// Subsurface の裏面ヒット: 散乱方向は向き補正済み法線側、PDF は正、
+    /// 原点は NEE と同じ hit.p（+ε）に置かれる。pdf=0 で MIS 重みが消える不具合への回帰テスト。
+    #[test]
+    fn subsurface_backface_hit_has_positive_pdf() {
+        let mat = subsurface();
+        let (ray, hit) = floor_backface_hit();
+        let n = -hit.n;
+        let mut rng = Rng::new(21);
+        for _ in 0..1000 {
+            let s = mat.sample(&ray, &hit, &mut rng).unwrap();
+            let d = s.scattered.d;
+            assert!(n.dot(d) >= 0.0, "direction not in oriented hemisphere");
+            assert!(s.pdf > 0.0 || n.dot(d) < 1e-9, "pdf = {}", s.pdf);
+            let expected_o = hit.p + RAY_EPSILON * d;
+            assert!((s.scattered.o - expected_o).len() < 1e-12);
+        }
     }
 
     /// is_delta / emitted の分類が正しい。
