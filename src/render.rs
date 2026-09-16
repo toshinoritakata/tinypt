@@ -159,6 +159,22 @@ fn sample_pixel(
     }
 }
 
+/// 読み込んだチェックポイントがこのレンダーで再開に使えるかを検証する。
+///
+/// バッファ長が画素数と一致し、`next_id` がタスク数以内のときだけ `Some` を返す。
+/// `None` の場合、呼び出し側はレジューム位置を 0 のまま（最初から）レンダーする。
+fn validate_resume(
+    loaded: Option<(usize, Vec<Color>, Vec<f64>)>,
+    n_pixels: usize,
+    n_tasks: usize,
+) -> Option<(usize, Vec<Color>, Vec<f64>)> {
+    let (next_id, acc, acc_w) = loaded?;
+    if acc.len() != n_pixels || acc_w.len() != n_pixels || next_id > n_tasks {
+        return None;
+    }
+    Some((next_id, acc, acc_w))
+}
+
 /// Renders the scene and returns accumulation buffers.
 pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io::Result<RenderOutput> {
     let w = config.width;
@@ -174,28 +190,27 @@ pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io:
 
     let ckpt_enabled = config.checkpoint_enabled && config.checkpoint_every_tasks > 0;
 
+    let tasks = build_tasks(config);
+    let tid = tasks.len();
+
     // Resume state
     let mut resume_next_id: usize = 0;
     if ckpt_enabled {
-        if let Ok(Some((next_id, acc0, acc_w0))) = load_checkpoint(ckpt_file, config.scene_hash, w, h) {
-            resume_next_id = next_id.min(usize::MAX);
-            if acc0.len() == w * h && acc_w0.len() == w * h {
-                out.acc = acc0;
-                out.acc_w = acc_w0;
-                eprintln!(
-                    "Resumed from checkpoint: {} (next task id: {})",
-                    ckpt_file, resume_next_id
-                );
-            }
+        let loaded = load_checkpoint(ckpt_file, config.scene_hash, w, h).ok().flatten();
+        if let Some((next_id, acc0, acc_w0)) = validate_resume(loaded, w * h, tid) {
+            resume_next_id = next_id;
+            out.acc = acc0;
+            out.acc_w = acc_w0;
+            eprintln!(
+                "Resumed from checkpoint: {} (next task id: {})",
+                ckpt_file, resume_next_id
+            );
         }
     }
 
     // タスク配布用チャネル (tx→rx) と結果回収用チャネル (rtx→rrx)
     let (tx, rx) = chan::unbounded::<Task>();
     let (rtx, rrx) = chan::unbounded::<TileResult>();
-
-    let tasks = build_tasks(config);
-    let tid = tasks.len();
 
     // Send only tasks not yet merged (resume_next_id is the next expected merge id).
     for t in tasks.iter().skip(resume_next_id) {
@@ -503,5 +518,45 @@ mod tests {
         out.merge_tile(&tile, width);
         assert_eq!(r(&out, 1, 1, width), 2.0);
         assert_eq!(out.acc_w[idx(1, 1, width)], 2.0);
+    }
+
+    /// 不整合なチェックポイント（バッファ長・next_id 超過）はレジュームに使わない。
+    /// 以前はバッファ不一致でも resume_next_id だけが残り、タイルが欠落していた。
+    #[test]
+    fn validate_resume_rejects_inconsistent_checkpoints() {
+        let px = |n| vec![Color::new(0.0, 0.0, 0.0); n];
+        assert!(validate_resume(None, 4, 4).is_none());
+        assert!(validate_resume(Some((2, px(3), vec![0.0; 4])), 4, 4).is_none());
+        assert!(validate_resume(Some((2, px(4), vec![0.0; 3])), 4, 4).is_none());
+        assert!(validate_resume(Some((5, px(4), vec![0.0; 4])), 4, 4).is_none());
+        let ok = validate_resume(Some((4, px(4), vec![0.0; 4])), 4, 4).unwrap();
+        assert_eq!(ok.0, 4);
+    }
+
+    /// ハッシュが一致するチェックポイントだけから再開し、不一致なら最初からレンダーする。
+    #[test]
+    fn render_resumes_only_from_matching_scene_hash() {
+        let (w, h) = (2, 2);
+        let scene = empty_scene(w, h);
+        let mut config = base_config(w, h, 1);
+        config.checkpoint_enabled = true;
+        config.scene_hash = 0xABCD;
+        let dir = std::env::temp_dir().join(format!("tinypt_render_ckpt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ckpt.bin").to_string_lossy().into_owned();
+
+        // 全タスク完了済み（next_id = タスク数）で目印の値を持つチェックポイント
+        let n_tasks = build_tasks(&config).len();
+        let marker = vec![Color::new(7.0, 7.0, 7.0); w * h];
+        save_checkpoint(&path, 0xABCD, w, h, n_tasks, &marker, &vec![99.0; w * h]).unwrap();
+
+        let out = render(&scene, &config, &path).unwrap();
+        assert!(out.acc_w.iter().all(|&v| v == 99.0), "matching hash should resume");
+
+        save_checkpoint(&path, 0x1234, w, h, n_tasks, &marker, &vec![99.0; w * h]).unwrap();
+        let out = render(&scene, &config, &path).unwrap();
+        assert!(out.acc_w.iter().all(|&v| v == config.spp as f64), "mismatched hash must not resume");
+
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -3,7 +3,7 @@
 //! コマンドライン引数を解析し、シーン構築 → レンダリング → 後処理 → 画像出力を実行する。
 //! 対応フォーマット: PPM / HDR (Radiance) / EXR (ACEScg)
 
-use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, render, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, Tonemap};
+use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, render, resolve_pixels, scene_hash, OutputFormat, OutputSettings, RenderConfig, Tonemap};
 
 /// CLI で明示的に指定された値（シーンファイルの設定より優先させる）。
 #[derive(Default)]
@@ -92,6 +92,20 @@ fn parse_args(config: &mut RenderConfig) -> CliOverrides {
                     }
                 }
             }
+            "--checkpoint" => {
+                config.checkpoint_enabled = true;
+            }
+            "--no-checkpoint" => {
+                config.checkpoint_enabled = false;
+            }
+            "--checkpoint-every" => {
+                if let Some(v) = args.next() {
+                    if let Ok(n) = v.parse::<usize>() {
+                        config.checkpoint_every_tasks = n.max(1);
+                        config.checkpoint_enabled = true;
+                    }
+                }
+            }
             "--morton" => {
                 config.morton_enabled = true;
             }
@@ -120,10 +134,17 @@ fn main() -> std::io::Result<()> {
     if let Some(spp) = overrides.spp {
         config.spp = spp;
     }
-    let ckpt_file = ckpt_path(config.scene_hash);
+    // チェックポイントのキーは最終 config（シーン設定 + CLI 上書き後）から導出する。
+    // 無効時はファイルに触れないので、参照ファイルの再読込コストも払わない。
+    let ckpt_file = if config.checkpoint_enabled {
+        config.scene_hash = scene_hash(&config)?;
+        Some(ckpt_path(config.scene_hash))
+    } else {
+        None
+    };
 
     // 3. レンダリング実行（マルチスレッド・タイルベース）
-    let output = render(&scene, &config, &ckpt_file)?;
+    let output = render(&scene, &config, ckpt_file.as_deref().unwrap_or(""))?;
 
     // 4. 後処理パイプライン
     //    蓄積バッファを一度だけリニア RGB に解決 → （オプションで）デノイズ →
@@ -138,6 +159,8 @@ fn main() -> std::io::Result<()> {
         .write(&config.output_path, config.width, config.height, &pixels, settings)?;
 
     // 5. レンダリング完了後、チェックポイントファイルを削除
-    let _ = std::fs::remove_file(&ckpt_file);
+    if let Some(f) = &ckpt_file {
+        let _ = std::fs::remove_file(f);
+    }
     Ok(())
 }

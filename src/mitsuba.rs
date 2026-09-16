@@ -265,6 +265,27 @@ pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
     Ok(scene)
 }
 
+/// XML が参照する外部ファイル（`<string name="filename">`）を文書順に列挙する。
+///
+/// パスは [`load_scene_from_str`] と同じく `base_dir` 基準で解決する。
+/// チェックポイントのシーンハッシュが OBJ/環境マップの内容まで含むために使う。
+pub fn referenced_files(xml: &str, base_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    fn walk(el: &Element, base_dir: &Path, out: &mut Vec<PathBuf>) {
+        if el.tag == "string" && el.attr("name") == Some("filename") {
+            if let Some(v) = el.attr("value") {
+                out.push(resolve_path(base_dir, v));
+            }
+        }
+        for c in &el.children {
+            walk(c, base_dir, out);
+        }
+    }
+    let root = parse_tree(xml)?;
+    let mut out = Vec::new();
+    walk(&root, base_dir, &mut out);
+    Ok(out)
+}
+
 /// シーン直下の `<emitter>`（環境マップ）を `EnvMap` にマップする。
 /// `envmap`（ファイル）と `constant`（定数色）に対応。`scale` を放射輝度に乗算する。
 fn parse_scene_emitter(el: &Element, base_dir: &Path) -> Option<EnvMap> {
@@ -645,6 +666,18 @@ mod tests {
         c.width = 16;
         c.height = 9;
         c
+    }
+
+    /// referenced_files は入れ子の filename を文書順・base_dir 基準で列挙する。
+    #[test]
+    fn referenced_files_lists_filenames_in_document_order() {
+        let xml = r#"<scene version="3.0.0">
+              <shape type="obj"><string name="filename" value="a.obj"/></shape>
+              <shape type="sphere"><float name="radius" value="1"/></shape>
+              <emitter type="envmap"><string name="filename" value="/abs/env.exr"/></emitter>
+            </scene>"#;
+        let files = referenced_files(xml, Path::new("dir")).unwrap();
+        assert_eq!(files, vec![PathBuf::from("dir/a.obj"), PathBuf::from("/abs/env.exr")]);
     }
 
     fn load(xml: &str) -> Scene {

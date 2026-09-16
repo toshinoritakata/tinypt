@@ -19,7 +19,9 @@ pub struct RenderConfig {
     pub checkpoint_enabled: bool,
     /// N タスクごとにチェックポイントを保存
     pub checkpoint_every_tasks: usize,
-    /// シーンのハッシュ値（チェックポイントの一致判定に使用）
+    /// シーンのハッシュ値（チェックポイントの一致判定に使用）。
+    /// 既定値はプレースホルダで、チェックポイント有効時は main が最終 config から
+    /// [`crate::checkpoint::scene_hash`] で導出して上書きする
     pub scene_hash: u64,
     /// 出力ファイルパス（拡張子で形式を自動判別）
     pub output_path: String,

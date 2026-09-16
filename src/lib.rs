@@ -35,7 +35,7 @@ pub mod hdr;         // Radiance HDR (.hdr) 読み書き
 pub mod exr;         // OpenEXR (.exr) 読み書き
 pub mod env;         // 環境マップの読み込みと重点的サンプリング
 
-pub use checkpoint::ckpt_path;
+pub use checkpoint::{ckpt_path, scene_hash};
 pub use config::{RenderConfig, Tonemap};
 pub use output::{resolve_pixels, OutputFormat, OutputSettings};
 pub use mitsuba::load_scene;
