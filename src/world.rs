@@ -481,50 +481,118 @@ mod tests {
         best
     }
 
+    /// 2 つの Hit がビット単位で等しいか（参照実装との比較用）。
+    fn assert_same_hit(a: Option<Hit>, b: Option<Hit>, what: &str) {
+        match (a, b) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+                assert_eq!(a.t.to_bits(), b.t.to_bits(), "{}: t {} vs {}", what, a.t, b.t);
+                assert_eq!(bits(a.p), bits(b.p), "{}: p", what);
+                assert_eq!(bits(a.n), bits(b.n), "{}: n", what);
+                assert_eq!((a.mat_id, a.prim_id, a.inst_id), (b.mat_id, b.prim_id, b.inst_id), "{}: ids", what);
+            }
+            (a, b) => panic!("{}: hit mismatch {:?} vs {:?}", what, a.map(|h| (h.t, h.inst_id)), b.map(|h| (h.t, h.inst_id))),
+        }
+    }
+
     /// インスタンス BVH を最近接距離で枝刈りしても、結果（t・点・法線・ID）はビット単位で不変。
-    /// 拡大・縮小・回転を混ぜた重なり合うインスタンスで確認する。
+    ///
+    /// 枝刈り距離の誤り（相対マージンの撤去・`|A⁻¹d|` の掛け忘れ・`|A⁻¹d|` で割る）を
+    /// 検出できるよう、次を含める:
+    /// - 先に走査される拡大インスタンス（×100）の手前に、後から走査される縮小インスタンス（×0.01）
+    /// - 完全一致・ほぼ一致（相対 1e-8 / 1e-12 のスケール差）のインスタンス対
+    /// - 一次レイに加え、ヒット点からの二次レイと有限 tmax のシャドウレイ
     #[test]
     fn instance_pruning_preserves_hits() {
-        let quad = |z: f64| {
-            vec![
-                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, -1.0, z), Vec3::new(1.0, 1.0, z), 0),
-                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(-1.0, 1.0, z), 0),
-            ]
+        // 板 20 枚（z = 0, 0.1, …, 1.9）を重ねたメッシュ。1 インスタンス内でも奥の板が枝刈り対象になる
+        let plates = || -> Vec<Triangle> {
+            (0..20)
+                .flat_map(|k| {
+                    let z = k as f64 * 0.1;
+                    vec![
+                        Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, -1.0, z), Vec3::new(1.0, 1.0, z), 0),
+                        Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(-1.0, 1.0, z), 0),
+                    ]
+                })
+                .collect()
         };
         let mut rng = Rng::new(77);
+        let rnd = |rng: &mut Rng, s: f64| Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * s;
         let mut world = World::new();
-        for i in 0..30 {
-            // 各インスタンスは 20 枚の板を z 方向に重ねたメッシュ（1 メッシュ内でも奥の板を枝刈りできる）
-            let tris: Vec<Triangle> = (0..20).flat_map(|k| quad(k as f64 * 0.1)).collect();
-            let s = [0.01, 0.5, 1.0, 3.0, 100.0][i % 5];
-            let t = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 6.0;
-            let xform = Transform::translate(t)
-                .compose(Transform::scale(Vec3::new(s, s * 0.7, s * 1.3)))
-                .compose(Transform::rotate(Vec3::new(0.3, 1.0, 0.2), 37.0 * i as f64));
-            world.add_mesh_instance(tris, xform, Some(i));
-        }
-        world.spheres.push(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 99 });
+        let mut xforms: Vec<Transform> = Vec::new();
+        let add = |world: &mut World, xforms: &mut Vec<Transform>, xf: Transform| {
+            let id = world.add_mesh_instance(plates(), xf, Some(xforms.len()));
+            xforms.push(xf);
+            id
+        };
 
-        let mut hits = 0;
-        for _ in 0..5000 {
-            let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 40.0;
-            let d = uniform_sphere_dir(&mut rng);
-            let r = Ray { o, d, time: 0.0 };
-            let a = world.hit(r, 1e-4, 1e30);
-            let b = hit_without_instance_pruning(&world, r, 1e-4, 1e30);
-            match (a, b) {
-                (None, None) => {}
-                (Some(a), Some(b)) => {
-                    hits += 1;
-                    assert_eq!(a.t.to_bits(), b.t.to_bits());
-                    assert_eq!((a.p.x.to_bits(), a.p.y.to_bits(), a.p.z.to_bits()), (b.p.x.to_bits(), b.p.y.to_bits(), b.p.z.to_bits()));
-                    assert_eq!((a.n.x.to_bits(), a.n.y.to_bits(), a.n.z.to_bits()), (b.n.x.to_bits(), b.n.y.to_bits(), b.n.z.to_bits()));
-                    assert_eq!((a.mat_id, a.prim_id, a.inst_id), (b.mat_id, b.prim_id, b.inst_id));
-                }
-                (a, b) => panic!("hit mismatch: {:?} vs {:?}", a.map(|h| h.t), b.map(|h| h.t)),
-            }
+        // 1. 拡大（×100、非一様）を先に。原点付近を奥行き方向に大きく覆う
+        for k in 0..3 {
+            let xf = Transform::translate(Vec3::new(0.0, 0.0, -150.0 + k as f64 * 7.0))
+                .compose(Transform::rotate(Vec3::new(0.2, 1.0, 0.1), 11.0 * k as f64))
+                .compose(Transform::scale(Vec3::new(100.0, 80.0, 100.0)));
+            add(&mut world, &mut xforms, xf);
         }
-        assert!(hits > 500, "too few hits to be meaningful: {}", hits);
+        // 2. 縮小（×0.01）を後に、拡大インスタンスの手前に多数
+        for _ in 0..40 {
+            let xf = Transform::translate(rnd(&mut rng, 6.0))
+                .compose(Transform::rotate(rnd(&mut rng, 2.0) + Vec3::new(0.0, 1.0, 0.0), rng.next_f64() * 360.0))
+                .compose(Transform::scale(Vec3::new(0.01, 0.013, 0.008) * (1.0 + 30.0 * rng.next_f64())));
+            add(&mut world, &mut xforms, xf);
+        }
+        // 3. 完全一致・ほぼ一致の対（同じメッシュ・ほぼ同じ変換）
+        for &(s, eps) in &[(0.8, 0.0), (0.8, 1e-8), (1.0, 1e-12), (0.01, 1e-8), (100.0, 1e-12), (3.0, 1e-8)] {
+            let base = Transform::translate(rnd(&mut rng, 4.0))
+                .compose(Transform::rotate(rnd(&mut rng, 2.0) + Vec3::new(1.0, 0.0, 0.0), rng.next_f64() * 360.0));
+            add(&mut world, &mut xforms, base.compose(Transform::scale(Vec3::new(s, s, s))));
+            let s2 = s * (1.0 + eps);
+            add(&mut world, &mut xforms, base.compose(Transform::scale(Vec3::new(s2, s2, s2))));
+        }
+        // 4. 一般的なスケールと回転の混在
+        for i in 0..20 {
+            let s = [0.01, 0.3, 1.0, 3.0, 100.0][i % 5];
+            let xf = Transform::translate(rnd(&mut rng, 8.0))
+                .compose(Transform::rotate(rnd(&mut rng, 2.0) + Vec3::new(0.0, 0.0, 1.0), 37.0 * i as f64))
+                .compose(Transform::scale(Vec3::new(s, s * 0.7, s * 1.3)));
+            add(&mut world, &mut xforms, xf);
+        }
+        world.spheres.push(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 0.5, mat_id: 999 });
+
+        let n_inst = xforms.len();
+        let (mut primary_hits, mut queries) = (0usize, 0usize);
+        for _ in 0..20_000 {
+            // インスタンス内の点を狙った一次レイ（ヒットが多くなるように）
+            let target_inst = (rng.next_f64() * n_inst as f64) as usize % n_inst;
+            let local = Vec3::new(rng.next_f64() * 2.0 - 1.0, rng.next_f64() * 2.0 - 1.0, rng.next_f64() * 1.9);
+            let target = xforms[target_inst].apply_point(local);
+            let o = target + uniform_sphere_dir(&mut rng) * (0.05 + 30.0 * rng.next_f64());
+            let r = Ray { o, d: (target - o).norm(), time: 0.0 };
+            let a = world.hit(r, 1e-4, 1e30);
+            assert_same_hit(a, hit_without_instance_pruning(&world, r, 1e-4, 1e30), "primary");
+            queries += 1;
+            let Some(h) = a else { continue };
+            primary_hits += 1;
+
+            // 二次レイ（ヒット点から任意方向）
+            let d2 = uniform_sphere_dir(&mut rng);
+            let r2 = Ray { o: h.p + 1e-4 * d2, d: d2, time: 0.0 };
+            assert_same_hit(world.hit(r2, 1e-4, 1e30), hit_without_instance_pruning(&world, r2, 1e-4, 1e30), "secondary");
+
+            // シャドウレイ（有限 tmax。別インスタンス内の点へ）
+            let other = (rng.next_f64() * n_inst as f64) as usize % n_inst;
+            let lp = xforms[other].apply_point(Vec3::new(rng.next_f64() * 2.0 - 1.0, rng.next_f64() * 2.0 - 1.0, 1.9 * rng.next_f64()));
+            let to = lp - h.p;
+            let dist = to.len();
+            if dist > 1e-3 {
+                let d3 = to / dist;
+                let r3 = Ray { o: h.p + 1e-4 * d3, d: d3, time: 0.0 };
+                let tmax = (dist - 2e-4).max(1e-4);
+                assert_same_hit(world.hit(r3, 1e-4, tmax), hit_without_instance_pruning(&world, r3, 1e-4, tmax), "shadow");
+            }
+            queries += 2;
+        }
+        assert!(primary_hits > 10_000, "too few hits to be meaningful: {} of {}", primary_hits, queries);
     }
 
     /// build_lights の重み = 面積 × 輝度（Light::area と共有された面積計算）。

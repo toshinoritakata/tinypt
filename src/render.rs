@@ -176,7 +176,22 @@ fn validate_resume(
 }
 
 /// Renders the scene and returns accumulation buffers.
+///
+/// ワーカースレッド数は `available_parallelism` に従う。結果はスレッド数に依存しない
+/// （ピクセル単位のシードとタスク ID 順のマージによる）。
 pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io::Result<RenderOutput> {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    render_with_threads(scene, config, ckpt_file, threads)
+}
+
+/// ワーカースレッド数を指定してレンダーする（[`render`] の本体。テストでスレッド数非依存性を確かめるため分離）。
+fn render_with_threads(
+    scene: &Scene,
+    config: &RenderConfig,
+    ckpt_file: &str,
+    threads: usize,
+) -> std::io::Result<RenderOutput> {
+    let threads = threads.max(1);
     let w = config.width;
     let h = config.height;
     let inv_w = 1.0 / (w as f64);
@@ -218,7 +233,6 @@ pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io:
     }
     drop(tx);
 
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     eprintln!(
         "Render: {}x{}, spp={}, tile={}, threads={}, morton={}, seed={}",
         w, h, config.spp, config.tile, threads, config.morton_enabled, config.seed
@@ -558,5 +572,89 @@ mod tests {
         assert!(out.acc_w.iter().all(|&v| v == config.spp as f64), "mismatched hash must not resume");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 64-bit FNV-1a（ゴールデン値の計算用）。
+    fn fnv64(data: impl IntoIterator<Item = u8>) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// 蓄積バッファのハッシュ。`quantize` なら各値を 1e-9 単位に丸めてからハッシュする。
+    ///
+    /// ゴールデン比較には丸めた値を使う。macOS の最適化ビルドは同じ引数の sin/cos を
+    /// `__sincos_stret` にまとめるため、debug と release で数画素の値が最終 ulp だけ
+    /// 異なる（出力の 8bit PPM は同一）。スレッド数比較は同一ビルド内なのでビット単位で行う。
+    fn buffer_hash(out: &RenderOutput, quantize: bool) -> u64 {
+        let mut bytes = Vec::with_capacity(out.acc.len() * 32);
+        for (c, w) in out.acc.iter().zip(&out.acc_w) {
+            let v: Vec3 = (*c).into();
+            for x in [v.x, v.y, v.z, *w] {
+                let bits = if quantize { ((x * 1e9).round() as i64) as u64 } else { x.to_bits() };
+                bytes.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+        fnv64(bytes)
+    }
+
+    /// ゴールデン値。sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した
+    /// 蓄積バッファのハッシュ（1e-9 単位に丸め）と、それを `--tonemap none` 相当で書いた PPM のハッシュ。
+    /// `RENDER_REVISION` と対で更新する（片方だけ変えるとテストが失敗する）。
+    const GOLDEN_REVISION: u32 = 1;
+    const GOLDEN_BUFFER_HASH: u64 = 0xc986_0384_44f5_2318;
+    const GOLDEN_PPM_HASH: u64 = 0xa29f_d0bf_355c_3fe2;
+
+    /// 出力（蓄積バッファと PPM バイト列）が既知の値から変わっていないことを固定する。
+    /// 浮動小数点演算の決定性（Rust は FMA 縮約や fast-math をしない）に依拠する。
+    /// 別プラットフォームで libm（sin/cos/pow 等）の丸めが違うと値が変わりうる。
+    /// 1 / 3 / 利用可能スレッド数のいずれでも同じ値になることも確認する。
+    #[test]
+    fn golden_cornell_output_is_unchanged() {
+        let mut config = RenderConfig::default();
+        let scene = crate::mitsuba::load_scene("sample/cornell.xml", &mut config).expect("load sample/cornell.xml");
+        config.width = 48;
+        config.height = 48;
+        config.spp = 2;
+        config.seed = 0;
+        config.tile = 16;
+        config.morton_enabled = true;
+        config.adaptive_enabled = false;
+        config.checkpoint_enabled = false;
+
+        let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(2);
+        let mut hashes = Vec::new();
+        for threads in [1, 3, max_threads] {
+            let out = render_with_threads(&scene, &config, "", threads).unwrap();
+            let pixels = crate::output::resolve_pixels(config.width, config.height, &out.acc, &out.acc_w);
+            let path = std::env::temp_dir().join(format!("tinypt_golden_{}_{}.ppm", std::process::id(), threads));
+            let path = path.to_string_lossy().into_owned();
+            let settings = crate::output::OutputSettings { exposure: 0.0, tonemap: crate::config::Tonemap::None };
+            crate::output::OutputFormat::Ppm.write(&path, config.width, config.height, &pixels, settings).unwrap();
+            let ppm = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            hashes.push((threads, buffer_hash(&out, false), buffer_hash(&out, true), fnv64(ppm)));
+        }
+        for &(threads, exact, _, p) in &hashes[1..] {
+            assert_eq!((exact, p), (hashes[0].1, hashes[0].3), "output depends on thread count ({} vs 1)", threads);
+        }
+        let (_, _, buffer, ppm) = hashes[0];
+        assert_eq!(
+            crate::constants::RENDER_REVISION, GOLDEN_REVISION,
+            "RENDER_REVISION was bumped: re-record GOLDEN_BUFFER_HASH / GOLDEN_PPM_HASH for the new output \
+             (current: 0x{:016x} / 0x{:016x}) and set GOLDEN_REVISION to match",
+            buffer, ppm
+        );
+        assert!(
+            buffer == GOLDEN_BUFFER_HASH && ppm == GOLDEN_PPM_HASH,
+            "rendered output changed: buffer hash 0x{:016x} (golden 0x{:016x}), PPM hash 0x{:016x} (golden 0x{:016x}).\n\
+             If this change is meant to alter the output, bump constants::RENDER_REVISION (so old checkpoints \
+             are not resumed) and update GOLDEN_BUFFER_HASH / GOLDEN_PPM_HASH in src/render.rs to the new values.\n\
+             If it is not meant to alter the output, this is a regression.",
+            buffer, GOLDEN_BUFFER_HASH, ppm, GOLDEN_PPM_HASH
+        );
     }
 }

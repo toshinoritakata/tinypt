@@ -10,7 +10,41 @@ use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, remove_stale_t
 struct CliOverrides {
     /// `--spp` が指定された場合のサンプル数
     spp: Option<usize>,
+    /// `-h` / `--help` が指定された（使い方を表示してレンダーせずに終了する）
+    help: bool,
 }
+
+/// `-h` / `--help` で表示する使い方。
+const USAGE: &str = "\
+Usage: tinypt [OPTIONS]
+
+Scene / output:
+  --scene PATH               Mitsuba XML scene file (default: built-in scene, 1920x1080)
+  -o, --out PATH             Output file; format from extension: .ppm .hdr .exr (default: out.ppm)
+  --env PATH                 HDR/EXR environment map (built-in scene only)
+  --no-env                   Cancel an earlier --env
+
+Sampling:
+  --spp N                    Samples per pixel, N >= 1 (default: 512; overrides the scene file)
+  --adaptive / --no-adaptive Adaptive sampling (default: off)
+  --adaptive-min-spp N       Minimum samples per pixel for adaptive sampling, N >= 1 (default: 8)
+  --adaptive-threshold X     Convergence threshold, relative std. dev., finite (default: 0.02)
+  --seed N                   Random seed (default: 0)
+  --morton / --no-morton     Morton-order tiles (default: on)
+
+Post-processing (PPM only for tonemap/exposure):
+  --denoise / --no-denoise   Intel OIDN denoising (default: on)
+  --tonemap none|aces        Tone mapping (default: aces)
+  --exposure EV              Exposure compensation, finite (default: 0.0)
+
+Checkpoints:
+  --checkpoint / --no-checkpoint  Save and resume checkpoints (default: off)
+  --checkpoint-every N       Save every N tiles, N >= 1; also enables checkpoints (default: 128)
+
+  -h, --help                 Show this help and exit
+
+Invalid values and unknown arguments are reported as warnings and ignored.
+";
 
 /// フラグの値（次の引数）を取り出す。無ければ警告して `None`。
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str, warnings: &mut Vec<String>) -> Option<String> {
@@ -38,6 +72,17 @@ fn next_number<T: std::str::FromStr>(
     }
 }
 
+/// フラグの値を有限の `f64` として取り出す。NaN / 無限大は警告して `None`。
+fn next_finite(args: &mut impl Iterator<Item = String>, flag: &str, warnings: &mut Vec<String>) -> Option<f64> {
+    let n = next_number::<f64>(args, flag, warnings)?;
+    if n.is_finite() {
+        Some(n)
+    } else {
+        warnings.push(format!("non-finite value '{}' for {}; ignored", n, flag));
+        None
+    }
+}
+
 /// コマンドライン引数を解析して `RenderConfig` に反映する。
 /// シーンファイルの設定より優先すべき CLI 明示値と、警告メッセージの一覧を返す。
 ///
@@ -51,6 +96,9 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
         match arg.as_str() {
             "--spp" => {
                 if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
+                    if n == 0 {
+                        w.push("--spp 0 is not valid; using 1".to_string());
+                    }
                     config.spp = n.max(1);
                     overrides.spp = Some(n.max(1));
                 }
@@ -87,11 +135,14 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
             }
             "--adaptive-min-spp" => {
                 if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
+                    if n == 0 {
+                        w.push("--adaptive-min-spp 0 is not valid; using 1".to_string());
+                    }
                     config.adaptive_min_spp = n.max(1);
                 }
             }
             "--adaptive-threshold" => {
-                if let Some(n) = next_number::<f64>(&mut args, &arg, w) {
+                if let Some(n) = next_finite(&mut args, &arg, w) {
                     config.adaptive_threshold = n.max(0.0);
                 }
             }
@@ -109,7 +160,7 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
                 }
             }
             "--exposure" => {
-                if let Some(n) = next_number::<f64>(&mut args, &arg, w) {
+                if let Some(n) = next_finite(&mut args, &arg, w) {
                     config.exposure = n;
                 }
             }
@@ -121,7 +172,16 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
             }
             "--checkpoint-every" => {
                 if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
-                    config.checkpoint_every_tasks = n.max(1);
+                    // 0 を 1 に丸めると 1 タイルごとの保存（1080p で数百 GB の書き込み）になるため、
+                    // 0 は無効値として警告し、間隔は変えない（チェックポイントは有効化する）。
+                    if n == 0 {
+                        w.push(format!(
+                            "--checkpoint-every 0 is not valid; keeping {}",
+                            config.checkpoint_every_tasks
+                        ));
+                    } else {
+                        config.checkpoint_every_tasks = n;
+                    }
                     config.checkpoint_enabled = true;
                 }
             }
@@ -130,6 +190,9 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
             }
             "--no-morton" => {
                 config.morton_enabled = false;
+            }
+            "-h" | "--help" => {
+                overrides.help = true;
             }
             other => {
                 w.push(format!("unknown argument '{}'; ignored", other));
@@ -145,6 +208,10 @@ fn main() -> std::io::Result<()> {
     let (overrides, warnings) = parse_args(std::env::args().skip(1), &mut config);
     for w in &warnings {
         eprintln!("Warning: {}", w);
+    }
+    if overrides.help {
+        print!("{}", USAGE);
+        return Ok(());
     }
 
     // 2. シーン構築（カメラ・ジオメトリ・マテリアル・環境マップ）
@@ -242,5 +309,45 @@ mod tests {
         assert!(w[2].contains("--out"));
         assert_eq!(c.tonemap, RenderConfig::default().tonemap);
         assert_eq!(c.output_path, RenderConfig::default().output_path);
+    }
+
+    /// NaN / 無限大の露出・閾値は警告して無視する（NaN 露出で画像が真っ黒になるのを防ぐ）。
+    #[test]
+    fn non_finite_floats_warn_and_keep_defaults() {
+        let def = RenderConfig::default();
+        let (c, _, w) = parse(&["--exposure", "nan", "--adaptive-threshold", "inf", "--exposure", "-inf"]);
+        assert_eq!(w.len(), 3, "{:?}", w);
+        assert!(w.iter().all(|m| m.contains("non-finite")), "{:?}", w);
+        assert_eq!(c.exposure, def.exposure);
+        assert_eq!(c.adaptive_threshold, def.adaptive_threshold);
+    }
+
+    /// 0 の spp / min spp は 1 に丸めて警告、checkpoint-every 0 は間隔を変えずに警告する。
+    #[test]
+    fn zero_counts_warn() {
+        let def = RenderConfig::default();
+        let (c, o, w) = parse(&["--spp", "0", "--adaptive-min-spp", "0", "--checkpoint-every", "0"]);
+        assert_eq!(w.len(), 3, "{:?}", w);
+        assert_eq!(c.spp, 1);
+        assert_eq!(o.spp, Some(1));
+        assert_eq!(c.adaptive_min_spp, 1);
+        assert_eq!(c.checkpoint_every_tasks, def.checkpoint_every_tasks);
+        assert!(c.checkpoint_enabled);
+
+        let (c, _, w) = parse(&["--checkpoint-every", "7"]);
+        assert!(w.is_empty());
+        assert_eq!(c.checkpoint_every_tasks, 7);
+    }
+
+    /// -h / --help は警告を出さずヘルプ要求として記録される。
+    #[test]
+    fn help_flag_is_recognized() {
+        for flag in ["-h", "--help"] {
+            let (_, o, w) = parse(&[flag]);
+            assert!(o.help);
+            assert!(w.is_empty(), "{:?}", w);
+        }
+        let (_, o, _) = parse(&["--spp", "4"]);
+        assert!(!o.help);
     }
 }
