@@ -148,12 +148,19 @@ impl World {
             };
 
             let o_obj = inst.xform.apply_point_inv(r.o);
-            let mut d_obj = inst.xform.apply_vec_inv(r.d);
-            d_obj = d_obj.norm(); // stabilize
+            let d_obj_raw = inst.xform.apply_vec_inv(r.d);
+            let d_len = d_obj_raw.len().max(1e-30); // Vec3::norm と同じ式（ビット一致）
+            let d_obj = d_obj_raw / d_len; // stabilize
             let r_obj = Ray { o: o_obj, d: d_obj, time: r.time };
 
+            // 現在の最近接距離を物体空間に写して BVH の枝刈りに使う。
+            // |r.d| = 1 なので t_obj = t_world·|A⁻¹d|。丸めで境界上の候補を落とさないよう
+            // 相対マージンを付ける（最終的な採否は下のワールド空間 t 判定が行うので結果は不変）。
+            // tmin は従来どおり物体空間にそのまま渡す（スケールすると自己交差の挙動が変わる）。
+            let tmax_obj = closest * d_len * (1.0 + 1e-9);
+
             // Object-space BVH
-            if let Some(h_obj) = mesh.hit(r_obj, tmin, 1e30) {
+            if let Some(h_obj) = mesh.hit(r_obj, tmin, tmax_obj) {
                 let p_world = inst.xform.apply_point(h_obj.p);
                 let n_world = inst.xform.apply_normal(h_obj.n);
 
@@ -438,6 +445,86 @@ mod tests {
         world.spheres.push(Sphere { c, r, mat_id: 0 });
         world.build_lights(&mats);
         world
+    }
+
+    /// 旧実装（インスタンス BVH に tmax=1e30 を渡す）と同じ結果を返すことを確認するための参照実装。
+    fn hit_without_instance_pruning(world: &World, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        let mut closest = tmax;
+        let mut best: Option<Hit> = None;
+        for (inst_id, inst) in world.instances.iter().enumerate() {
+            let mesh = &world.meshes[inst.mesh_id];
+            let o_obj = inst.xform.apply_point_inv(r.o);
+            let d_obj = inst.xform.apply_vec_inv(r.d).norm();
+            if let Some(h_obj) = mesh.hit(Ray { o: o_obj, d: d_obj, time: r.time }, tmin, 1e30) {
+                let p_world = inst.xform.apply_point(h_obj.p);
+                let t_world = (p_world - r.o).dot(r.d);
+                if t_world > tmin && t_world < closest {
+                    closest = t_world;
+                    best = Some(Hit {
+                        t: t_world,
+                        p: p_world,
+                        n: inst.xform.apply_normal(h_obj.n),
+                        mat_id: inst.mat_override.unwrap_or(h_obj.mat_id),
+                        prim_id: h_obj.prim_id,
+                        inst_id: Some(inst_id),
+                    });
+                }
+            }
+        }
+        for (idx, s) in world.spheres.iter().enumerate() {
+            if let Some(mut h) = s.hit(r, tmin, closest) {
+                h.prim_id = idx;
+                closest = h.t;
+                best = Some(h);
+            }
+        }
+        best
+    }
+
+    /// インスタンス BVH を最近接距離で枝刈りしても、結果（t・点・法線・ID）はビット単位で不変。
+    /// 拡大・縮小・回転を混ぜた重なり合うインスタンスで確認する。
+    #[test]
+    fn instance_pruning_preserves_hits() {
+        let quad = |z: f64| {
+            vec![
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, -1.0, z), Vec3::new(1.0, 1.0, z), 0),
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(-1.0, 1.0, z), 0),
+            ]
+        };
+        let mut rng = Rng::new(77);
+        let mut world = World::new();
+        for i in 0..30 {
+            // 各インスタンスは 20 枚の板を z 方向に重ねたメッシュ（1 メッシュ内でも奥の板を枝刈りできる）
+            let tris: Vec<Triangle> = (0..20).flat_map(|k| quad(k as f64 * 0.1)).collect();
+            let s = [0.01, 0.5, 1.0, 3.0, 100.0][i % 5];
+            let t = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 6.0;
+            let xform = Transform::translate(t)
+                .compose(Transform::scale(Vec3::new(s, s * 0.7, s * 1.3)))
+                .compose(Transform::rotate(Vec3::new(0.3, 1.0, 0.2), 37.0 * i as f64));
+            world.add_mesh_instance(tris, xform, Some(i));
+        }
+        world.spheres.push(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 99 });
+
+        let mut hits = 0;
+        for _ in 0..5000 {
+            let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 40.0;
+            let d = uniform_sphere_dir(&mut rng);
+            let r = Ray { o, d, time: 0.0 };
+            let a = world.hit(r, 1e-4, 1e30);
+            let b = hit_without_instance_pruning(&world, r, 1e-4, 1e30);
+            match (a, b) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    hits += 1;
+                    assert_eq!(a.t.to_bits(), b.t.to_bits());
+                    assert_eq!((a.p.x.to_bits(), a.p.y.to_bits(), a.p.z.to_bits()), (b.p.x.to_bits(), b.p.y.to_bits(), b.p.z.to_bits()));
+                    assert_eq!((a.n.x.to_bits(), a.n.y.to_bits(), a.n.z.to_bits()), (b.n.x.to_bits(), b.n.y.to_bits(), b.n.z.to_bits()));
+                    assert_eq!((a.mat_id, a.prim_id, a.inst_id), (b.mat_id, b.prim_id, b.inst_id));
+                }
+                (a, b) => panic!("hit mismatch: {:?} vs {:?}", a.map(|h| h.t), b.map(|h| h.t)),
+            }
+        }
+        assert!(hits > 500, "too few hits to be meaningful: {}", hits);
     }
 
     /// build_lights の重み = 面積 × 輝度（Light::area と共有された面積計算）。

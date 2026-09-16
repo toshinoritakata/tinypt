@@ -47,7 +47,8 @@ impl Bvh {
     ///
     /// 1. 全三角形の AABB と重心を事前計算
     /// 2. 再帰的に最適分割位置を SAH で決定
-    /// 3. 分割不可能な場合は中央値分割にフォールバック
+    /// 3. SAH が使えない場合（要素数 < 2·SAH_BINS、重心が縮退、有効分割なし）は
+    ///    最大広がり軸の重心による中央値分割（select_nth）にフォールバック
     pub fn build(tris: &[Triangle]) -> Self {
         let mut indices: Vec<usize> = (0..tris.len()).collect();
         let mut nodes: Vec<BvhNode> = Vec::new();
@@ -97,7 +98,7 @@ impl Bvh {
                 return node_index;
             }
 
-            // Split by largest centroid extent (median split)
+            // 分割軸: 重心の広がりが最大の軸
             let ext = cbox.extent();
             let axis = if ext.x >= ext.y && ext.x >= ext.z {
                 0
@@ -107,24 +108,24 @@ impl Bvh {
                 2
             };
 
-            let mid = if n >= SAH_BINS * 2 {
+            // SAH（ビン分割）で分割位置を探す。候補が少ない・重心が一点に潰れている・
+            // 有効な分割が無い場合は None を返し、下の中央値分割に任せる。
+            let sah_mid = if n >= SAH_BINS * 2 {
                 let minc = match axis { 0 => cbox.min.x, 1 => cbox.min.y, _ => cbox.min.z };
                 let maxc = match axis { 0 => cbox.max.x, 1 => cbox.max.y, _ => cbox.max.z };
                 let extent = maxc - minc;
 
                 if extent > 1e-12 {
                     let inv_extent = 1.0 / extent;
-                    let mut bins = [(Aabb { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(0.0, 0.0, 0.0) }, 0usize); SAH_BINS];
-                    for b in &mut bins {
-                        b.0 = Aabb::empty();
-                        b.1 = 0;
-                    }
-
-                    for &idx in &indices[start..end] {
+                    let bin_of = |idx: usize| -> usize {
                         let c = centroids[idx];
                         let cv = match axis { 0 => c.x, 1 => c.y, _ => c.z };
-                        let mut bi = ((cv - minc) * inv_extent * (SAH_BINS as f64)) as usize;
-                        if bi >= SAH_BINS { bi = SAH_BINS - 1; }
+                        (((cv - minc) * inv_extent * (SAH_BINS as f64)) as usize).min(SAH_BINS - 1)
+                    };
+                    let mut bins = [(Aabb::empty(), 0usize); SAH_BINS];
+
+                    for &idx in &indices[start..end] {
+                        let bi = bin_of(idx);
                         bins[bi].0 = bins[bi].0.union(bounds[idx]);
                         bins[bi].1 += 1;
                     }
@@ -174,52 +175,36 @@ impl Bvh {
                     }
 
                     if best_cost.is_finite() {
-                        indices[start..end].sort_by_key(|&idx| {
-                            let c = centroids[idx];
-                            let cv = match axis { 0 => c.x, 1 => c.y, _ => c.z };
-                            let mut bi = ((cv - minc) * inv_extent * (SAH_BINS as f64)) as usize;
-                            if bi >= SAH_BINS { bi = SAH_BINS - 1; }
-                            bi
-                        });
-                        let mut left_total = 0usize;
-                        for i in 0..best_split {
-                            left_total += bins[i].1;
-                        }
-                        if left_total > 0 && left_total < n {
-                            start + left_total
-                        } else {
-                            start + n / 2
-                        }
+                        // lc > 0 && rc > 0 の分割だけが候補なので 0 < left_total < n が保証される
+                        let left_total = left_count[best_split - 1];
+                        indices[start..end].sort_by_key(|&idx| bin_of(idx));
+                        Some(start + left_total)
                     } else {
-                        start + n / 2
+                        None
                     }
                 } else {
-                    start + n / 2
+                    None
                 }
             } else {
-                start + n / 2
+                None
             };
 
-            if mid == start || mid == end {
-                // Fallback to median split if SAH produced a degenerate partition.
-                let mid = start + n / 2;
-                indices[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
-                    let ca = centroids[a];
-                    let cb = centroids[b];
-                    let va = match axis { 0 => ca.x, 1 => ca.y, _ => ca.z };
-                    let vb = match axis { 0 => cb.x, 1 => cb.y, _ => cb.z };
-                    va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
-                });
-                let left = build_node(nodes, indices, bounds, centroids, start, mid);
-                let right = build_node(nodes, indices, bounds, centroids, mid, end);
-
-                let idx = node_index as usize;
-                nodes[idx].left = left;
-                nodes[idx].right = right;
-                nodes[idx].start = 0;
-                nodes[idx].count = 0;
-                return node_index;
-            }
+            let mid = match sah_mid {
+                Some(mid) => mid,
+                None => {
+                    // 中央値分割: 最大広がり軸の重心で select_nth し、左右を空間的に分ける
+                    let mid = start + n / 2;
+                    indices[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
+                        let ca = centroids[a];
+                        let cb = centroids[b];
+                        let va = match axis { 0 => ca.x, 1 => ca.y, _ => ca.z };
+                        let vb = match axis { 0 => cb.x, 1 => cb.y, _ => cb.z };
+                        va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
+                    });
+                    mid
+                }
+            };
+            debug_assert!(start < mid && mid < end);
 
             let left = build_node(nodes, indices, bounds, centroids, start, mid);
             let right = build_node(nodes, indices, bounds, centroids, mid, end);
@@ -351,3 +336,90 @@ impl Bvh {
         best
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    fn random_tris(n: usize, rng: &mut Rng) -> Vec<Triangle> {
+        let mut rv = |s: f64| Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * s;
+        (0..n)
+            .map(|i| {
+                let c = rv(10.0);
+                Triangle::new_static(c + rv(1.0), c + rv(1.0), c + rv(1.0), i)
+            })
+            .collect()
+    }
+
+    fn brute_force(tris: &[Triangle], r: Ray, tmin: f64, tmax: f64) -> Option<f64> {
+        let mut best: Option<f64> = None;
+        for t in tris {
+            if let Some(h) = t.hit(r, tmin, best.unwrap_or(tmax)) {
+                best = Some(h.t);
+            }
+        }
+        best
+    }
+
+    /// BVH の最近接交差距離は総当たりと一致する（SAH 経路・中央値分割経路の両方を含むサイズ）。
+    #[test]
+    fn bvh_hit_matches_brute_force() {
+        let mut rng = Rng::new(123);
+        for &n in &[1usize, 5, 12, 15, 16, 40, 500] {
+            let tris = random_tris(n, &mut rng);
+            let bvh = Bvh::build(&tris);
+            for _ in 0..500 {
+                let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
+                let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
+                let r = Ray { o, d: (target - o).norm(), time: 0.0 };
+                let a = bvh.hit(&tris, r, 1e-4, 1e30).map(|h| h.t);
+                let b = brute_force(&tris, r, 1e-4, 1e30);
+                assert_eq!(a, b, "n={}", n);
+            }
+        }
+    }
+
+    /// 全三角形がちょうど 1 つのリーフに属し、リーフ以外は子を 2 つ持つ。
+    #[test]
+    fn bvh_leaves_partition_all_triangles() {
+        let mut rng = Rng::new(5);
+        for &n in &[3usize, 12, 15, 100] {
+            let tris = random_tris(n, &mut rng);
+            let bvh = Bvh::build(&tris);
+            let mut seen = vec![0u32; n];
+            for node in &bvh.nodes {
+                if node.left == -1 {
+                    assert!(node.count as usize <= LEAF_SIZE);
+                    for &i in &bvh.indices[node.start as usize..(node.start + node.count) as usize] {
+                        seen[i] += 1;
+                    }
+                } else {
+                    assert!(node.right != -1 && node.count == 0);
+                }
+            }
+            assert!(seen.iter().all(|&c| c == 1), "n={}", n);
+        }
+    }
+
+    /// SAH を使わない小さなノード（n < 2·SAH_BINS）でも、重心で空間的に分割される。
+    /// 以前は並び順のまま半分に割っていたため、左右の子の重心範囲が重なっていた。
+    #[test]
+    fn small_node_split_is_spatial() {
+        // x 方向に並んだ 12 枚を逆順・交互に並べて入力する
+        let order = [11usize, 0, 9, 2, 7, 4, 5, 6, 3, 8, 1, 10];
+        let tris: Vec<Triangle> = order
+            .iter()
+            .map(|&i| {
+                let x = i as f64 * 2.0;
+                Triangle::new_static(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 0.5, 0.0, 0.0), Vec3::new(x, 0.5, 0.0), i)
+            })
+            .collect();
+        let bvh = Bvh::build(&tris);
+        let root = bvh.nodes[0];
+        let l = bvh.nodes[root.left as usize].bbox;
+        let r = bvh.nodes[root.right as usize].bbox;
+        assert!(l.max.x < r.min.x || r.max.x < l.min.x, "children overlap on the split axis: {:?} {:?}", l, r);
+    }
+}
+

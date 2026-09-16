@@ -78,7 +78,7 @@ impl RenderConfig {
             tile: 16,
             checkpoint_enabled: false,
             checkpoint_every_tasks: 128,
-            scene_hash: 0x4859503000000001u64, // 'HYP0' prefix
+            scene_hash: 0x4859503000000001u64, // プレースホルダ（'HYP0' は旧プロジェクト名 Hyperion の名残）
             output_path: "out.ppm".to_string(),
             env_map_path: None,
             scene_path: None,

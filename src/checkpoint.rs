@@ -1,8 +1,11 @@
 //! レンダリング蓄積バッファのチェックポイント永続化。
 //!
 //! 長時間レンダリングの中断・再開を可能にする。
-//! バイナリフォーマット: マジック → バージョン → シーンハッシュ → 解像度 → タスクID → acc → acc_w
-//! 書き込みは一時ファイル経由の atomic rename で行い、データ破損を防ぐ。
+//! バイナリフォーマット（v2）:
+//! マジック → バージョン → シーンハッシュ → 解像度 → タスクID → acc → acc_w → チェックサム
+//! チェックサムはそれ以前の全バイトの FNV-1a 64bit。不一致・末尾の余剰バイトがあれば読まない。
+//! 書き込みは一時ファイル（`<path>.tmp`）経由の atomic rename で行い、データ破損を防ぐ。
+//! 強制終了で残った `.tmp` は [`remove_stale_tmp`] で起動時に削除する。
 
 use std::fs::File;
 use std::io::{BufWriter, Write, Read, BufReader};
@@ -11,11 +14,22 @@ use crate::config::RenderConfig;
 use crate::math::{Vec3, Color};
 
 const CKPT_MAGIC: &[u8; 8] = b"HYPCKPT\0";
-const CKPT_VERSION: u32 = 1;
+const CKPT_VERSION: u32 = 2;
 
 /// シーンハッシュからチェックポイントファイル名を生成する。
 pub fn ckpt_path(scene_hash: u64) -> String {
     format!("checkpoint_{:016x}.bin", scene_hash)
+}
+
+/// 書き込み途中のファイル名（`<path>.tmp`）。
+fn tmp_path(path: &str) -> String {
+    format!("{}.tmp", path)
+}
+
+/// 前回の強制終了などで残った `<path>.tmp` を削除する。削除した場合 `true`。
+/// 完成したチェックポイント本体（`path`）には触れない。
+pub fn remove_stale_tmp(path: &str) -> bool {
+    std::fs::remove_file(tmp_path(path)).is_ok()
 }
 
 /// FNV-1a 64bit。`DefaultHasher` と違い Rust のバージョンを跨いで値が安定するため、
@@ -61,12 +75,16 @@ impl Fnv64 {
 /// - width / height / spp / max_bounces / rr_start / seed
 /// - adaptive（有効フラグ・min_spp・threshold）
 /// - tile / morton（タスク ID の割り当てが変わるとレジューム位置が狂うため）
+/// - レンダラーのバージョン（`CARGO_PKG_VERSION`）と出力挙動のリビジョン
+///   （[`RENDER_REVISION`](crate::constants::RENDER_REVISION)）
 ///
 /// 出力パス・デノイズ・トーンマップ・露出・チェックポイント間隔は後処理か保存頻度にしか
 /// 影響しないので含めない。
 pub fn scene_hash(config: &RenderConfig) -> std::io::Result<u64> {
     let mut h = Fnv64::new();
     h.field(b"tinypt-scene-hash-v1");
+    h.field(env!("CARGO_PKG_VERSION").as_bytes());
+    h.u64(crate::constants::RENDER_REVISION as u64);
     match &config.scene_path {
         Some(path) => {
             let xml = std::fs::read_to_string(path)?;
@@ -104,6 +122,37 @@ pub fn scene_hash(config: &RenderConfig) -> std::io::Result<u64> {
         h.u64(v);
     }
     Ok(h.0)
+}
+
+/// 書き込んだバイトを FNV-1a に通す Writer ラッパ（チェックサム計算用）。
+struct HashingWriter<W: Write> {
+    inner: W,
+    hash: Fnv64,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hash.bytes(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 読んだバイトを FNV-1a に通す Reader ラッパ（チェックサム検証用）。
+struct HashingReader<R: Read> {
+    inner: R,
+    hash: Fnv64,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash.bytes(&buf[..n]);
+        Ok(n)
+    }
 }
 
 fn write_u32_le<W: Write>(w: &mut W, v: u32) -> std::io::Result<()> {
@@ -144,10 +193,10 @@ pub fn save_checkpoint(
     acc_w: &[f64],
 ) -> std::io::Result<()> {
     // Atomic-ish write: temp file then rename.
-    let tmp = format!("{}.tmp", path);
+    let tmp = tmp_path(path);
     {
         let f = File::create(&tmp)?;
-        let mut out = BufWriter::new(f);
+        let mut out = HashingWriter { inner: BufWriter::new(f), hash: Fnv64::new() };
 
         out.write_all(CKPT_MAGIC)?;
         write_u32_le(&mut out, CKPT_VERSION)?;
@@ -166,13 +215,19 @@ pub fn save_checkpoint(
         for v in acc_w {
             write_f64_le(&mut out, *v)?;
         }
-        out.flush()?;
+        // 末尾のチェックサム自身はハッシュに含めない
+        let checksum = out.hash.0;
+        let mut inner = out.inner;
+        write_u64_le(&mut inner, checksum)?;
+        inner.flush()?;
     }
     std::fs::rename(tmp, path)?;
     Ok(())
 }
 
-/// チェックポイントファイルを読み込む。シーンハッシュと解像度が一致しない場合は None を返す。
+/// チェックポイントファイルを読み込む。
+/// マジック・バージョン・シーンハッシュ・解像度・チェックサムのいずれかが一致しない場合、
+/// またはチェックサムの後ろに余剰バイトがある場合は None を返す。
 pub fn load_checkpoint(
     path: &str,
     scene_hash: u64,
@@ -184,7 +239,7 @@ pub fn load_checkpoint(
     }
 
     let f = File::open(path)?;
-    let mut inp = BufReader::new(f);
+    let mut inp = HashingReader { inner: BufReader::new(f), hash: Fnv64::new() };
 
     let mut magic = [0u8; 8];
     inp.read_exact(&mut magic)?;
@@ -223,6 +278,17 @@ pub fn load_checkpoint(
         acc_w.push(read_f64_le(&mut inp)?);
     }
 
+    let expected = inp.hash.0;
+    let mut rest = inp.inner;
+    let stored = read_u64_le(&mut rest)?;
+    if stored != expected {
+        return Ok(None);
+    }
+    let mut extra = [0u8; 1];
+    if rest.read(&mut extra)? != 0 {
+        return Ok(None);
+    }
+
     Ok(Some((next_id, acc, acc_w)))
 }
 
@@ -238,6 +304,83 @@ mod tests {
 
     fn base() -> RenderConfig {
         RenderConfig::default()
+    }
+
+    fn sample_buffers(n: usize) -> (Vec<Color>, Vec<f64>) {
+        let acc = (0..n).map(|i| Color::new(i as f64, 0.5, -1.0)).collect();
+        let acc_w = (0..n).map(|i| i as f64 + 1.0).collect();
+        (acc, acc_w)
+    }
+
+    /// 保存したチェックポイントはそのまま読み戻せる（v2 フォーマットの往復）。
+    #[test]
+    fn checkpoint_roundtrip() {
+        let path = tmp("roundtrip.bin").to_string_lossy().into_owned();
+        let (acc, acc_w) = sample_buffers(6);
+        save_checkpoint(&path, 42, 3, 2, 5, &acc, &acc_w).unwrap();
+        let (next_id, acc2, acc_w2) = load_checkpoint(&path, 42, 3, 2).unwrap().unwrap();
+        assert_eq!(next_id, 5);
+        assert_eq!(acc_w2, acc_w);
+        for (a, b) in acc.iter().zip(&acc2) {
+            assert_eq!(Vec3::from(*a).x, Vec3::from(*b).x);
+        }
+        assert!(!Path::new(&tmp_path(&path)).exists(), "tmp renamed away");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 本体の 1 バイト破損・末尾の切り詰め・余剰バイトはチェックサムで検出され、読み込まない。
+    #[test]
+    fn corrupted_checkpoint_is_rejected() {
+        let path = tmp("corrupt.bin").to_string_lossy().into_owned();
+        let (acc, acc_w) = sample_buffers(6);
+        save_checkpoint(&path, 42, 3, 2, 5, &acc, &acc_w).unwrap();
+        let good = std::fs::read(&path).unwrap();
+
+        // ヘッダは正しいまま本体（acc の中ほど）を 1 バイト変える
+        let mut flipped = good.clone();
+        flipped[40] ^= 0x01;
+        std::fs::write(&path, &flipped).unwrap();
+        assert!(load_checkpoint(&path, 42, 3, 2).unwrap().is_none(), "bit flip");
+
+        // チェックサム欠落（切り詰め）は読み込みエラー
+        std::fs::write(&path, &good[..good.len() - 8]).unwrap();
+        assert!(!matches!(load_checkpoint(&path, 42, 3, 2), Ok(Some(_))), "truncated");
+
+        let mut extended = good.clone();
+        extended.push(0);
+        std::fs::write(&path, &extended).unwrap();
+        assert!(load_checkpoint(&path, 42, 3, 2).unwrap().is_none(), "trailing bytes");
+
+        std::fs::write(&path, &good).unwrap();
+        assert!(load_checkpoint(&path, 42, 3, 2).unwrap().is_some(), "intact");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 旧フォーマット（v1、チェックサムなし）は読まない。
+    #[test]
+    fn old_format_version_is_rejected() {
+        let path = tmp("v1.bin").to_string_lossy().into_owned();
+        let (acc, acc_w) = sample_buffers(6);
+        save_checkpoint(&path, 42, 3, 2, 5, &acc, &acc_w).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes.truncate(bytes.len() - 8);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load_checkpoint(&path, 42, 3, 2).unwrap().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 残骸の `.tmp` だけを削除し、本体には触れない。
+    #[test]
+    fn remove_stale_tmp_deletes_only_tmp() {
+        let path = tmp("stale.bin").to_string_lossy().into_owned();
+        std::fs::write(&path, b"body").unwrap();
+        std::fs::write(tmp_path(&path), b"partial").unwrap();
+        assert!(remove_stale_tmp(&path));
+        assert!(!Path::new(&tmp_path(&path)).exists());
+        assert!(Path::new(&path).exists());
+        assert!(!remove_stale_tmp(&path), "nothing left to remove");
+        std::fs::remove_file(&path).ok();
     }
 
     /// 同じ config からは同じハッシュ（決定論的）。
