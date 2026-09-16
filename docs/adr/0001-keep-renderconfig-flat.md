@@ -1,6 +1,6 @@
 # Keep RenderConfig a flat struct
 
-`RenderConfig` is a flat 17-field struct threaded into `render`, `build_scene`,
+`RenderConfig` is a flat 17-field struct threaded into `render`, `build_scene` (since renamed `build_default_scene`),
 and the output path. Splitting it into cohesive bundles (Frame / Sampling /
 Checkpoint / Output) was considered and rejected: `render` reads 12 of the 17
 fields, so its interface barely narrows, and the bundles would be pure data
@@ -24,3 +24,9 @@ of fields, revisit this — the bundle would then earn its keep.
 **Update:** `scene_path`, `max_bounces`, and `rr_start` have since been added
 (now 20 fields). They were added flat, consistent with this decision; the
 struct grew but was not split.
+
+**Update:** `scene_hash` is no longer a meaningful constant default. When
+checkpointing is enabled, `main` overwrites it with a hash derived from the
+final config (after scene-file settings and CLI overrides) and the scene
+contents; the value in `RenderConfig::default()` is only a placeholder. The
+field count is unchanged (20).

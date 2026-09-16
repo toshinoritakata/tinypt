@@ -11,7 +11,7 @@ The scattering behaviour at a surface point — how an incoming direction relate
 _Avoid_: BRDF (too narrow — we include transmission), shader, surface model.
 
 **BsdfSample**:
-The result of sampling a BSDF: the scattered `Ray` (origin included, so transmissive and subsurface offsets stay inside the BSDF), the throughput `weight` (`f·cos/pdf`), the `pdf`, and the `is_delta` flag. The `pdf` it reports is the same value `eval` would return for that direction pair.
+The result of sampling a BSDF: the scattered `Ray` (origin included, so transmissive offsets stay inside the BSDF), the throughput `weight` (`f·cos/pdf`), the `pdf`, and the `is_delta` flag. The `pdf` it reports is the same value `eval` would return for that direction pair.
 _Avoid_: ScatterResult, BounceResult.
 
 **Delta BSDF**:
@@ -37,10 +37,13 @@ Combining BSDF sampling and light sampling with the power heuristic (β=2). Need
 **Throughput** (`weight`):
 The accumulated attenuation along a path, `f·cos/pdf` folded together. Carried in `BsdfSample.weight` and multiplied into the path's running throughput.
 
+**Firefly clamp**:
+Every contribution added to a path's radiance — any emitter/background hit (MIS-weighted or not, e.g. seen directly from the camera or after a delta bounce) **and** every NEE contribution — is luminance-scaled to at most `FIREFLY_CLAMP` (50) before being accumulated. Biased by design; applied per contribution (not per path), so both MIS strategies share the same limit.
+
 ### Scene description
 
 **Scene file**:
-An external description of a `Scene` (shapes, BSDFs, emitters, sensor), loaded as a subset of the Mitsuba renderer's XML format (see [ADR-0002](docs/adr/0002-mitsuba-xml-scene-format.md)). Distinct from the **default scene** built in code by `build_scene`.
+An external description of a `Scene` (shapes, BSDFs, emitters, sensor), loaded as a subset of the Mitsuba renderer's XML format (see [ADR-0002](docs/adr/0002-mitsuba-xml-scene-format.md)). Distinct from the **default scene** built in code by `build_default_scene`.
 _Avoid_: scene graph, scene format.
 
 **Sensor**:
@@ -56,11 +59,11 @@ An object→world affine transform (`Transform`): a general linear part (`Mat3`)
 ## Conventions
 
 - `eval` returns the BSDF value `f` **without** the cosine term; the cosine is folded into `BsdfSample.weight` and applied explicitly by the integrator in NEE.
-- Normal orientation (the entering/exiting decision) is handled **inside** the BSDF, not by the integrator.
+- Normal orientation (the entering/exiting decision): `sample` orients the normal internally from `hit.n` and the incoming ray; `eval` expects an **already-oriented** `n`, which the integrator supplies via `oriented_normal` (also used for NEE).
 - `wo` is the outgoing direction `(-ray.d).norm()`, pointing back toward where the ray came from.
 - In scene files, `<rgb>` colour values are **linear** (read straight into `Color`); `<srgb>` values are **sRGB** (gamma-decoded via `from_srgb`). A scene file uses `<srgb>` to reproduce a `from_srgb` albedo and `<rgb>` for scene-referred radiance.
-- **Colour encoding is symmetric**: input decodes with the exact piecewise sRGB curve (`srgb_to_linear`) and PPM output encodes with its exact inverse (`linear_to_srgb`) — not a `1/2.2` approximation. HDR/EXR stay linear.
-- **Background**: a scene file with no environment emitter defaults to a **black** background (Mitsuba semantics). The built-in default scene (via `build_scene`) instead falls back to the procedural `sky()` gradient.
+- **Colour encoding is symmetric**: input decodes with the exact piecewise sRGB curve (`srgb_to_linear`) and PPM output encodes with its exact inverse (`linear_to_srgb`) — not a `1/2.2` approximation. HDR stays linear sRGB; EXR is linear ACEScg.
+- **Background**: a scene file with no environment emitter defaults to a **black** background (Mitsuba semantics). The built-in default scene (via `build_default_scene`) instead falls back to the procedural `sky()` gradient.
 
 ## Example dialogue
 

@@ -5,7 +5,7 @@ format, rather than OpenUSD, glTF, PBRT, or a custom serde format. The
 priority was semantic alignment with a physically-based Monte Carlo path
 tracer: Mitsuba's `roughconductor` (distribution `ggx`, parameter `alpha`)
 maps almost 1:1 to our `Ggx` material, and the format natively has the
-sphere primitive, DOF camera (`apertureRadius`/`focusDistance`), area
+sphere primitive, DOF camera (`aperture_radius`/`focus_distance`), area
 emitters, and environment maps that this renderer already supports.
 Crucially, Mitsuba XML is a declarative tree that parses trivially in Rust
 (`quick-xml`) and maps directly onto our `Scene`, with none of the stateful
@@ -40,8 +40,14 @@ spectral inputs are read as RGB triples.
 
 A loaded scene with no environment emitter defaults to a **black**
 background (Mitsuba semantics), deliberately *not* the procedural `sky()`
-gradient the built-in `build_scene` falls back to — otherwise the sky would
+gradient the built-in `build_scene` (since renamed `build_default_scene`) falls back to — otherwise the sky would
 leak in as ambient light through any open/interior scene (e.g. the Cornell
 box). The parametric Mitsuba shapes (`rectangle`, `cube`, `disk`) are
 generated as canonical-form triangle meshes placed by a `to_world`
 transform, reusing the mesh+instance path.
+
+**Update:** `Subsurface` was reduced to a Lambert-equivalent BSDF (its
+scattering-distance origin offset was removed so that BSDF sampling and NEE
+estimate the same shading point, keeping MIS consistent); `scatter_dist` is
+reserved and unused. A true BSSRDF would be a separate feature. No Mitsuba
+`bsdf` type maps to it.
