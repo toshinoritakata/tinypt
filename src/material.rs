@@ -235,7 +235,7 @@ fn ggx_eval(albedo: Color, alpha: f64, n: Vec3, wo: Vec3, wi: Vec3) -> Color {
     f * (d_ggx * g / denom)
 }
 
-/// GGX サンプリングの PDF を計算する（VNDF サンプリングに対応）。
+/// GGX サンプリングの立体角 PDF（VNDF サンプリングに対応、反射方向 `wi` について）。
 fn ggx_pdf(alpha: f64, n: Vec3, wo: Vec3, wi: Vec3) -> f64 {
     let cos_i = n.dot(wo);
     let cos_o = n.dot(wi);
@@ -246,7 +246,9 @@ fn ggx_pdf(alpha: f64, n: Vec3, wo: Vec3, wi: Vec3) -> f64 {
     let cos_h = n.dot(m).max(0.0);
     let d_ggx = ggx_distribution(alpha, cos_h);
     let g1 = ggx_smith_g1(alpha, cos_i);
-    let pdf_m = d_ggx * g1 * cos_h / cos_i.max(1e-6);
+    // 可視法線分布: D_wo(m) = G1(wo)·max(0, wo·m)·D(m) / (n·wo)（Heitz 2018 式 2）。
+    // 反射のヤコビアン 1/(4|wi·m|) を掛けると pdf(wi) = G1(wo)·D(m) / (4 n·wo)。
+    let pdf_m = d_ggx * g1 * wo.dot(m).max(0.0) / cos_i.max(1e-6);
     let denom = 4.0 * wi.dot(m).abs().max(1e-6);
     (pdf_m / denom).max(0.0)
 }
@@ -336,7 +338,8 @@ fn sample_ggx_vndf(wo: Vec3, alpha: f64, u1: f64, u2: f64) -> Vec3 {
     let t1p = r * phi.cos();
     let t2p_init = r * phi.sin();
     let s = 0.5 * (1.0 + v.z);
-    let t2p = (1.0 - s).sqrt() * t2p_init + s * (1.0 - t1p * t1p).max(0.0).sqrt();
+    // Heitz 2018 Listing 1: t2 = (1 − s)·√(1 − t1²) + s·t2
+    let t2p = (1.0 - s) * (1.0 - t1p * t1p).max(0.0).sqrt() + s * t2p_init;
 
     let nh = (t1 * t1p + t2 * t2p + v * (1.0 - t1p * t1p - t2p * t2p).max(0.0).sqrt()).norm();
     Vec3::new(alpha * nh.x, alpha * nh.y, nh.z).norm()
@@ -368,42 +371,161 @@ mod tests {
         }
     }
 
-    /// sample() が報告する PDF は eval() の PDF と一致する（GGX / VNDF）。
-    #[test]
-    fn ggx_sample_pdf_matches_eval() {
-        let mat = Material::Ggx { albedo: Color::new(0.9, 0.9, 0.9), alpha: 0.3 };
-        let (ray, hit) = floor_hit();
-        let mut rng = Rng::new(7);
-        let n = hit.n;
-        let wo = (-ray.d).norm();
-        for _ in 0..1000 {
-            if let Some(s) = mat.sample(&ray, &hit, &mut rng) {
-                let (_, pdf_eval) = mat.eval(wo, s.scattered.d, n);
-                assert!((s.pdf - pdf_eval).abs() < 1e-9, "{} vs {}", s.pdf, pdf_eval);
-            }
-        }
+    /// 法線 +Y の点に、出射方向 `wo`（天頂角 `theta_o`）から入射するレイと Hit。
+    fn oblique_hit(theta_o: f64) -> (Ray, Hit, Vec3) {
+        let wo = Vec3::new(theta_o.sin(), theta_o.cos(), 0.0);
+        let ray = Ray { o: wo * 2.0, d: -wo, time: 0.0 };
+        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None };
+        (ray, hit, wo)
     }
 
-    /// GGX の重みは f·cos/pdf と一致する（sample の weight と eval の f・pdf が一貫）。
-    /// VNDF サンプリングなのに NDF PDF で割っていた不整合への回帰テスト。
-    #[test]
-    fn ggx_weight_matches_f_cos_over_pdf() {
-        let mat = Material::Ggx { albedo: Color::new(0.9, 0.8, 0.7), alpha: 0.35 };
-        let (ray, hit) = floor_hit();
-        let mut rng = Rng::new(11);
-        let n = hit.n;
-        let wo = (-ray.d).norm();
-        for _ in 0..2000 {
-            if let Some(s) = mat.sample(&ray, &hit, &mut rng) {
+    /// GGX テストの (α, θo) の組。垂直入射・斜め入射・グレイジングを含む。
+    const GGX_CASES: [(f64, f64); 8] = [
+        (0.1, 0.0), (0.25, 0.0), (0.25, 0.6), (0.25, 1.2), (0.5, 1.0), (0.1, 1.45), (1.0, 0.3), (1.0, 1.2),
+    ];
+
+    /// `check_ggx_sample_matches_eval` の本体。失敗理由を返す（シード掃引テストと共有）。
+    ///
+    /// sample() の PDF は同じ方向の eval() の PDF と一致し、weight は f·cos/pdf と一致する。
+    /// どの (α, θo) でも有効サンプルが十分に出ることを要求する（以前は垂直入射で常に None に
+    /// なり、アサーションが一度も実行されない空振りテストだった）。有効率の下限 2/5 は、
+    /// 最も有効率の低い (1.0, 0.3)（真値 ≈ 0.512、2000 試行で SD ≈ 0.011）に対して約 10σ の余裕。
+    fn check_ggx_sample_matches_eval(seed: u64) -> Result<(), String> {
+        let mut rng = Rng::new(seed);
+        for &(alpha, theta_o) in &GGX_CASES {
+            let mat = Material::Ggx { albedo: Color::new(0.9, 0.8, 0.7), alpha };
+            let (ray, hit, wo) = oblique_hit(theta_o);
+            let n = hit.n;
+            let trials = 2000;
+            let mut valid = 0;
+            for _ in 0..trials {
+                let Some(s) = mat.sample(&ray, &hit, &mut rng) else { continue };
+                valid += 1;
                 let wi = s.scattered.d;
                 let (f, pdf) = mat.eval(wo, wi, n);
-                let cos_o = n.dot(wi).max(0.0);
-                let expected = f * (cos_o / pdf.max(1e-6));
-                assert!((s.weight.r() - expected.r()).abs() < 1e-9, "{} vs {}", s.weight.r(), expected.r());
-                assert!((s.weight.g() - expected.g()).abs() < 1e-9);
-                assert!((s.weight.b() - expected.b()).abs() < 1e-9);
+                if (s.pdf - pdf).abs() > 1e-9 * pdf.max(1.0) {
+                    return Err(format!("α={} θo={}: pdf {} vs eval {}", alpha, theta_o, s.pdf, pdf));
+                }
+                let expected = f * (n.dot(wi).max(0.0) / pdf.max(1e-6));
+                for (a, b) in [(s.weight.r(), expected.r()), (s.weight.g(), expected.g()), (s.weight.b(), expected.b())] {
+                    if (a - b).abs() > 1e-9 * b.abs().max(1.0) {
+                        return Err(format!("α={} θo={}: weight {} vs f·cos/pdf {}", alpha, theta_o, a, b));
+                    }
+                }
+            }
+            if valid * 5 < trials * 2 {
+                return Err(format!("α={} θo={}: only {} / {} valid samples", alpha, theta_o, valid, trials));
             }
         }
+        Ok(())
+    }
+
+    /// 標本の平均と、平均の標準誤差。
+    fn mean_and_se(sum: f64, sum_sq: f64, n: usize) -> (f64, f64) {
+        let n = n as f64;
+        let mean = sum / n;
+        let var = (sum_sq / n - mean * mean).max(0.0) * n / (n - 1.0);
+        (mean, (var / n).sqrt())
+    }
+
+    /// `ggx_sampling_is_unbiased_and_pdf_normalized` の本体。失敗理由を返す（シード掃引テストと共有）。
+    ///
+    /// - E[weight] = ∫ f·cos dω（一様半球サンプリングによる参照積分と比較）
+    /// - ∫ pdf dω = 有効サンプル率（地平線の下へ反射した分だけ 1 より小さい）
+    ///
+    /// 許容誤差は固定の相対値ではなく、両辺の標本分散から求めた標準誤差 SE に対して
+    /// |Δ| < 5·SE + 0.003（相対の絶対下限）とする。鋭いローブ（α = 0.1）では一様半球の参照積分の
+    /// 分散が大きく、固定 2% だとシード次第で約半数が偶然に失敗していた。
+    fn check_ggx_sampling_is_unbiased(seed: u64) -> Result<(), String> {
+        const K: f64 = 5.0;
+        const FLOOR: f64 = 0.003;
+        let tau = std::f64::consts::TAU;
+        let mut rng = Rng::new(seed);
+        for &(alpha, theta_o) in &GGX_CASES {
+            let mat = Material::Ggx { albedo: Color::new(1.0, 1.0, 1.0), alpha };
+            let (ray, hit, wo) = oblique_hit(theta_o);
+            let n = hit.n;
+
+            let m = 200_000;
+            let (mut sw, mut sw2, mut valid) = (0.0, 0.0, 0usize);
+            for _ in 0..m {
+                if let Some(s) = mat.sample(&ray, &hit, &mut rng) {
+                    let w = s.weight.r();
+                    sw += w;
+                    sw2 += w * w;
+                    valid += 1;
+                }
+            }
+            let (mean_w, se_w) = mean_and_se(sw, sw2, m);
+            let valid_rate = valid as f64 / m as f64;
+            let se_rate = (valid_rate * (1.0 - valid_rate) / m as f64).sqrt();
+
+            // 参照: 一様半球（pdf = 1/2π）での ∫ f·cos dω と ∫ pdf dω
+            let (mut sf, mut sf2, mut sp, mut sp2) = (0.0, 0.0, 0.0, 0.0);
+            for _ in 0..m {
+                let z = rng.next_f64();
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let phi = tau * rng.next_f64();
+                let wi = Vec3::new(r * phi.cos(), z, r * phi.sin());
+                let (f, pdf) = mat.eval(wo, wi, n);
+                let (x, y) = (f.r() * z * tau, pdf * tau);
+                sf += x;
+                sf2 += x * x;
+                sp += y;
+                sp2 += y * y;
+            }
+            let (ref_fcos, se_fcos) = mean_and_se(sf, sf2, m);
+            let (ref_pdf, se_pdf) = mean_and_se(sp, sp2, m);
+
+            let case = format!("α={} θo={}", alpha, theta_o);
+            if valid_rate <= 0.4 {
+                return Err(format!("{}: valid rate {}", case, valid_rate));
+            }
+            let d_w = mean_w - ref_fcos;
+            let tol_w = K * (se_w * se_w + se_fcos * se_fcos).sqrt() + FLOOR * ref_fcos;
+            if d_w.abs() >= tol_w {
+                return Err(format!("{}: E[weight] {} vs ∫f·cos {} (|Δ| {:.3e} ≥ tol {:.3e})", case, mean_w, ref_fcos, d_w.abs(), tol_w));
+            }
+            let d_p = ref_pdf - valid_rate;
+            let tol_p = K * (se_pdf * se_pdf + se_rate * se_rate).sqrt() + FLOOR * valid_rate;
+            if d_p.abs() >= tol_p {
+                return Err(format!("{}: ∫pdf {} vs valid rate {} (|Δ| {:.3e} ≥ tol {:.3e})", case, ref_pdf, valid_rate, d_p.abs(), tol_p));
+            }
+            if ref_pdf >= 1.0 + K * se_pdf + FLOOR {
+                return Err(format!("{}: ∫pdf {} exceeds 1 (SE {:.3e})", case, ref_pdf, se_pdf));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ggx_sample_matches_eval_for_pdf_and_weight() {
+        check_ggx_sample_matches_eval(7).unwrap();
+    }
+
+    /// VNDF サンプラの式の誤り・pdf の cos_h/wo·m の取り違え・weight や pdf の定数倍の誤りを検出する。
+    #[test]
+    fn ggx_sampling_is_unbiased_and_pdf_normalized() {
+        check_ggx_sampling_is_unbiased(11).unwrap();
+    }
+
+    /// 上の 2 テストがシードに依存して偶然失敗しないことの確認（重いので通常は実行しない）。
+    /// `cargo test --release --no-default-features ggx_tests_are_seed_robust -- --ignored`
+    /// 環境変数 `TINYPT_GGX_SEEDS` で掃引するシード数を変えられる（既定 256）。
+    #[test]
+    #[ignore]
+    fn ggx_tests_are_seed_robust() {
+        let seeds: u64 = std::env::var("TINYPT_GGX_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        let mut failures = Vec::new();
+        for seed in 0..seeds {
+            if let Err(e) = check_ggx_sample_matches_eval(seed) {
+                failures.push(format!("match seed {}: {}", seed, e));
+            }
+            if let Err(e) = check_ggx_sampling_is_unbiased(seed) {
+                failures.push(format!("unbiased seed {}: {}", seed, e));
+            }
+        }
+        assert!(failures.is_empty(), "{} failures over {} seeds:\n{}", failures.len(), seeds, failures.join("\n"));
     }
 
     /// Lambert の重みは albedo に一致する（f·cos/pdf が打ち消し合う／拡散の白炉テスト）。
