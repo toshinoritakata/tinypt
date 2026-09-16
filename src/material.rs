@@ -14,7 +14,7 @@
 //! - **Metal**: 完全鏡面反射（デルタ BSDF）
 //! - **Dielectric**: 屈折体（フレネル + Beer-Lambert 吸収、デルタ BSDF）
 //! - **GGX**: マイクロファセットモデル（VNDF サンプリング + Smith 遮蔽関数）
-//! - **Subsurface**: 簡易サブサーフェス（現状は Lambert と同一の拡散反射。`scatter_dist` は未使用の予約パラメータ）
+//! - **Subsurface**: 簡易サブサーフェス（現状は Lambert と同一の拡散反射）
 //! - **DiffuseLight**: 拡散発光体（散乱なし、放射輝度を返す）
 
 use std::f64::consts::PI;
@@ -36,8 +36,8 @@ pub enum Material {
     Dielectric { ior: f64, absorption: Color },
     /// GGX マイクロファセット（粗さパラメータ alpha）
     Ggx     { albedo: Color, alpha: f64 },
-    /// 簡易サブサーフェス（現状は Lambert と同一の拡散反射。`scatter_dist` は予約で未使用）
-    Subsurface { albedo: Color, scatter_dist: f64 },
+    /// 簡易サブサーフェス（現状は Lambert と同一の拡散反射）
+    Subsurface { albedo: Color },
     /// 拡散面光源
     DiffuseLight { emit: Color },
 }
@@ -179,7 +179,7 @@ impl Material {
                     is_delta: false,
                 })
             }
-            Material::Subsurface { albedo, .. } => {
+            Material::Subsurface { albedo } => {
                 // 向き補正済み n 周りのコサイン半球サンプリングで Lambert と同じ契約に揃える:
                 // weight = f·cos/pdf = albedo、pdf = eval() の pdf、原点は hit.p（NEE と同一点）。
                 // 以前は散乱距離ぶん原点を面の内側へずらしていたが、NEE のシャドウレイ
@@ -202,7 +202,7 @@ impl Material {
     /// デルタ散乱マテリアルは有限の値を持たないため `(0, 0)` を返す。
     pub fn eval(&self, wo: Vec3, wi: Vec3, n: Vec3) -> (Color, f64) {
         match *self {
-            Material::Lambert { albedo } | Material::Subsurface { albedo, .. } => {
+            Material::Lambert { albedo } | Material::Subsurface { albedo } => {
                 let cos = n.dot(wi).max(0.0);
                 if cos <= 0.0 {
                     (Color::new(0.0, 0.0, 0.0), 0.0)
@@ -465,7 +465,7 @@ mod tests {
     }
 
     fn subsurface() -> Material {
-        Material::Subsurface { albedo: Color::new(0.8, 0.5, 0.3), scatter_dist: 0.2 }
+        Material::Subsurface { albedo: Color::new(0.8, 0.5, 0.3) }
     }
 
     /// Subsurface: sample() の PDF は eval() の PDF と一致する（表面・裏面の両方）。

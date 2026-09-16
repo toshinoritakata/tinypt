@@ -48,6 +48,7 @@ transform, reusing the mesh+instance path.
 
 **Update:** `Subsurface` was reduced to a Lambert-equivalent BSDF (its
 scattering-distance origin offset was removed so that BSDF sampling and NEE
-estimate the same shading point, keeping MIS consistent); `scatter_dist` is
-reserved and unused. A true BSSRDF would be a separate feature. No Mitsuba
+estimate the same shading point, keeping MIS consistent); `scatter_dist` was
+at first kept as a reserved, unused field and was later removed, leaving
+`Subsurface { albedo }`. A true BSSRDF would be a separate feature. No Mitsuba
 `bsdf` type maps to it.

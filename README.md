@@ -25,7 +25,7 @@ Rust 製のモンテカルロパストレーサー。
 | `Metal` | `albedo` | 完全鏡面反射（デルタ BSDF） |
 | `Dielectric` | `ior`, `absorption` | 屈折体。フレネル + Beer-Lambert 吸収（デルタ BSDF） |
 | `Ggx` | `albedo`, `alpha` | GGX マイクロファセット反射（下記参照） |
-| `Subsurface` | `albedo`, `scatter_dist` | 簡易サブサーフェス（現状は Lambert と同一の拡散反射。`scatter_dist` は予約・未使用）。シーンファイル・組み込みシーンからは指定不可 |
+| `Subsurface` | `albedo` | 簡易サブサーフェス（現状は Lambert と同一の拡散反射）。シーンファイル・組み込みシーンからは指定不可 |
 | `DiffuseLight` | `emit` | 拡散面光源 |
 
 ### GGX マイクロファセット
