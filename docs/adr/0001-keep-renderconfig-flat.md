@@ -30,3 +30,8 @@ checkpointing is enabled, `main` overwrites it with a hash derived from the
 final config (after scene-file settings and CLI overrides) and the scene
 contents; the value in `RenderConfig::default()` is only a placeholder. The
 field count is unchanged (20).
+
+**Update:** `max_bounces` and `rr_start` were renamed `max_depth` and
+`rr_depth` and now carry Mitsuba's path-length meaning (depth 1 = directly
+visible emitters, 2 = direct illumination, `usize::MAX` = unlimited). This is a
+rename with a semantic fix, not a new field; the struct stays flat (20 fields).

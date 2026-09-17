@@ -9,10 +9,11 @@ pub struct RenderConfig {
     pub height: usize,
     /// ピクセルあたりのサンプル数（Samples Per Pixel）
     pub spp: usize,
-    /// パスの最大バウンス数（Mitsuba の integrator max_depth に対応）
-    pub max_bounces: usize,
-    /// Russian Roulette を開始するバウンス数（Mitsuba の rr_depth に対応）
-    pub rr_start: usize,
+    /// 最大パス長（Mitsuba の integrator `max_depth` と同じ意味。カメラから数えた頂点数で、
+    /// 1 = 直接見える発光体のみ、2 = 直接照明まで。`usize::MAX` で無制限＝`max_depth = -1`）
+    pub max_depth: usize,
+    /// Russian Roulette を開始するパス長（Mitsuba の integrator `rr_depth` と同じ意味）
+    pub rr_depth: usize,
     /// タイルサイズ（ピクセル、正方形）
     pub tile: usize,
     /// チェックポイント保存の有効/無効
@@ -73,8 +74,8 @@ impl RenderConfig {
             width: 1920,
             height: 1080,
             spp: 512,
-            max_bounces: crate::constants::path::MAX_BOUNCES,
-            rr_start: crate::constants::path::RR_START_BOUNCE,
+            max_depth: crate::constants::path::MAX_DEPTH,
+            rr_depth: crate::constants::path::RR_DEPTH,
             tile: 16,
             checkpoint_enabled: false,
             checkpoint_every_tasks: 128,

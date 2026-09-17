@@ -11,7 +11,7 @@
 //! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `twosided`(unwrap)
 //! - `emitter type="area"`: `radiance`（shape に付随）
 //! - `emitter type="envmap"`(filename) / `constant`(radiance): 環境マップ。`scale` 対応
-//! - `film`(width/height) / `sampler`(sample_count) / `integrator`(max_depth/rr_depth): RenderConfig へ反映
+//! - `film`(width/height) / `sampler`(sample_count) / `integrator`(max_depth/rr_depth、Mitsuba と同じ意味、max_depth=-1 は無制限): RenderConfig へ反映
 //!
 //! ## 方針
 //! - 色: `<rgb>` はリニア、`<srgb>` は sRGB（ガンマ展開）。
@@ -72,6 +72,11 @@ impl Element {
     }
 
     fn int(&self, name: &str) -> Option<usize> {
+        self.prop("integer", name)?.attr("value")?.trim().parse().ok()
+    }
+
+    /// 負の値も読める整数プロパティ（`max_depth = -1` など）。
+    fn int_signed(&self, name: &str) -> Option<i64> {
         self.prop("integer", name)?.attr("value")?.trim().parse().ok()
     }
 
@@ -136,8 +141,8 @@ pub struct SceneSettings {
     pub width: Option<usize>,
     pub height: Option<usize>,
     pub spp: Option<usize>,
-    pub max_bounces: Option<usize>,
-    pub rr_start: Option<usize>,
+    pub max_depth: Option<usize>,
+    pub rr_depth: Option<usize>,
 }
 
 impl SceneSettings {
@@ -152,11 +157,11 @@ impl SceneSettings {
         if let Some(spp) = self.spp {
             config.spp = spp;
         }
-        if let Some(m) = self.max_bounces {
-            config.max_bounces = m;
+        if let Some(m) = self.max_depth {
+            config.max_depth = m;
         }
-        if let Some(r) = self.rr_start {
-            config.rr_start = r;
+        if let Some(r) = self.rr_depth {
+            config.rr_depth = r;
         }
     }
 }
@@ -191,12 +196,21 @@ pub fn load_scene_from_str(xml: &str, base_dir: &Path, base_config: &RenderConfi
                 }
             }
             "integrator" => {
-                // Mitsuba の max_depth/rr_depth に対応（max_depth=-1 の無制限は未対応＝既定維持）
-                if let Some(d) = child.int("max_depth") {
-                    settings.max_bounces = Some(d.max(1));
+                // Mitsuba の max_depth / rr_depth をそのままの意味で使う（パス長。1 = 直接見える
+                // 発光体のみ、2 = 直接照明まで）。max_depth = -1 は無制限（Russian Roulette で打ち切る）。
+                if let Some(d) = child.int_signed("max_depth") {
+                    match d {
+                        -1 => settings.max_depth = Some(usize::MAX),
+                        d if d >= 0 => settings.max_depth = Some(d as usize),
+                        d => warn(&format!("integrator max_depth {} is invalid (expected -1 or >= 0); ignored", d)),
+                    }
                 }
-                if let Some(r) = child.int("rr_depth") {
-                    settings.rr_start = Some(r);
+                if let Some(r) = child.int_signed("rr_depth") {
+                    if r >= 1 {
+                        settings.rr_depth = Some(r as usize);
+                    } else {
+                        warn(&format!("integrator rr_depth {} is invalid (expected >= 1); ignored", r));
+                    }
                 }
             }
             _ => {}
@@ -770,8 +784,29 @@ mod tests {
         assert_eq!(config.width, 800);
         assert_eq!(config.height, 600);
         assert_eq!(config.spp, 256);
-        assert_eq!(config.max_bounces, 12);
-        assert_eq!(config.rr_start, 5);
+        assert_eq!(config.max_depth, 12);
+        assert_eq!(config.rr_depth, 5);
+    }
+
+    /// max_depth = -1 は無制限、0 はそのまま（何も描かない）、それ以外の負値と rr_depth < 1 は無視。
+    #[test]
+    fn integrator_depth_values_follow_mitsuba() {
+        let settings_for = |max_depth: &str, rr_depth: &str| {
+            let xml = format!(
+                r#"<scene version="3.0.0"><integrator type="path"><integer name="max_depth" value="{}"/><integer name="rr_depth" value="{}"/></integrator>
+                   <shape type="sphere"><bsdf type="diffuse"/></shape></scene>"#,
+                max_depth, rr_depth
+            );
+            load_scene_from_str(&xml, Path::new("."), &cfg()).unwrap().1
+        };
+        let s = settings_for("-1", "5");
+        assert_eq!(s.max_depth, Some(usize::MAX));
+        assert_eq!(s.rr_depth, Some(5));
+        assert_eq!(settings_for("0", "1").max_depth, Some(0));
+        assert_eq!(settings_for("1", "1").max_depth, Some(1));
+        let s = settings_for("-2", "0");
+        assert_eq!(s.max_depth, None);
+        assert_eq!(s.rr_depth, None);
     }
 
     #[test]

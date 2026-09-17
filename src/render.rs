@@ -238,7 +238,7 @@ fn render_with_threads(
         w, h, config.spp, config.tile, threads, config.morton_enabled, config.seed
     );
 
-    let limits = PathLimits { max_bounces: config.max_bounces, rr_start: config.rr_start };
+    let limits = PathLimits { max_depth: config.max_depth, rr_depth: config.rr_depth };
 
     scope(|sp| {
         let world_ref = &scene.world;
@@ -398,8 +398,8 @@ mod tests {
             width: w,
             height: h,
             spp: 1,
-            max_bounces: 8,
-            rr_start: 3,
+            max_depth: 8,
+            rr_depth: 3,
             tile: 1,
             checkpoint_enabled: false,
             checkpoint_every_tasks: 1,
@@ -435,8 +435,8 @@ mod tests {
             width: w,
             height: h,
             spp: 4,
-            max_bounces: 8,
-            rr_start: 3,
+            max_depth: 8,
+            rr_depth: 3,
             tile,
             checkpoint_enabled: false,
             checkpoint_every_tasks: 1,
@@ -626,19 +626,19 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 4;
+    const GOLDEN_REVISION: u32 = 5;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
-    const GOLDEN_CORNELL: (u64, u64) = (0xe0fb_0da2_b40a_e05c, 0xdbb2_11fe_7acf_2536);
+    const GOLDEN_CORNELL: (u64, u64) = (0x5156_c9fc_0c95_100e, 0xc733_0a4b_cf8f_a88d);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
-    const GOLDEN_SPHERES: (u64, u64) = (0x1ecd_77bb_680f_b53b, 0x6320_0a66_44ac_088c);
+    const GOLDEN_SPHERES: (u64, u64) = (0x6750_33e4_dcae_afe6, 0xec70_43a5_3315_6a88);
 
     /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
     /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。
     const GOLDEN_SPHERES_XML: &str = r#"<scene version="3.0.0">
-      <integrator type="path"><integer name="max_depth" value="8"/><integer name="rr_depth" value="3"/></integrator>
+      <integrator type="path"><integer name="max_depth" value="9"/><integer name="rr_depth" value="4"/></integrator>
       <sensor type="perspective">
         <float name="fov" value="40"/>
         <float name="aperture_radius" value="0.05"/>

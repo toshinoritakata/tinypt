@@ -102,9 +102,8 @@ impl Material {
                 // Snell の法則: η = η_i / η_t（入射側/透過側の屈折率比）
                 let eta = if entering { 1.0 / ior } else { *ior };
                 let cos_i = (-ray_in.d).dot(n).max(0.0);
-                // Schlick 近似によるフレネル反射率
-                let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
-                let fresnel = f0 + (1.0 - f0) * pow5(1.0 - cos_i);
+                // Schlick 近似によるフレネル反射率（媒質から出る側は透過側の cos を使う）
+                let fresnel = schlick_dielectric(cos_i, eta, *ior);
 
                 let mut current_beta = Color::new(1.0, 1.0, 1.0);
                 // Beer-Lambert for path inside the medium (only apply when exiting/inside)
@@ -251,6 +250,27 @@ fn ggx_pdf(alpha: f64, n: Vec3, wo: Vec3, wi: Vec3) -> f64 {
     let pdf_m = d_ggx * g1 * wo.dot(m).max(0.0) / cos_i.max(1e-6);
     let denom = 4.0 * wi.dot(m).abs().max(1e-6);
     (pdf_m / denom).max(0.0)
+}
+
+/// 誘電体境界の Schlick 近似による反射率。`eta` = η_i/η_t、`ior` は媒質の屈折率。
+///
+/// Schlick 近似の角度は、常に屈折率の**低い側**（ここでは外側）の角度でなければならない。
+/// 外から入射する場合（eta < 1）は入射角の cos、媒質から出る場合（eta > 1）は Snell の法則で
+/// 求めた透過角の cos を使う。こうすると同じ境界を逆向きに通る光路で反射率が一致し
+/// （Stokes の関係）、臨界角に近づくと反射率が 1 に連続的に近づく。
+/// 全反射（透過角が存在しない）では 1 を返す。
+fn schlick_dielectric(cos_i: f64, eta: f64, ior: f64) -> f64 {
+    let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+    let cos = if eta > 1.0 {
+        let sin2_t = eta * eta * (1.0 - cos_i * cos_i).max(0.0);
+        if sin2_t >= 1.0 {
+            return 1.0;
+        }
+        (1.0 - sin2_t).sqrt()
+    } else {
+        cos_i
+    };
+    f0 + (1.0 - f0) * pow5(1.0 - cos)
 }
 
 /// x^5 を効率的に計算する（フレネルの Schlick 近似用）。
@@ -643,6 +663,74 @@ mod tests {
             assert!(s.pdf > 0.0 || n.dot(d) < 1e-9, "pdf = {}", s.pdf);
             let expected_o = hit.p + RAY_EPSILON * d;
             assert!((s.scattered.o - expected_o).len() < 1e-12);
+        }
+    }
+
+    /// 誘電体の厳密な Fresnel 反射率（非偏光、s/p 偏光の平均）。`eta` = η_i/η_t。全反射なら 1。
+    fn fresnel_dielectric_exact(cos_i: f64, eta: f64) -> f64 {
+        let sin2_t = eta * eta * (1.0 - cos_i * cos_i).max(0.0);
+        if sin2_t >= 1.0 {
+            return 1.0;
+        }
+        let cos_t = (1.0 - sin2_t).sqrt();
+        let rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+        let rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+        0.5 * (rs * rs + rp * rp)
+    }
+
+    /// 旧実装（出る側でも入射角の cos を使っていた）。比較用。
+    fn schlick_dielectric_old(cos_i: f64, ior: f64) -> f64 {
+        let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+        f0 + (1.0 - f0) * pow5(1.0 - cos_i)
+    }
+
+    /// 媒質から出る側の Schlick 反射率は、同じ光路を外から入る側の反射率と一致する（Stokes の関係。
+    /// 厳密な Fresnel はこれを満たす）。旧実装は内側の角度を使っていたため一致しなかった。
+    #[test]
+    fn dielectric_schlick_is_symmetric_across_the_interface() {
+        for &ior in &[1.33f64, 1.5, 2.4] {
+            for k in 0..=100 {
+                let cos_out = k as f64 / 100.0; // 外側（低屈折率側）の角度
+                let sin_out = (1.0 - cos_out * cos_out).sqrt();
+                let cos_in = (1.0 - (sin_out / ior).powi(2)).sqrt(); // Snell で内側の角度
+                let enter = schlick_dielectric(cos_out, 1.0 / ior, ior);
+                let exit = schlick_dielectric(cos_in, ior, ior);
+                assert!((enter - exit).abs() < 1e-12, "ior={} cos_out={}: enter {} vs exit {}", ior, cos_out, enter, exit);
+                let exact_enter = fresnel_dielectric_exact(cos_out, 1.0 / ior);
+                let exact_exit = fresnel_dielectric_exact(cos_in, ior);
+                assert!((exact_enter - exact_exit).abs() < 1e-12, "exact Fresnel must be symmetric");
+            }
+        }
+    }
+
+    /// 出る側の反射率は厳密な Fresnel に近い（旧実装より大幅に誤差が小さい）。臨界角を超えると 1。
+    /// 入る側は旧実装と同一。
+    #[test]
+    fn dielectric_schlick_exit_side_tracks_exact_fresnel() {
+        for &ior in &[1.33f64, 1.5, 2.4] {
+            let critical_cos = (1.0 - 1.0 / (ior * ior)).sqrt();
+            let (mut max_new, mut max_old) = (0.0f64, 0.0f64);
+            for k in 0..=2000 {
+                let cos_i = k as f64 / 2000.0;
+                let exact = fresnel_dielectric_exact(cos_i, ior);
+                let new = schlick_dielectric(cos_i, ior, ior);
+                let old = schlick_dielectric_old(cos_i, ior);
+                max_new = max_new.max((new - exact).abs());
+                max_old = max_old.max((old - exact).abs());
+                if cos_i < critical_cos {
+                    assert_eq!(new, 1.0, "ior={} cos_i={}: beyond the critical angle must reflect totally", ior, cos_i);
+                }
+                // 入る側は変更なし
+                assert_eq!(schlick_dielectric(cos_i, 1.0 / ior, ior), schlick_dielectric_old(cos_i, ior));
+            }
+            // Schlick 近似そのものの誤差（入る側の最大誤差）と同程度に収まる
+            let max_enter = (0..=2000)
+                .map(|k| k as f64 / 2000.0)
+                .map(|c| (schlick_dielectric(c, 1.0 / ior, ior) - fresnel_dielectric_exact(c, 1.0 / ior)).abs())
+                .fold(0.0, f64::max);
+            assert!(max_new <= max_enter + 1e-12, "ior={}: exit-side error {} exceeds enter-side error {}", ior, max_new, max_enter);
+            assert!(max_old > 0.5, "ior={}: old exit-side error {} (expected large near the critical angle)", ior, max_old);
+            println!("ior={}: max |Schlick−exact| exit side new {:.4} old {:.4}, enter side {:.4}", ior, max_new, max_old, max_enter);
         }
     }
 

@@ -72,7 +72,7 @@ impl Fnv64 {
 /// 含めるもの（蓄積バッファの中身かタスク ID の並びを変えるもの）:
 /// - シーン内容: XML ならファイル内容と参照ファイル（OBJ / 環境マップ）のパス＋内容、
 ///   組み込みシーンなら識別子と `--env` の環境マップ（パス＋内容）
-/// - width / height / spp / max_bounces / rr_start / seed
+/// - width / height / spp / max_depth / rr_depth / seed
 /// - adaptive（有効フラグ・min_spp・threshold）
 /// - tile / morton（タスク ID の割り当てが変わるとレジューム位置が狂うため）
 /// - レンダラーのバージョン（`CARGO_PKG_VERSION`）と出力挙動のリビジョン
@@ -110,8 +110,8 @@ pub fn scene_hash(config: &RenderConfig) -> std::io::Result<u64> {
         config.width as u64,
         config.height as u64,
         config.spp as u64,
-        config.max_bounces as u64,
-        config.rr_start as u64,
+        config.max_depth as u64,
+        config.rr_depth as u64,
         config.seed,
         config.adaptive_enabled as u64,
         config.adaptive_min_spp as u64,
@@ -397,8 +397,8 @@ mod tests {
             ("width", |c| c.width += 1),
             ("height", |c| c.height += 1),
             ("spp", |c| c.spp += 1),
-            ("max_bounces", |c| c.max_bounces += 1),
-            ("rr_start", |c| c.rr_start += 1),
+            ("max_depth", |c| c.max_depth += 1),
+            ("rr_depth", |c| c.rr_depth += 1),
             ("seed", |c| c.seed += 1),
             ("adaptive_enabled", |c| c.adaptive_enabled = !c.adaptive_enabled),
             ("adaptive_min_spp", |c| c.adaptive_min_spp += 1),

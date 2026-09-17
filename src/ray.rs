@@ -86,7 +86,8 @@ impl Camera {
     }
     /// 正規化スクリーン座標 [-1, 1] からカメラレイを生成する。
     ///
-    /// DOF 有効時: レンズ上のランダムな点から焦点面上の点へレイを飛ばす。
+    /// DOF 有効時: レンズ上のランダムな点から焦点面上の点へレイを飛ばす。焦点面は視線（−w）に
+    /// 垂直で、レンズ中心から距離 `focus_dist` にある**平面**（薄レンズモデル。Mitsuba / PBRT と同じ）。
     /// モーションブラー: シャッター開閉の間のランダムな time を割り当てる。
     pub fn ray(&self, sx: f64, sy: f64, rng: &mut Rng) -> Ray {
         // ピンホール方向（レンズ中心から見たスクリーン上の方向）
@@ -99,9 +100,14 @@ impl Camera {
             Vec3::new(0.0, 0.0, 0.0)
         };
         let origin = self.o + lens_offset;
-        // 焦点面上の点に向けてレイを飛ばす（ピント面で全レイが収束）
-        let focus_point = self.o + dir_base * self.focus_dist;
-        let dir = (focus_point - origin).norm();
+        let dir = if self.lens_radius > 0.0 {
+            // ピンホール方向が焦点平面 (p − o)·(−w) = focus_dist と交わる点に向けてレイを飛ばす
+            // （画面の端ほど焦点までの距離が 1/cos 倍になる。以前は距離 focus_dist の球面だった）
+            let focus_point = self.o + dir_base * (self.focus_dist / dir_base.dot(-self.w));
+            (focus_point - origin).norm()
+        } else {
+            dir_base
+        };
         // モーションブラー: シャッター間のランダムな時間を割り当て
         let time = self.shutter_open + (self.shutter_close - self.shutter_open) * rng.next_f64();
         Ray { o: origin, d: dir, time }
@@ -135,5 +141,56 @@ mod tests {
 
         let delta = (r0.o - r1.o).len();
         assert!(delta > 0.0);
+    }
+
+    /// レイが焦点平面（視線に垂直、レンズ中心から focus_dist）と交わる点。
+    fn hit_focus_plane(r: Ray, eye: Vec3, forward: Vec3, focus_dist: f64) -> Vec3 {
+        let t = (focus_dist - (r.o - eye).dot(forward)) / r.d.dot(forward);
+        r.at(t)
+    }
+
+    /// 同じ画素のレイは、レンズ上のどこから出ても焦点**平面**上の同じ点に収束する（画面の端でも）。
+    /// その点はピンホールレイと焦点平面の交点。旧実装は距離 focus_dist の球面に収束していたため、
+    /// 画面の端では平面上の交点がレンズ位置によってばらついた。
+    #[test]
+    fn dof_rays_converge_on_the_focus_plane() {
+        let eye = Vec3::new(0.3, 1.2, 4.0);
+        let target = Vec3::new(0.0, 0.5, 0.0);
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let focus = 3.0;
+        let cam = Camera::look_at_dof(eye, target, up, 60.0, 16.0 / 9.0, focus, 0.4);
+        let pinhole = Camera::look_at(eye, target, up, 60.0, 16.0 / 9.0);
+        let forward = (target - eye).norm();
+        let mut rng = Rng::new(9);
+        for &(sx, sy) in &[(0.0, 0.0), (0.9, 0.0), (-0.95, 0.8), (0.7, -0.99)] {
+            let reference = hit_focus_plane(pinhole.ray(sx, sy, &mut rng), eye, forward, focus);
+            for _ in 0..64 {
+                let r = cam.ray(sx, sy, &mut rng);
+                let p = hit_focus_plane(r, eye, forward, focus);
+                assert!((p - reference).len() < 1e-9, "screen ({}, {}): focus point {:?} vs {:?}", sx, sy, (p.x, p.y, p.z), (reference.x, reference.y, reference.z));
+            }
+        }
+    }
+
+    /// レンズ上の原点はレンズ円板（u, v 平面、半径 aperture/2）内に一様に分布し、ピンホール
+    /// （aperture 0）のレイは従来どおり eye から画素方向へ出る。
+    #[test]
+    fn lens_origins_lie_on_the_lens_disk_and_pinhole_is_unchanged() {
+        let eye = Vec3::new(0.0, 0.0, 1.0);
+        let target = Vec3::new(0.0, 0.0, 0.0);
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let cam = Camera::look_at_dof(eye, target, up, 45.0, 1.0, 2.0, 0.5);
+        let mut rng = Rng::new(4);
+        for _ in 0..1000 {
+            let r = cam.ray(0.3, -0.2, &mut rng);
+            let off = r.o - eye;
+            assert!(off.z.abs() < 1e-12 && off.len() <= 0.25 + 1e-12, "lens origin off the disk: {:?}", (off.x, off.y, off.z));
+        }
+        let pin = Camera::look_at(eye, target, up, 45.0, 1.0);
+        let r = pin.ray(0.3, -0.2, &mut rng);
+        assert_eq!((r.o.x, r.o.y, r.o.z), (eye.x, eye.y, eye.z));
+        let half = (22.5f64).to_radians().tan();
+        let expect = Vec3::new(0.3 * half, -0.2 * half, -1.0).norm();
+        assert!((r.d - expect).len() < 1e-12);
     }
 }

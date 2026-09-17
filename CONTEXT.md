@@ -34,6 +34,10 @@ Directly sampling a light (environment map or area light) at each non-delta boun
 **MIS** (Multiple Importance Sampling):
 Combining BSDF sampling and light sampling with the power heuristic (β=2). Needs the BSDF's pdf for a given direction pair — supplied by `eval` and by `BsdfSample.pdf`.
 
+**Path depth** (`max_depth`, `rr_depth`):
+The length of a path counted in vertices from the camera, with Mitsuba's meaning: depth 1 is an emitter or the background seen directly, depth 2 is direct illumination (one scattering vertex), and so on. `RenderConfig.max_depth` limits it (`usize::MAX` = unlimited, Mitsuba `max_depth = -1`); an intersection at loop index `bounce` is depth `bounce + 1`, and NEE / BSDF sampling from it (depth `bounce + 2`) only happen while that is within the limit, so the last depth always has both MIS strategies. `rr_depth` is the depth from which Russian roulette decides whether to extend a path. Scene files set both through `<integrator>`; the built-in scene and CLI use the defaults `MAX_DEPTH = 9` (at most 8 scattering events) and `RR_DEPTH = 4`, and there is no CLI flag for them.
+_Avoid_: bounces (ambiguous about whether the camera ray or the light hit counts).
+
 **Throughput** (`weight`):
 The accumulated attenuation along a path, `f·cos/pdf` folded together. Carried in `BsdfSample.weight` and multiplied into the path's running throughput.
 

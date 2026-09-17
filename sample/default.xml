@@ -4,10 +4,12 @@
      組み込みシーンの手続き的な空グラデーションとは異なる（XML では sky() を表現できないため）。
      使い方: tinypt --scene sample/default.xml -o out.ppm -->
 <scene version="3.0.0">
-  <!-- レンダリング設定もシーンファイルから読み込む（CLI 明示値が優先）。 -->
+  <!-- レンダリング設定もシーンファイルから読み込む（CLI 明示値が優先）。
+       max_depth / rr_depth は Mitsuba と同じパス長の意味で、組み込みシーンの既定値
+       （MAX_DEPTH 9 = 最大 8 回の散乱、RR_DEPTH 4）に揃えている。 -->
   <integrator type="path">
-    <integer name="max_depth" value="8"/>
-    <integer name="rr_depth" value="3"/>
+    <integer name="max_depth" value="9"/>
+    <integer name="rr_depth" value="4"/>
   </integrator>
   <sampler type="independent">
     <integer name="sample_count" value="512"/>

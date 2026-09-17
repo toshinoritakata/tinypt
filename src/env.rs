@@ -89,19 +89,28 @@ impl EnvMap {
     }
 
     /// 方向 `dir` から環境マップの放射輝度をバイリニア補間でサンプリングする。
+    ///
+    /// テクセル (x, y) は (u, v) ∈ [x/W, (x+1)/W) × [y/H, (y+1)/H) を覆い、その中心で値が
+    /// テクセル値に一致する（`pdf` / CDF と同じ `u·W`, `v·H` 基準）。補間はテクセル中心間で行い、
+    /// U（経度）方向は周期的に折り返し、V（緯度）方向は端の行でクランプする。
     pub fn sample(&self, dir: Vec3) -> Color {
         let (u, v, _theta) = dir_to_uv(dir);
 
-        let x = u * (self.width as f64);
-        let y = v * (self.height as f64 - 1.0);
+        let x = u * (self.width as f64) - 0.5;
+        let y = v * (self.height as f64) - 0.5;
 
-        let x0 = (x.floor() as usize) % self.width;
-        let x1 = (x0 + 1) % self.width;
-        let y0 = clamp(y, 0.0, (self.height - 1) as f64).floor() as usize;
-        let y1 = (y0 + 1).min(self.height - 1);
-
-        let fx = x - x.floor();
-        let fy = y - y.floor();
+        let xf = x.floor();
+        let yf = y.floor();
+        let fx = x - xf;
+        let w = self.width as i64;
+        let h = self.height as i64;
+        let x0 = (xf as i64).rem_euclid(w) as usize;
+        let x1 = (xf as i64 + 1).rem_euclid(w) as usize;
+        let y0 = (yf as i64).clamp(0, h - 1) as usize;
+        let y1 = (yf as i64 + 1).clamp(0, h - 1) as usize;
+        // 端の行の外側（最初の行の中心より上・最後の行の中心より下）では y0 == y1 となり、
+        // 補間係数に関係なくその行の値になる
+        let fy = clamp(y - yf, 0.0, 1.0);
 
         let c00 = self.data[y0 * self.width + x0];
         let c10 = self.data[y0 * self.width + x1];
@@ -202,6 +211,77 @@ mod tests {
         let phi = std::f64::consts::TAU * u;
         let sin_theta = theta.sin();
         Vec3::new(phi.cos() * sin_theta, theta.cos(), phi.sin() * sin_theta)
+    }
+
+    /// 各テクセル中心の方向では、`sample` はそのテクセル値をそのまま返す（`pdf` / CDF と同じ
+    /// v·H 基準の写像）。旧実装は v·(H−1) 基準で、行が中心からずれていた。
+    #[test]
+    fn sample_returns_texel_values_at_texel_centers() {
+        let (w, h) = (8usize, 5usize);
+        let data: Vec<Color> = (0..w * h).map(|i| Color::new(i as f64, (i * 7 % 11) as f64, 1.0 + (i % 3) as f64)).collect();
+        let env = EnvMap::from_pixels(w, h, data.clone());
+        for y in 0..h {
+            for x in 0..w {
+                let dir = uv_to_dir((x as f64 + 0.5) / w as f64, (y as f64 + 0.5) / h as f64);
+                let c = env.sample(dir);
+                let e = data[y * w + x];
+                assert!((c.r() - e.r()).abs() < 1e-6 && (c.g() - e.g()).abs() < 1e-6 && (c.b() - e.b()).abs() < 1e-6,
+                    "texel ({}, {}): got ({}, {}, {}) expected ({}, {}, {})", x, y, c.r(), c.g(), c.b(), e.r(), e.g(), e.b());
+            }
+        }
+    }
+
+    /// U 方向は周期的（u=0 の経線をまたいでも連続）、V 方向は極付近で端の行にクランプされる。
+    /// テクセル中心の間は線形補間。
+    #[test]
+    fn sample_wraps_in_u_clamps_in_v_and_interpolates_linearly() {
+        let (w, h) = (4usize, 3usize);
+        let data: Vec<Color> = (0..w * h).map(|i| Color::new(i as f64, 0.0, 0.0)).collect();
+        let env = EnvMap::from_pixels(w, h, data.clone());
+        let r = |u: f64, v: f64| env.sample(uv_to_dir(u, v)).r();
+        let row = 1usize;
+        let v = (row as f64 + 0.5) / h as f64;
+        // u = 0 の経線（テクセル W−1 と 0 の中心の中間）: 両者の平均。0 の直前と直後で連続
+        let mid = 0.5 * (data[row * w + w - 1].r() + data[row * w].r());
+        assert!((r(0.0, v) - mid).abs() < 1e-6, "seam value {} vs {}", r(0.0, v), mid);
+        assert!((r(1e-9, v) - r(1.0 - 1e-9, v)).abs() < 1e-6, "discontinuity across the u seam");
+        // テクセル中心 0 と 1 の 1/4 の位置は 3:1 の線形補間
+        let u = (0.5 + 0.25) / w as f64;
+        let expect = 0.75 * data[row * w].r() + 0.25 * data[row * w + 1].r();
+        assert!((r(u, v) - expect).abs() < 1e-6, "interpolation {} vs {}", r(u, v), expect);
+        // 極の近く（最初の行の中心より上、最後の行の中心より下）は端の行の値
+        let u0 = 0.5 / w as f64;
+        assert!((r(u0, 1e-6) - data[0].r()).abs() < 1e-6, "north pole clamp");
+        assert!((r(u0, 1.0 - 1e-6) - data[(h - 1) * w].r()).abs() < 1e-6, "south pole clamp");
+    }
+
+    /// 方向について一様に平均した `sample` の放射輝度は、CDF と同じテクセル立体角重みで求めた
+    /// 画像の平均に一致する（行のずれがあると明るい行の重みがずれて一致しない）。
+    #[test]
+    fn sample_integral_matches_texel_solid_angle_weights() {
+        let (w, h) = (16usize, 8usize);
+        // 緯度で大きく変わる画像（行ごとに 1, 2, 4, …）
+        let data: Vec<Color> = (0..w * h).map(|i| { let y = i / w; Color::new((1u32 << y) as f64, 1.0, 1.0) }).collect();
+        let env = EnvMap::from_pixels(w, h, data.clone());
+        let mut rng = Rng::new(3);
+        let n = 400_000;
+        let mut sum = 0.0;
+        for _ in 0..n {
+            sum += env.sample(uniform_sphere_dir(&mut rng)).r();
+        }
+        let mc = sum / n as f64 * 4.0 * std::f64::consts::PI;
+        let mut exact = 0.0;
+        for y in 0..h {
+            let t0 = std::f64::consts::PI * y as f64 / h as f64;
+            let t1 = std::f64::consts::PI * (y + 1) as f64 / h as f64;
+            let omega = std::f64::consts::TAU * (t0.cos() - t1.cos());
+            exact += (1u32 << y) as f64 * omega;
+        }
+        // 双線形補間は行の中間で隣の行と混ざるので完全一致はしないが、1〜2% の範囲に入る。
+        // 旧実装（v·(H−1) 基準）は行の対応が系統的にずれ、この画像では約 −12% になる。
+        let rel = mc / exact - 1.0;
+        assert!(rel.abs() < 0.03, "∫sample dω {} vs texel-weighted {} (rel {:+.4})", mc, exact, rel);
+        println!("integral rel error {:+.4}", rel);
     }
 
     #[test]

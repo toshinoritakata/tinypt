@@ -11,14 +11,16 @@ pub const RAY_T_MAX: f64 = 1e30;
 /// 同じシーン・設定でも蓄積バッファの中身が変わる変更（積分器・BSDF・サンプリング・
 /// 乱数列など）を入れたら 1 つ上げる。チェックポイントのシーンハッシュに混ぜ、
 /// 挙動の異なるビルドが書いたチェックポイントから再開しないようにする。
-pub const RENDER_REVISION: u32 = 4;
+pub const RENDER_REVISION: u32 = 5;
 
 /// パストレーシングの定数。
 pub mod path {
-    /// パスあたりの最大バウンス回数。
-    pub const MAX_BOUNCES: usize = 8;
-    /// Russian Roulette を開始するバウンス数。
-    pub const RR_START_BOUNCE: usize = 3;
+    /// 既定の最大パス長（Mitsuba の `max_depth` と同じ意味。1 = 直接見える発光体のみ、
+    /// 2 = 直接照明まで、9 = 最大 8 回の散乱）。
+    pub const MAX_DEPTH: usize = 9;
+    /// 既定の Russian Roulette 開始パス長（Mitsuba の `rr_depth` と同じ意味。長さ `rr_depth` の
+    /// パスを延長するかどうかから判定する＝散乱点のインデックス rr_depth − 1 以降）。
+    pub const RR_DEPTH: usize = 4;
     /// ファイアフライ抑制のための輝度クランプ閾値。
     pub const FIREFLY_CLAMP: f64 = 50.0;
 }

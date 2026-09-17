@@ -41,15 +41,24 @@ fn background(d: Vec3, env: Option<&EnvMap>) -> Color {
 /// パストレーシングのパラメータ（シーン/設定由来でランタイムに与える）。
 #[derive(Clone, Copy)]
 pub struct PathLimits {
-    /// 最大バウンス数
-    pub max_bounces: usize,
-    /// Russian Roulette を開始するバウンス数
-    pub rr_start: usize,
+    /// 最大パス長（Mitsuba の `max_depth`）。長さ k のパスはカメラから数えて k 個目の頂点で
+    /// 光源（発光体・背景）に到達するパス。1 = 直接見える発光体のみ、2 = 直接照明まで。
+    /// `usize::MAX` は無制限
+    pub max_depth: usize,
+    /// Russian Roulette を開始するパス長（Mitsuba の `rr_depth`）。長さ `rr_depth` 以上のパスを
+    /// さらに延長するかどうかを確率的に決める
+    pub rr_depth: usize,
 }
 
 /// パスを追跡し推定放射輝度を返す。
 ///
-/// カメラレイから出発し、最大 `limits.max_bounces` 回の散乱を追跡する。
+/// カメラレイから出発し、長さ `limits.max_depth` までのパスの寄与を推定する。
+///
+/// `bounce` 番目（0 始まり）の交差点はパス長 `bounce + 1` の頂点。発光体・背景への到達は
+/// 長さ `bounce + 1` の寄与、この点からの NEE と BSDF サンプリングは長さ `bounce + 2` の寄与になるので、
+/// 後者は `bounce + 2 <= max_depth` のときだけ行う。こうすると最後の長さでも NEE と BSDF 側の
+/// 発光ヒットが必ず対で揃い、MIS の重みの和が 1 になる（以前は最後の長さの NEE だけが加算され、
+/// 対になる BSDF 側のヒットが打ち切られていた）。
 /// 各バウンスで NEE（直接照明推定）と BSDF サンプリングを行い、
 /// MIS で重みを統合して蓄積する。
 pub fn radiance(
@@ -67,7 +76,7 @@ pub fn radiance(
     let mut last_non_delta = false;   // 前バウンスが非デルタ散乱か（MIS 適用判定）
     let mut last_p = ray.o;           // 前バウンスのシェーディング点（面光源 MIS の light_pdf 計算用）
 
-    for bounce in 0..limits.max_bounces {
+    for bounce in 0..limits.max_depth {
         // レイとシーンの交差判定
         let hit = match world.hit(ray, RAY_EPSILON, RAY_T_MAX) {
             Some(v) => v,
@@ -102,6 +111,11 @@ pub fn radiance(
             break;
         }
 
+        // この点から先（NEE・BSDF サンプリング）はパス長 bounce + 2 の寄与。上限を超えるなら終了
+        if bounce + 2 > limits.max_depth {
+            break;
+        }
+
         let n = oriented_normal(hit.n, ray.d);
 
         // NEE（Next Event Estimation）はデルタ散乱マテリアルでは行わない
@@ -126,7 +140,8 @@ pub fn radiance(
         // この頂点での発光・NEE の寄与を積んだ後、続きのパス（BSDF サンプリング）を
         // 延ばすかどうかだけを判定する。打ち切っても既に得た直接光は失われない。
         // 生存確率はスループットの最大成分を [0.05, 0.95] にクランプしたもの。
-        if bounce >= limits.rr_start {
+        // 延長するのはパス長 bounce + 1 のパスなので、それが rr_depth 以上なら判定する。
+        if bounce + 1 >= limits.rr_depth {
             let p = path_throughput.r().max(path_throughput.g()).max(path_throughput.b()).min(0.95).max(0.05);
             if rng.next_f64() > p {
                 break;
@@ -356,6 +371,69 @@ mod tests {
         let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), Vec3::new(0.0, 1.0, 0.0), n);
         let expected = f.r() * mis_weight(1.0, pdf_bsdf);
         assert!((c.r() - expected).abs() < 1e-12, "{} vs {}", c.r(), expected);
+    }
+
+    /// Lambert の床（半径 1000 の球の上面、アルベド ρ）の真上に球光源（中心高さ 3、半径 1、放射輝度 L）、
+    /// 背景は黒。床の原点で観測される放射輝度は直接照明だけで ρ·L·sin²θmax = ρ·L/9
+    /// （床は凸なので床から床への相互反射はなく、発光体は反射しない）。
+    fn floor_under_sphere_light() -> (World, Vec<Material>, EnvMap) {
+        use crate::geometry::Sphere;
+        let mats = vec![
+            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) },
+            Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) },
+        ];
+        let mut world = World::new();
+        world.add_sphere(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: 0 });
+        world.add_sphere(Sphere { c: Vec3::new(0.0, 3.0, 0.0), r: 1.0, mat_id: 1 });
+        world.build_lights(&mats);
+        (world, mats, EnvMap::constant(Color::new(0.0, 0.0, 0.0)))
+    }
+
+    /// 平均と標準誤差。
+    fn estimate(world: &World, mats: &[Material], env: &EnvMap, ray: Ray, limits: PathLimits, n: usize, seed: u64) -> (f64, f64) {
+        let mut rng = Rng::new(seed);
+        let (mut s, mut s2) = (0.0, 0.0);
+        for _ in 0..n {
+            let x = radiance(world, mats, Some(env), ray, &mut rng, limits).r();
+            s += x;
+            s2 += x * x;
+        }
+        let mean = s / n as f64;
+        (mean, ((s2 / n as f64 - mean * mean).max(0.0) / n as f64).sqrt())
+    }
+
+    /// max_depth は Mitsuba と同じパス長: 0 は何も寄与せず、1 は直接見える発光体だけ、
+    /// 2 以上では直接照明が理論値に一致する（最後の長さでも NEE と BSDF 側の発光ヒットが対で揃う）。
+    /// 旧実装は「最大バウンス数」で、最後の長さの NEE だけが加算され MIS の相方が欠けて暗くなっていた。
+    #[test]
+    fn max_depth_follows_mitsuba_path_length() {
+        let (world, mats, env) = floor_under_sphere_light();
+        let to_light = Ray { o: Vec3::new(0.0, 6.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
+        let to_floor = Ray { o: Vec3::new(2.0, 1.0, 0.0), d: Vec3::new(-2.0, -1.0, 0.0).norm(), time: 0.0 };
+        let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
+
+        let mut rng = Rng::new(1);
+        assert_eq!(radiance(&world, &mats, Some(&env), to_light, &mut rng, limits(0)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, Some(&env), to_light, &mut rng, limits(1)).r(), 4.0);
+        assert_eq!(radiance(&world, &mats, Some(&env), to_floor, &mut rng, limits(1)).r(), 0.0);
+
+        let exact = 0.5 * 4.0 / 9.0;
+        for max_depth in [2usize, 3, 8, usize::MAX] {
+            let (mean, se) = estimate(&world, &mats, &env, to_floor, limits(max_depth), 200_000, 7);
+            assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "max_depth={}: {} ± {} vs exact {}", max_depth, mean, se, exact);
+        }
+    }
+
+    /// Russian Roulette をどの長さから始めても（rr_depth = 1 でも）推定は不偏。
+    #[test]
+    fn russian_roulette_start_does_not_bias_direct_light() {
+        let (world, mats, env) = floor_under_sphere_light();
+        let to_floor = Ray { o: Vec3::new(2.0, 1.0, 0.0), d: Vec3::new(-2.0, -1.0, 0.0).norm(), time: 0.0 };
+        let exact = 0.5 * 4.0 / 9.0;
+        for rr_depth in [1usize, 2, 5] {
+            let (mean, se) = estimate(&world, &mats, &env, to_floor, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 11);
+            assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "rr_depth={}: {} ± {} vs exact {}", rr_depth, mean, se, exact);
+        }
     }
 
     /// 負値チャネルを含む色は黒扱いしない（寄与を変えないため輝度判定を使わない）。
