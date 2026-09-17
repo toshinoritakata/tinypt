@@ -626,7 +626,7 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 9;
+    const GOLDEN_REVISION: u32 = 10;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。

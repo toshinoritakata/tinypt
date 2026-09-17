@@ -218,31 +218,40 @@ impl Sphere {
         if !(disc > 0.0) {
             return None;
         }
-        // 誤差の見積もりは交差しうるときだけ行う
+        let sq = disc.sqrt();
+        let q = -(b + b.signum() * sq);
+        if q == 0.0 {
+            return None;
+        }
+        // t0 = q/a, t1 = c/q（桁落ちしない形）
+        let t0 = q / a;
+        let t1 = c / q;
+        let (tn, tf) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+        let near_in = tn > 0.0 && tn >= tmin && tn <= tmax;
+        let far_in = tf > 0.0 && tf >= tmin && tf <= tmax;
+        if !near_in && !far_in {
+            return None;
+        }
+        // 誤差の見積もりは、範囲内に正の根がある（採用しうる）ときだけ行う
         let dl1 = r.d.l1();
         let ocl1 = oc.l1();
         let a_err = gamma(3) * dl1 * dl1;
         let b_err = gamma(3) * ocl1 * dl1 + dl1 * oc_err;
         let c_err = gamma(3) * (ocl1 * ocl1 + rr) + 2.0 * ocl1 * oc_err;
         let disc_err = gamma(3) * (b * b + (a * c).abs()) + 2.0 * b.abs() * b_err + a * c_err + c.abs() * a_err;
-        let sq = disc.sqrt();
         let sq_err = disc_err / (2.0 * sq);
-        let q = -(b + b.signum() * sq);
-        if q == 0.0 {
-            return None;
-        }
         let q_err = b_err + sq_err + gamma(1) * (b.abs() + sq);
-        // t0 = q/a, t1 = c/q
-        let t0 = q / a;
-        let t0_err = gamma(1) * t0.abs() + (q_err + t0.abs() * a_err) / a;
-        let t1 = c / q;
-        let t1_err = gamma(1) * t1.abs() + (c_err + t1.abs() * q_err) / q.abs();
-        let (near, far) = if t0 <= t1 { ((t0, t0_err), (t1, t1_err)) } else { ((t1, t1_err), (t0, t0_err)) };
-        let accept = |(t, e): (f64, f64)| t > e && t >= tmin && t <= tmax;
-        let t = if accept(near) {
-            near.0
-        } else if accept(far) {
-            far.0
+        let err_of = |t: f64| {
+            if t == t0 {
+                gamma(1) * t0.abs() + (q_err + t0.abs() * a_err) / a
+            } else {
+                gamma(1) * t1.abs() + (c_err + t1.abs() * q_err) / q.abs()
+            }
+        };
+        let t = if near_in && tn > err_of(tn) {
+            tn
+        } else if far_in && tf > err_of(tf) {
+            tf
         } else {
             return None;
         };
@@ -294,64 +303,92 @@ impl Triangle {
         self.bounds().centroid()
     }
 
-    /// Möller–Trumbore 法によるレイ-三角形交差判定（誤差上界付き）。
+    /// 水密なレイ-三角形交差判定（PBRT v4 `Triangle::Intersect`、誤差上界付き）。
     ///
-    /// レイの time で頂点を線形補間してからテストする（モーションブラー対応）。両面判定。
-    /// t の計算誤差の上界（頂点・原点の丸めと、行列式・分子の積の丸め）を見積もり、`t > 誤差上界` の
-    /// ヒットだけを採用する（原点が面の誤差の箱の外にずらしてあれば、元の面は必ず棄却される）。
-    /// 以前の行列式の絶対しきい値（|det| < 1e-10、面積の 2 乗に比例するためスケール依存）は使わない。
-    /// 交差点は重心座標から求め、成分ごとの誤差上界 `p_error` を付ける。
+    /// レイの time で頂点を補間してからテストする（モーションブラー対応）。両面判定。
+    /// 頂点をレイの原点基準に平行移動し、レイ方向の絶対値が最大の軸が z になるよう座標を並べ替え、
+    /// レイが +z を向くようにせん断してから、2 次元の辺関数で内外を判定する。辺関数がちょうど 0 の点
+    /// （辺・頂点の上）は内側として扱うので、共有辺・共有頂点を通るレイが隣り合う三角形の両方を
+    /// すり抜けることがない（Möller–Trumbore は共有辺ちょうどを狙うレイの約 2% を取りこぼしていた）。
+    /// f64 で計算するので、PBRT の float 版にある辺関数の倍精度での再計算は不要。
+    ///
+    /// t の計算誤差の上界（PBRT の δt）を求め、`t > δt` のヒットだけを採用する。交差点と誤差上界は
+    /// [`hit_at`](Self::hit_at) で重心座標から求める。
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
         let (t, u, v) = self.intersect(r, tmin, tmax)?;
         Some(self.hit_at(r, t, u, v))
     }
 
-    /// 交差の判定だけを行い、`(t, u, v)`（u, v は v1, v2 の重心座標）を返す。交差点と誤差上界の計算は
+    /// 交差の判定だけを行い、`(t, b1, b2)`（v1, v2 の重心座標）を返す。交差点と誤差上界の計算は
     /// [`hit_at`](Self::hit_at) に分けてあり、BVH の走査では最近接の 1 つだけを確定させる（高速化）。
+    #[inline]
     pub fn intersect(&self, r: Ray, tmin: f64, tmax: f64) -> Option<(f64, f64, f64)> {
-        // レイの time で頂点を補間
-        let time = r.time;
-        let (v0, v1, v2) = self.vertices_at(time);
-        let e1 = v1 - v0;
-        let e2 = v2 - v0;
-
-        let pvec = r.d.cross(e2);
-        let det = e1.dot(pvec);
+        let (v0, v1, v2) = self.vertices_at(r.time);
+        // 原点基準へ平行移動
+        let mut p0 = v0 - r.o;
+        let mut p1 = v1 - r.o;
+        let mut p2 = v2 - r.o;
+        // レイ方向の絶対値が最大の成分を z にする並べ替え
+        let ad = r.d.abs();
+        let kz = if ad.x > ad.y { if ad.x > ad.z { 0 } else { 2 } } else if ad.y > ad.z { 1 } else { 2 };
+        let kx = (kz + 1) % 3;
+        let ky = (kx + 1) % 3;
+        let perm = |v: Vec3| {
+            let a = [v.x, v.y, v.z];
+            Vec3::new(a[kx], a[ky], a[kz])
+        };
+        let d = perm(r.d);
+        p0 = perm(p0);
+        p1 = perm(p1);
+        p2 = perm(p2);
+        // レイが +z を向くようせん断（z の拡大は交差が見つかってから）
+        let sx = -d.x / d.z;
+        let sy = -d.y / d.z;
+        let sz = 1.0 / d.z;
+        p0.x += sx * p0.z;
+        p0.y += sy * p0.z;
+        p1.x += sx * p1.z;
+        p1.y += sy * p1.z;
+        p2.x += sx * p2.z;
+        p2.y += sy * p2.z;
+        // 辺関数
+        let e0 = p1.x * p2.y - p1.y * p2.x;
+        let e1 = p2.x * p0.y - p2.y * p0.x;
+        let e2 = p0.x * p1.y - p0.y * p1.x;
+        if (e0 < 0.0 || e1 < 0.0 || e2 < 0.0) && (e0 > 0.0 || e1 > 0.0 || e2 > 0.0) {
+            return None;
+        }
+        let det = e0 + e1 + e2;
         if det == 0.0 || !det.is_finite() {
             return None;
         }
-
+        // スケールした t で範囲判定（割り算の前に）
+        p0.z *= sz;
+        p1.z *= sz;
+        p2.z *= sz;
+        let t_scaled = e0 * p0.z + e1 * p1.z + e2 * p2.z;
+        if det < 0.0 && (t_scaled >= 0.0 || t_scaled < tmax * det || t_scaled > tmin * det) {
+            return None;
+        }
+        if det > 0.0 && (t_scaled <= 0.0 || t_scaled > tmax * det || t_scaled < tmin * det) {
+            return None;
+        }
         let inv_det = 1.0 / det;
-        let tvec = r.o - v0;
-        let u = tvec.dot(pvec) * inv_det;
-        if u < 0.0 || u > 1.0 {
+        let t = t_scaled * inv_det;
+        // t が真に正であることの保守的な確認（PBRT の δt）
+        let max_zt = p0.z.abs().max(p1.z.abs()).max(p2.z.abs());
+        let delta_z = gamma(3) * max_zt;
+        let max_xt = p0.x.abs().max(p1.x.abs()).max(p2.x.abs());
+        let max_yt = p0.y.abs().max(p1.y.abs()).max(p2.y.abs());
+        let delta_x = gamma(5) * (max_xt + max_zt);
+        let delta_y = gamma(5) * (max_yt + max_zt);
+        let delta_e = 2.0 * (gamma(2) * max_xt * max_yt + delta_y * max_xt + delta_x * max_yt);
+        let max_e = e0.abs().max(e1.abs()).max(e2.abs());
+        let delta_t = 3.0 * (gamma(3) * max_e * max_zt + delta_e * max_zt + delta_z * max_e) * inv_det.abs();
+        if t <= delta_t {
             return None;
         }
-
-        let qvec = tvec.cross(e1);
-        let v = r.d.dot(qvec) * inv_det;
-        if v < 0.0 || u + v > 1.0 {
-            return None;
-        }
-
-        let thit = e2.dot(qvec) * inv_det;
-        if thit < tmin || thit > tmax {
-            return None;
-        }
-
-        // t の誤差上界（保守的）: 頂点の補間・辺の引き算の丸め（err_v）、原点の引き算の丸め（err_o）、
-        // 3 重積（分子 e2·(tvec×e1)、行列式 e1·(d×e2)）の丸めと入力誤差の伝播
-        let vmax = v0.max_abs().max(v1.max_abs()).max(v2.max_abs());
-        let err_v = gamma(4) * vmax;
-        let err_o = gamma(2) * (r.o.max_abs() + v0.max_abs());
-        let (e1l, e2l, tl, dl) = (e1.l1(), e2.l1(), tvec.l1(), r.d.l1());
-        let num_err = gamma(7) * e1l * e2l * tl + 3.0 * (err_o * e1l * e2l + tl * err_v * (e1l + e2l));
-        let det_err = gamma(7) * e1l * e2l * dl + 3.0 * dl * err_v * (e1l + e2l);
-        let t_err = (num_err + thit.abs() * det_err) * inv_det.abs() * 2.0;
-        if thit <= t_err {
-            return None;
-        }
-        Some((thit, u, v))
+        Some((t, e1 * inv_det, e2 * inv_det))
     }
 
     /// [`intersect`](Self::intersect) の結果から交差情報（重心座標で求めた交差点・誤差上界・法線）を作る。

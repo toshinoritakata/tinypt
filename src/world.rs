@@ -55,6 +55,32 @@ pub struct Instance {
     pub xform: Transform,
     /// マテリアルオーバーライド（None なら三角形のマテリアルを使用）
     pub mat_override: Option<usize>,
+    /// ワールド空間の保守的な境界ボックス（メッシュの AABB の 8 頂点を変換し、変換の誤差上界ぶん広げたもの）。
+    /// `World::hit` で、レイを物体空間へ変換する前の安価な棄却に使う。
+    pub world_bounds: Aabb,
+}
+
+/// メッシュを `xform` で配置したインスタンスの、ワールド空間の保守的な境界ボックス。
+fn instance_world_bounds(mesh: &Mesh, xform: &Transform) -> Aabb {
+    let mut b = Aabb::empty();
+    let Some(root) = mesh.bvh.nodes.first() else { return b };
+    let (lo, hi) = (root.bbox.min, root.bbox.max);
+    let zero = Vec3::new(0.0, 0.0, 0.0);
+    for k in 0..8 {
+        let corner = Vec3::new(
+            if k & 1 == 0 { lo.x } else { hi.x },
+            if k & 2 == 0 { lo.y } else { hi.y },
+            if k & 4 == 0 { lo.z } else { hi.z },
+        );
+        let (w, err) = xform.apply_point_with_error(corner, zero);
+        b = b.grow(w - err).grow(w + err);
+    }
+    // 箱の角の座標自体の丸めのぶん、座標に比例してさらに広げる
+    let pad = |lo: f64, hi: f64| gamma(3) * lo.abs().max(hi.abs());
+    let (px, py, pz) = (pad(b.min.x, b.max.x), pad(b.min.y, b.max.y), pad(b.min.z, b.max.z));
+    b.min = Vec3::new(b.min.x - px, b.min.y - py, b.min.z - pz);
+    b.max = Vec3::new(b.max.x + px, b.max.y + py, b.max.z + pz);
+    b
 }
 
 /// インスタンスの交差判定で、ワールド空間の tmin 判定に却下された面の先を探し直す最大回数。
@@ -138,7 +164,8 @@ impl World {
         let mesh_id = self.meshes.len();
         self.meshes.push(Mesh::new(tris));
         let inst_id = self.instances.len();
-        self.instances.push(Instance { mesh_id, xform, mat_override });
+        let world_bounds = instance_world_bounds(&self.meshes[mesh_id], &xform);
+        self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds });
         inst_id
     }
 
@@ -171,11 +198,17 @@ impl World {
         let mut best: Option<Hit> = None;
 
         // Instances: ray -> object space
+        let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
         for (inst_id, inst) in self.instances.iter().enumerate() {
             let mesh = match self.meshes.get(inst.mesh_id) {
                 Some(m) => m,
                 None => continue,
             };
+            // ワールド空間の境界ボックスで先に棄却する（物体空間への変換と誤差計算を省く）。箱は保守的で、
+            // スラブ判定も遠い側を広げてあるので、ここで棄却されるインスタンスに当たるレイは無い
+            if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), closest * (1.0 + 1e-9)) {
+                continue;
+            }
 
             let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
             let d_obj_raw = inst.xform.apply_vec_inv(r.d);
@@ -1050,6 +1083,73 @@ mod tests {
         let expect_max = Vec3::new(10.0 + s, -2.0 + s, 4.0);
         // BVH の AABB はわずかに（~1e-9）広げてある
         assert!((b.min - expect_min).len() < 1e-8 && (b.max - expect_max).len() < 1e-8, "{:?} {:?}", (b.min.x, b.min.y, b.min.z), (b.max.x, b.max.y, b.max.z));
+    }
+
+    /// 中心頂点 `c` の周りに 6 枚の三角形を並べた扇（共有辺 6 本と共有頂点 1 つ）。法線 `n` の平面上、半径 `rad`。
+    fn triangle_fan(c: Vec3, n: Vec3, rad: f64) -> (Vec<Triangle>, Vec<Vec3>) {
+        let a = if n.x.abs() > 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+        let t = n.cross(a).norm();
+        let b = n.cross(t);
+        let rim: Vec<Vec3> = (0..6)
+            .map(|i| {
+                let ang = std::f64::consts::TAU * i as f64 / 6.0 + 0.3;
+                c + (t * ang.cos() + b * ang.sin()) * rad
+            })
+            .collect();
+        let tris = (0..6).map(|i| Triangle::new_static(c, rim[i], rim[(i + 1) % 6], 0)).collect();
+        (tris, rim)
+    }
+
+    /// 水密性の回帰テスト: 三角形の扇の**共有頂点ちょうど**と**共有辺上の点**を狙うレイは、隣り合う三角形の
+    /// どちらかに必ず当たる（すり抜け 0 件）。大きさ ×1e-3 / 等倍 / ×1e3 と、原点から 1e8 離した配置、
+    /// ランダムな向きの平面、平面の両側からのレイで確認する。三角形単体（ワールド座標）と、回転・非一様
+    /// スケールしたインスタンス経由（`World::hit`）の両方を調べる。
+    /// Möller–Trumbore では共有辺ちょうどを狙うレイの約 2% がすり抜けていた。
+    #[test]
+    fn shared_edges_and_vertices_are_watertight() {
+        let mut rng = Rng::new(41);
+        let mut total = 0usize;
+        for &(k, dist) in &[(1.0, 0.0), (1e-3, 0.0), (1e3, 0.0), (1.0, 1e8), (1e-3, 1e8)] {
+            for _ in 0..20 {
+                let c = Vec3::new(dist, -0.7 * dist, 0.4 * dist) + uniform_sphere_dir(&mut rng) * (0.3 * k);
+                let n = uniform_sphere_dir(&mut rng);
+                let (tris, rim) = triangle_fan(c, n, k);
+                // 同じ扇をインスタンスとしても置く（物体空間では原点中心・等倍、ワールドへ回転・非一様スケール・平行移動）
+                let (obj_tris, obj_rim) = triangle_fan(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), 1.0);
+                let xf = Transform::translate(c)
+                    .compose(Transform::rotate(uniform_sphere_dir(&mut rng), 360.0 * rng.next_f64()))
+                    .compose(Transform::scale(Vec3::new(k, 0.8 * k, 1.3 * k)));
+                let mut world = World::new();
+                world.add_mesh_instance(obj_tris, xf, None);
+                for i in 0..120 {
+                    // 狙う点: 共有頂点（中心）、または共有辺（中心 → 外周の頂点）上の点。外周の頂点・辺はメッシュの
+                    // 境界なので、丸めで外側に出た点を狙うレイが外れるのは正当（水密性の対象外）
+                    let edge = i % 6;
+                    let s = if i % 4 == 0 { 0.0 } else { rng.next_f64() };
+                    let target = c + (rim[edge] - c) * s;
+                    let obj_target = obj_rim[edge] * s;
+                    let world_target = xf.apply_point(obj_target);
+                    for (tgt, is_instance) in [(target, false), (world_target, true)] {
+                        let o = tgt + uniform_sphere_dir(&mut rng) * (3.0 * k);
+                        let d = (tgt - o).norm();
+                        let r = Ray { o, d, time: 0.0 };
+                        let hit = if is_instance {
+                            world.hit(r, 0.0, 1e30).is_some()
+                        } else {
+                            tris.iter().any(|t| t.hit(r, 0.0, 1e30).is_some())
+                        };
+                        // 平面にほぼ平行なレイは除く（平面に届く前に扇の外を通りうる）
+                        let plane_n = if is_instance { xf.apply_normal(Vec3::new(0.0, 0.0, 1.0)) } else { n };
+                        if d.dot(plane_n).abs() < 0.05 {
+                            continue;
+                        }
+                        total += 1;
+                        assert!(hit, "k={} dist={} instance={} s={}: ray aimed at a shared {} slipped through", k, dist, is_instance, s, if s == 0.0 { "vertex" } else { "edge" });
+                    }
+                }
+            }
+        }
+        assert!(total > 20_000, "too few rays checked ({})", total);
     }
 
     /// build_lights の重み = 面積 × 輝度（Light::area と共有された面積計算）。
