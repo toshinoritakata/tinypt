@@ -626,14 +626,14 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 7;
+    const GOLDEN_REVISION: u32 = 8;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
     const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0xdd80_3964_fecc_5c3c);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
-    const GOLDEN_SPHERES: (u64, u64) = (0xc55c_f4c9_e03c_de16, 0xf4e9_ab88_c297_cdc3);
+    const GOLDEN_SPHERES: (u64, u64) = (0x6eb1_13c1_70b4_3086, 0xf4e9_ab88_c297_cdc3);
 
     /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
     /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。
@@ -707,6 +707,72 @@ mod tests {
         config.morton_enabled = true;
         config.adaptive_enabled = false;
         config.checkpoint_enabled = false;
+    }
+
+    /// sample/cornell.xml 全体（形状の変換とカメラ）を `k` 倍に拡大縮小したシーンを読み込む。
+    /// 放射輝度はそのままなので、理想的には k によらず同じ画像になる。
+    fn scaled_cornell(k: f64, width: usize, height: usize) -> (Scene, RenderConfig) {
+        let xml = std::fs::read_to_string("sample/cornell.xml").expect("read sample/cornell.xml");
+        let n_shapes = xml.matches("<shape").count();
+        // 各形状の to_world の最も外側に一様スケールを挿入する（センサーの transform では無視される）
+        let scaled = xml.replace(r#"<transform name="to_world">"#, &format!(r#"<transform name="to_world"><scale value="{}"/>"#, k));
+        assert_eq!(scaled.matches("<scale value=").count() - xml.matches("<scale value=").count(), n_shapes + 1);
+        let lookat = r#"origin="0, 1, 3.9" target="0, 1, 0""#;
+        assert_eq!(scaled.matches(lookat).count(), 1, "cornell.xml camera changed; update this test");
+        let scaled = scaled.replace(lookat, &format!(r#"origin="0, {}, {}" target="0, {}, 0""#, k, 3.9 * k, k));
+        let mut config = RenderConfig::default();
+        let (scene, settings) = crate::mitsuba::load_scene_from_str(&scaled, std::path::Path::new("sample"), &config).unwrap();
+        settings.apply(&mut config);
+        config.width = width;
+        config.height = height;
+        config.adaptive_enabled = false;
+        config.checkpoint_enabled = false;
+        (scene, config)
+    }
+
+    /// スケール不変性: Cornell box を 1e-3 倍・1e3 倍にしても、画像（全体と 4×4 ブロックの平均輝度）は
+    /// 等倍と統計的に一致する。自己交差回避オフセットがシーンの大きさに比例する（`World::ray_epsilon`）ことの
+    /// 回帰テスト。以前の絶対オフセット 1e-4 では、1e-3 倍（箱の辺が 0.0006）で接地部の光漏れや角の暗さが出た。
+    #[test]
+    fn cornell_is_scale_invariant() {
+        let (w, h, spp, seeds) = (24usize, 24usize, 32usize, 8u64);
+        let block_means = |k: f64| -> Vec<[f64; 17]> {
+            let (scene, mut config) = scaled_cornell(k, w, h);
+            config.spp = spp;
+            (1..=seeds)
+                .map(|seed| {
+                    config.seed = seed;
+                    let out = render_with_threads(&scene, &config, "", 4).unwrap();
+                    let px = crate::output::resolve_pixels(w, h, &out.acc, &out.acc_w);
+                    let mut m = [0.0; 17];
+                    for y in 0..h {
+                        for x in 0..w {
+                            let l = px[y * w + x].luminance();
+                            m[16] += l / (w * h) as f64;
+                            m[(y * 4 / h) * 4 + x * 4 / w] += l / ((w / 4) * (h / 4)) as f64;
+                        }
+                    }
+                    m
+                })
+                .collect()
+        };
+        let stats = |v: &[[f64; 17]], i: usize| {
+            let n = v.len() as f64;
+            let mean = v.iter().map(|m| m[i]).sum::<f64>() / n;
+            let var = v.iter().map(|m| (m[i] - mean).powi(2)).sum::<f64>() / (n - 1.0);
+            (mean, var / n)
+        };
+        let base = block_means(1.0);
+        for k in [1e-3, 1e3] {
+            let other = block_means(k);
+            for i in 0..17 {
+                let (m1, v1) = stats(&base, i);
+                let (mk, vk) = stats(&other, i);
+                let tol = 5.0 * (v1 + vk).sqrt() + 1e-4 * m1;
+                assert!((mk - m1).abs() < tol, "scale {}: {} mean {} vs scale 1 {} (|Δ| {:.3e} ≥ tol {:.3e})",
+                    k, if i == 16 { "image".to_string() } else { format!("block {}", i) }, mk, m1, (mk - m1).abs(), tol);
+            }
+        }
     }
 
     /// Cornell box（面光源・長方形/立方体インスタンス・黒背景）の出力を固定する。

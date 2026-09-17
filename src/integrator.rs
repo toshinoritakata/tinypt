@@ -15,7 +15,7 @@
 //! パストレーシングではこの積分をモンテカルロ推定で近似する。
 
 use crate::constants::path::FIREFLY_CLAMP;
-use crate::constants::{RAY_EPSILON, RAY_T_MAX};
+use crate::constants::RAY_T_MAX;
 use crate::env::EnvMap;
 use crate::material::{BsdfSample, Material};
 use crate::math::{Color, Vec3};
@@ -76,11 +76,15 @@ pub fn radiance(
     let mut last_bsdf_pdf = 0.0;     // 前バウンスの BSDF PDF（MIS 用）
     let mut last_non_delta = false;   // 前バウンスが非デルタ散乱か（MIS 適用判定）
     let mut last_p = ray.o;           // 前バウンスのシェーディング点（面光源 MIS の light_pdf 計算用）
-    let mut eta_scale = 1.0;          // パス上の透過で掛かった相対屈折率 η_t/η_i の積（RR 用）
+    let mut eta_scale = 1.0;
+    // 自己交差回避オフセット（シーンの大きさに比例、`World::ray_epsilon`）。カメラレイ・散乱レイの
+    // 交差判定の tmin と、シャドウレイの原点のずらし量・tmin に使う（散乱レイの原点は BSDF が
+    // `Hit::ray_eps` でずらす）
+    let ray_eps = world.ray_epsilon();          // パス上の透過で掛かった相対屈折率 η_t/η_i の積（RR 用）
 
     for bounce in 0..limits.max_depth {
         // レイとシーンの交差判定
-        let hit = match world.hit(ray, RAY_EPSILON, RAY_T_MAX) {
+        let hit = match world.hit(ray, ray_eps, RAY_T_MAX) {
             Some(v) => v,
             None => {
                 // ミス: 背景（環境マップまたは空）からの寄与を加算
@@ -124,15 +128,15 @@ pub fn radiance(
         if !mat.is_delta() {
             // NEE: Environment map
             if let Some(env_map) = env {
-                let occluded = |shadow: Ray| world.hit(shadow, RAY_EPSILON, RAY_T_MAX).is_some();
-                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, hit.p, n, ray, rng);
+                let occluded = |shadow: Ray| world.hit(shadow, ray_eps, RAY_T_MAX).is_some();
+                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, hit.p, n, ray, ray_eps, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
             if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
                 let contrib = nee_area_light(
-                    |shadow: Ray, tmax: f64| world.hit(shadow, RAY_EPSILON, tmax).is_some(),
-                    &mat, path_throughput, hit.p, n, ray, &ls,
+                    |shadow: Ray, tmax: f64| world.hit(shadow, ray_eps, tmax).is_some(),
+                    &mat, path_throughput, hit.p, n, ray, ray_eps, &ls,
                 );
                 accumulated_radiance = accumulated_radiance + contrib;
             }
@@ -217,6 +221,7 @@ fn nee_environment(
     hit_p: Vec3,
     n: Vec3,
     ray: Ray,
+    ray_eps: f64,
     rng: &mut Rng,
 ) -> Color {
     let (wi, li, pdf_env) = env_map.sample_dir(rng);
@@ -225,7 +230,7 @@ fn nee_environment(
         return Color::new(0.0, 0.0, 0.0);
     }
 
-    let shadow = Ray { o: hit_p + RAY_EPSILON * wi, d: wi, time: ray.time };
+    let shadow = Ray { o: hit_p + ray_eps * wi, d: wi, time: ray.time };
     if occluded(shadow) {
         return Color::new(0.0, 0.0, 0.0);
     }
@@ -255,12 +260,14 @@ fn nee_area_light(
     hit_p: Vec3,
     n: Vec3,
     ray: Ray,
+    ray_eps: f64,
     ls: &LightSample,
 ) -> Color {
     let to_light = ls.position - hit_p;
     let dist2 = to_light.dot(to_light);
     let dist = dist2.sqrt();
-    if dist <= 1e-6 {
+    // 方向が定義できない距離 0 だけを除く（以前の絶対しきい値 1e-6 はシーンのスケールに依存していた）
+    if !(dist > 0.0) {
         return Color::new(0.0, 0.0, 0.0);
     }
 
@@ -270,11 +277,14 @@ fn nee_area_light(
         return Color::new(0.0, 0.0, 0.0);
     }
 
-    let shadow = Ray { o: hit_p + RAY_EPSILON * wi, d: wi, time: ray.time };
-    // 原点を ε 前進させているため、ライト面は新原点から dist−ε に位置する。
-    // tmax を dist−2ε にしないと丸め次第でライト自身に遮蔽判定される
-    let tmax = (dist - 2.0 * RAY_EPSILON).max(RAY_EPSILON);
-    if occluded(shadow, tmax) {
+    // シャドウレイ: 原点を ray_eps だけ光源側へ進め、光源上の点の手前で止める。光源は新しい原点から
+    // dist − ray_eps にあり、光源側にもシェーディング点側と対称に ray_eps の余裕を取って
+    // tmax = dist·(1 − 1e-9) − 2·ray_eps とする（光源自身を遮蔽物と判定しない。相対マージン 1e-9 は
+    // 座標が大きく光源が近いときの丸め対策）。区間が空（光源が ~3·ray_eps より近い）なら、間に遮蔽物は
+    // 置けないので遮蔽なしとする。
+    let shadow = Ray { o: hit_p + ray_eps * wi, d: wi, time: ray.time };
+    let tmax = dist * (1.0 - 1e-9) - 2.0 * ray_eps;
+    if tmax > ray_eps && occluded(shadow, tmax) {
         return Color::new(0.0, 0.0, 0.0);
     }
 
@@ -325,7 +335,7 @@ mod tests {
         for _ in 0..1000 {
             let c = nee_environment(
                 |_| { calls.set(calls.get() + 1); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, 1e-4, &mut rng,
             );
             let _ = env.sample_dir(&mut reference);
             assert!(is_black(c));
@@ -345,7 +355,7 @@ mod tests {
         for _ in 0..1000 {
             let c = nee_environment(
                 |_| { calls.set(calls.get() + 1); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, 1e-4, &mut rng,
             );
             total += c.luminance();
         }
@@ -361,7 +371,7 @@ mod tests {
         let mut rng = Rng::new(7);
         let mut max_l: f64 = 0.0;
         for _ in 0..200 {
-            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &mut rng);
+            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, 1e-4, &mut rng);
             max_l = max_l.max(c.luminance());
         }
         assert!(max_l > 0.0);
@@ -378,7 +388,7 @@ mod tests {
             emit: Color::new(2e5, 1e5, 5e4),
             pdf: 1.0,
         };
-        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, 1e-4, &ls);
         assert!((c.luminance() - FIREFLY_CLAMP).abs() < 1e-9, "luminance = {}", c.luminance());
         assert!((c.r() / c.g() - 2.0).abs() < 1e-9);
     }
@@ -393,7 +403,7 @@ mod tests {
             emit: Color::new(1.0, 1.0, 1.0),
             pdf: 1.0,
         };
-        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), p, n, ray, 1e-4, &ls);
         let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), Vec3::new(0.0, 1.0, 0.0), n);
         let expected = f.r() * mis_weight(1.0, pdf_bsdf);
         assert!((c.r() - expected).abs() < 1e-12, "{} vs {}", c.r(), expected);
@@ -483,7 +493,7 @@ mod tests {
     fn dielectric_sample_reports_relative_ior() {
         let ior = 1.5;
         let mat = Material::Dielectric { ior, absorption: Color::new(0.0, 0.0, 0.0) };
-        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None };
+        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, ray_eps: 1e-4 };
         let enter = Ray { o: Vec3::new(0.3, 1.0, 0.0), d: Vec3::new(-0.3, -1.0, 0.0).norm(), time: 0.0 };
         let exit = Ray { o: Vec3::new(0.1, -1.0, 0.0), d: Vec3::new(-0.1, 1.0, 0.0).norm(), time: 0.0 };
         let mut rng = Rng::new(2);
@@ -542,6 +552,40 @@ mod tests {
             let ray = Ray { o, d: (Vec3::new(0.0, target_y, 0.0) - o).norm(), time: 0.0 };
             let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 17);
             assert!((mean - 0.8).abs() < 5.0 * se + 1e-3, "rr_depth={} y={}: {} ± {} vs 0.8", rr_depth, target_y, mean, se);
+        }
+    }
+
+    /// 光源のすぐ近くの NEE: 三角形の床（4×4、アルベド 0.5）の真上、隙間 1e-5 に球光源（半径 1、L = 4）。
+    /// 床の原点での放射輝度は ρ·L·sin²θmax = ρ·L/(1 + h)² で、シーン全体を 1e-3 倍しても同じ。
+    /// 以前の絶対オフセット 1e-4（> 隙間）では、シャドウレイと散乱レイの原点が光源の内部に入り、
+    /// 結果が理論値からずれた。
+    #[test]
+    fn nee_right_next_to_a_light_matches_analytic_and_is_scale_invariant() {
+        use crate::geometry::{Sphere, Triangle};
+        use crate::transform::Transform;
+        let (albedo, emit, gap) = (0.5, 4.0, 1e-5);
+        let exact = albedo * emit / (1.0 + gap) / (1.0 + gap);
+        for k in [1.0, 1e-3] {
+            let mats = vec![
+                Material::Lambert { albedo: Color::new(albedo, albedo, albedo) },
+                Material::DiffuseLight { emit: Color::new(emit, emit, emit) },
+            ];
+            let mut world = World::new();
+            let v = |x: f64, z: f64| Vec3::new(x * k, 0.0, z * k);
+            let floor = vec![
+                Triangle::new_static(v(-2.0, -2.0), v(2.0, -2.0), v(2.0, 2.0), 0),
+                Triangle::new_static(v(-2.0, -2.0), v(2.0, 2.0), v(-2.0, 2.0), 0),
+            ];
+            world.add_mesh_instance(floor, Transform::identity(), None);
+            world.add_sphere(Sphere { c: Vec3::new(0.0, (1.0 + gap) * k, 0.0), r: k, mat_id: 1 });
+            world.build_lights(&mats);
+            assert!(world.ray_epsilon() < 0.1 * gap * k, "test setup: offset {} must be below the gap", world.ray_epsilon());
+            let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+            // 光源の下をくぐる浅い角度で床の原点を見る
+            let o = Vec3::new(2.0 * k, 0.001 * 2.0 * k, 0.0);
+            let ray = Ray { o, d: (Vec3::new(0.0, 0.0, 0.0) - o).norm(), time: 0.0 };
+            let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: usize::MAX, rr_depth: 1000 }, 100_000, 23);
+            assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "scale {}: {} ± {} vs exact {}", k, mean, se, exact);
         }
     }
 

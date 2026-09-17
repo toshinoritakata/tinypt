@@ -26,6 +26,10 @@ pub struct Hit {
     /// メッシュインスタンス経由のヒットなら Some(inst_id)、球なら None。
     /// 呼び出し側（World::hit）が設定する。
     pub inst_id: Option<usize>,
+    /// この交差点から新しいレイを出すときの自己交差回避オフセット（ワールド空間の距離）。
+    /// `World::hit` がシーンの大きさから設定する（プリミティブ単体の交差関数は 0 を返す）。
+    /// BSDF はこの値で散乱レイの原点をずらす。
+    pub ray_eps: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +200,7 @@ impl Sphere {
         }
         let p = r.at(t);
         let n = (p - self.c) / self.r;
-        Some(Hit { t, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None })
+        Some(Hit { t, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None, ray_eps: 0.0 })
     }
 }
 
@@ -275,6 +279,6 @@ impl Triangle {
 
         let p = r.at(thit);
         let n = e1.cross(e2).norm();
-        Some(Hit { t: thit, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None })
+        Some(Hit { t: thit, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None, ray_eps: 0.0 })
     }
 }

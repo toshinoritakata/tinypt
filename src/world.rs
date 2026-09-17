@@ -11,7 +11,7 @@
 //! PDF は `Light::pdf_omega` に一本化され、`sample_light` と `light_pdf` が共有する。
 
 use crate::bvh::Bvh;
-use crate::geometry::{Hit, Sphere, Triangle};
+use crate::geometry::{Aabb, Hit, Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{cdf_search, Color, Vec3};
 use crate::ray::Ray;
@@ -84,6 +84,9 @@ pub struct World {
     sphere_light_id: Vec<Option<usize>>,
     /// (インスタンス ID, メッシュ内三角形 ID) → lights 上の ID。
     tri_light_id: std::collections::HashMap<(usize, usize), usize>,
+    /// 自己交差回避オフセットのキャッシュ（シーンの境界ボックスから初回参照時に求める）。
+    /// 形状を追加するとリセットされる。
+    ray_eps: std::sync::OnceLock<f64>,
 }
 
 impl World {
@@ -98,11 +101,58 @@ impl World {
             light_total: 0.0,
             sphere_light_id: Vec::new(),
             tri_light_id: std::collections::HashMap::new(),
+            ray_eps: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 全ジオメトリ（球と、変換後のメッシュインスタンス）のワールド空間の境界ボックス。
+    /// インスタンスはメッシュの BVH ルートの AABB の 8 頂点を変換して包む。
+    pub fn bounds(&self) -> Aabb {
+        let mut b = Aabb::empty();
+        for s in &self.spheres {
+            let r = Vec3::new(s.r, s.r, s.r);
+            b = b.grow(s.c - r).grow(s.c + r);
+        }
+        for inst in &self.instances {
+            let Some(mesh) = self.meshes.get(inst.mesh_id) else { continue };
+            let Some(root) = mesh.bvh.nodes.first() else { continue };
+            let (lo, hi) = (root.bbox.min, root.bbox.max);
+            for k in 0..8 {
+                let corner = Vec3::new(
+                    if k & 1 == 0 { lo.x } else { hi.x },
+                    if k & 2 == 0 { lo.y } else { hi.y },
+                    if k & 4 == 0 { lo.z } else { hi.z },
+                );
+                b = b.grow(inst.xform.apply_point(corner));
+            }
+        }
+        b
+    }
+
+    /// 自己交差回避オフセット（ワールド空間の距離）: `RAY_EPSILON_REL × 境界ボックスの対角線長`。
+    ///
+    /// 散乱レイ・シャドウレイの原点のずらし量と、それらの交差判定の tmin に使う。シーン全体を
+    /// 拡大縮小すると同じ比率で変わるので、結果がスケールに依存しない。形状が無い場合は
+    /// `RAY_EPSILON_EMPTY_SCENE`。
+    ///
+    /// 限界: 1 つのシーンに非常に大きな形状（広い床）と非常に小さな形状が混在すると、オフセットが
+    /// 小さな形状に対して大きすぎる（小物体の接地影・細部の遮蔽が失われる）。交差点ごとの誤差上界に
+    /// 基づくオフセット（段階 2）で解消する予定。
+    pub fn ray_epsilon(&self) -> f64 {
+        *self.ray_eps.get_or_init(|| {
+            let b = self.bounds();
+            let diag = (b.max - b.min).len();
+            if diag.is_finite() && diag > 0.0 {
+                crate::constants::RAY_EPSILON_REL * diag
+            } else {
+                crate::constants::RAY_EPSILON_EMPTY_SCENE
+            }
+        })
     }
 
     /// 球プリミティブを追加し、その `World::spheres` 上のインデックスを返す。
     pub fn add_sphere(&mut self, sphere: Sphere) -> usize {
+        self.ray_eps = std::sync::OnceLock::new();
         let idx = self.spheres.len();
         self.spheres.push(sphere);
         idx
@@ -111,6 +161,7 @@ impl World {
     /// 三角形群からメッシュを構築し、`xform` で配置したインスタンスを追加する。
     /// 追加したインスタンスの ID を返す。
     pub fn add_mesh_instance(&mut self, tris: Vec<Triangle>, xform: Transform, mat_override: Option<usize>) -> usize {
+        self.ray_eps = std::sync::OnceLock::new();
         let mesh_id = self.meshes.len();
         self.meshes.push(Mesh::new(tris));
         let inst_id = self.instances.len();
@@ -191,6 +242,7 @@ impl World {
                         mat_id,
                         prim_id: h_obj.prim_id,
                         inst_id: Some(inst_id),
+                        ray_eps: 0.0,
                     });
                 }
                 break;
@@ -206,6 +258,9 @@ impl World {
             }
         }
 
+        if let Some(h) = best.as_mut() {
+            h.ray_eps = self.ray_epsilon();
+        }
         best
     }
 
@@ -583,6 +638,7 @@ mod tests {
                         mat_id: inst.mat_override.unwrap_or(h_obj.mat_id),
                         prim_id: h_obj.prim_id,
                         inst_id: Some(inst_id),
+                        ray_eps: 0.0,
                     });
                 }
                 break;
@@ -844,6 +900,99 @@ mod tests {
         }
     }
 
+    /// 12 枚の三角形で作る [-1, 1]³ の立方体。
+    fn unit_box() -> Vec<Triangle> {
+        let c = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+        let faces = [
+            [c(-1., -1., -1.), c(1., -1., -1.), c(1., 1., -1.), c(-1., 1., -1.)],
+            [c(-1., -1., 1.), c(1., -1., 1.), c(1., 1., 1.), c(-1., 1., 1.)],
+            [c(-1., -1., -1.), c(1., -1., -1.), c(1., -1., 1.), c(-1., -1., 1.)],
+            [c(-1., 1., -1.), c(1., 1., -1.), c(1., 1., 1.), c(-1., 1., 1.)],
+            [c(-1., -1., -1.), c(-1., 1., -1.), c(-1., 1., 1.), c(-1., -1., 1.)],
+            [c(1., -1., -1.), c(1., 1., -1.), c(1., 1., 1.), c(1., -1., 1.)],
+        ];
+        faces.iter().flat_map(|q| [Triangle::new_static(q[0], q[1], q[2], 0), Triangle::new_static(q[0], q[2], q[3], 0)]).collect()
+    }
+
+    /// 二次レイの自己再ヒットなし: 球と回転した立方体インスタンスを、大きさ 1e-3〜1e3、原点からの距離 0〜1e3 倍で
+    /// 置き、表面の点から `Hit::ray_eps` だけずらした二次レイを出す。外向き（幾何法線側）のレイは凸な自分自身に
+    /// 当たらず、内向きのレイ（透過）は入射した面に再ヒットせず（t > 10·ε）物体の反対側へ抜ける。
+    #[test]
+    fn secondary_rays_do_not_rehit_their_own_surface_at_any_scale() {
+        let mut rng = Rng::new(31);
+        for &k in &[1e-3, 1.0, 1e3] {
+            for &offset in &[0.0, 1e3] {
+                let center = Vec3::new(offset * k, 0.5 * offset * k, -0.3 * offset * k);
+                let mut world = World::new();
+                world.add_sphere(Sphere { c: center, r: k, mat_id: 0 });
+                let xf = Transform::translate(center + Vec3::new(4.0 * k, 0.0, 0.0))
+                    .compose(Transform::rotate(Vec3::new(0.3, 1.0, 0.2), 33.0))
+                    .compose(Transform::scale(Vec3::new(k, 0.7 * k, 1.3 * k)));
+                world.add_mesh_instance(unit_box(), xf, None);
+                let mut checked = 0;
+                for i in 0..2000 {
+                    let target = if i % 2 == 0 { center } else { center + Vec3::new(4.0 * k, 0.0, 0.0) };
+                    let o = target + uniform_sphere_dir(&mut rng) * (5.0 * k);
+                    let Some(h) = world.hit(Ray { o, d: (target - o).norm(), time: 0.0 }, world.ray_epsilon(), 1e30) else { continue };
+                    let eps = h.ray_eps;
+                    assert_eq!(eps, world.ray_epsilon());
+                    // 三角形の法線の向き（巻き順）は保証されないので、物体の中心から外向きにそろえる
+                    // （狙った物体の手前に別の物体があることもあるので、実際に当たった物体の中心を使う）
+                    let hit_center = if h.inst_id.is_some() { center + Vec3::new(4.0 * k, 0.0, 0.0) } else { center };
+                    let n = if h.n.dot(h.p - hit_center) < 0.0 { -h.n.norm() } else { h.n.norm() };
+                    for _ in 0..4 {
+                        let mut d = uniform_sphere_dir(&mut rng);
+                        // 外向き
+                        if d.dot(n) < 0.0 { d = -d; }
+                        if let Some(h2) = world.hit(Ray { o: h.p + eps * d, d, time: 0.0 }, eps, 1e30) {
+                            assert!(!(h2.inst_id == h.inst_id && (h.inst_id.is_some() || h2.prim_id == h.prim_id)),
+                                "k={} offset={}: outward ray re-hit its own object at t={} (eps {})", k, offset, h2.t, eps);
+                        }
+                        // 内向き（浅すぎる角度は除く）
+                        let di = -d;
+                        if di.dot(-n) > 0.1 {
+                            let h2 = world.hit(Ray { o: h.p + eps * di, d: di, time: 0.0 }, eps, 1e30)
+                                .unwrap_or_else(|| panic!("k={} offset={}: inward ray escaped its object", k, offset));
+                            // 自分の入射面への再ヒットなら t は ε 程度になる（立方体の辺の近くでは隣の面から
+                            // 抜ける正当な短い弦もあるので、弦の長さではなく ε との比で判定する）
+                            assert!(h2.t > 10.0 * eps, "k={} offset={}: inward ray re-hit the entry surface at t={} (eps {})", k, offset, h2.t, eps);
+                        }
+                        checked += 1;
+                    }
+                }
+                assert!(checked > 4000, "k={} offset={}: too few checks ({})", k, offset, checked);
+            }
+        }
+    }
+
+    /// **期待される失敗（段階 2 = バッチ 3c の合格条件）**: 大きな床（1 万単位四方）と、その上の非常に薄い
+    /// 壁（厚さ 5e-5、高さ 1e-2）が同じシーンにあると、シーンの大きさに比例するオフセット（≈ 1.4e-3）が
+    /// 壁の厚さや壁までの距離（5e-4）より大きくなる。床の点から壁越しに光源へ向かうシャドウレイは、原点を
+    /// ずらした時点で壁を飛び越えてしまい、遮蔽を検出できない（小物体の接地影・細部の遮蔽の欠落）。
+    ///
+    /// ここでは正しい振る舞い（遮蔽される）を assert しており、現状は失敗するので `should_panic` にしてある。
+    /// 交差点ごとの誤差上界に基づくオフセット（バッチ 3c）で通るようになったら、`should_panic` を外すこと
+    /// （外さないとこのテストが失敗し、変更に気付ける）。
+    #[test]
+    #[should_panic(expected = "thin occluder not detected")]
+    fn expected_failure_large_floor_and_thin_occluder() {
+        let mut world = World::new();
+        let q = |x: f64, z: f64| Vec3::new(x, 0.0, z);
+        let floor = vec![
+            Triangle::new_static(q(-5e3, -5e3), q(5e3, -5e3), q(5e3, 5e3), 0),
+            Triangle::new_static(q(-5e3, -5e3), q(5e3, 5e3), q(-5e3, 5e3), 0),
+        ];
+        world.add_mesh_instance(floor, Transform::identity(), None);
+        // 薄い壁: x ∈ [0, 5e-5]、y ∈ [0, 1e-2]、z ∈ [-5e-3, 5e-3]
+        let wall = Transform::translate(Vec3::new(2.5e-5, 5e-3, 0.0)).compose(Transform::scale(Vec3::new(2.5e-5, 5e-3, 5e-3)));
+        world.add_mesh_instance(unit_box(), wall, None);
+        let eps = world.ray_epsilon();
+        let p = Vec3::new(-5e-4, 0.0, 0.0);
+        let d = Vec3::new(1.0, 0.002, 0.0).norm();
+        let occluded = world.hit(Ray { o: p + eps * d, d, time: 0.0 }, eps, 10.0).is_some();
+        assert!(occluded, "thin occluder not detected (offset {} vs distance to the wall 5e-4)", eps);
+    }
+
     /// build_lights の重み = 面積 × 輝度（Light::area と共有された面積計算）。
     #[test]
     fn sphere_light_weight_is_area_times_luminance() {
@@ -896,6 +1045,7 @@ mod tests {
                     mat_id: 0,
                     prim_id: 0,
                     inst_id: None,
+                    ray_eps: 0.0,
                 };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() < 1e-9 * ls.pdf.max(1.0), "light_pdf {} != sample_light pdf {}", pdf, ls.pdf);
@@ -938,7 +1088,7 @@ mod tests {
                     let wi = (ls.position - from).norm();
                     assert!(ls.normal.dot(-wi) > 0.0, "{}: sampled a point not visible from outside", name);
                 }
-                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None };
+                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, ray_eps: 0.0 };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "{}: light_pdf {} != sample pdf {}", name, pdf, ls.pdf);
             }
@@ -1094,7 +1244,7 @@ mod tests {
                     let wi = (ls.position - from).norm();
                     assert!(ls.normal.dot(-wi) > 0.0, "r={} eps={:e}: cone sample on the hidden side", r, eps);
                 }
-                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None };
+                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, ray_eps: 0.0 };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "r={} eps={:e}: light_pdf {} != sample pdf {}", r, eps, pdf, ls.pdf);
             }
@@ -1118,6 +1268,7 @@ mod tests {
             mat_id: 0,
             prim_id: 3, // no sphere at this index
             inst_id: None,
+            ray_eps: 0.0,
         };
         assert_eq!(world.light_pdf(Vec3::new(5.0, 0.0, 0.0), 0.0, &hit), 0.0);
     }
@@ -1175,7 +1326,6 @@ mod tests {
     /// Cornell box が暗くなる/バンディングが出るバグがあった）。
     #[test]
     fn shadow_ray_does_not_self_hit_sampled_light() {
-        use crate::constants::RAY_EPSILON;
         use crate::transform::Transform;
 
         let mut world = World::new();
@@ -1198,9 +1348,10 @@ mod tests {
                 let to = ls.position - p;
                 let dist = to.dot(to).sqrt();
                 let wi = to / dist;
-                let shadow = Ray { o: p + RAY_EPSILON * wi, d: wi, time: 0.0 };
-                let tmax = (dist - 2.0 * RAY_EPSILON).max(RAY_EPSILON);
-                assert!(world.hit(shadow, RAY_EPSILON, tmax).is_none(), "shadow ray must not self-hit the sampled light");
+                let eps = world.ray_epsilon();
+                let shadow = Ray { o: p + eps * wi, d: wi, time: 0.0 };
+                let tmax = dist * (1.0 - 1e-9) - 2.0 * eps;
+                assert!(world.hit(shadow, eps, tmax).is_none(), "shadow ray must not self-hit the sampled light");
             }
         }
         assert!(sampled > 0, "no light samples drawn");
