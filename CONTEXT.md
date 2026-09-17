@@ -11,7 +11,7 @@ The scattering behaviour at a surface point — how an incoming direction relate
 _Avoid_: BRDF (too narrow — we include transmission), shader, surface model.
 
 **BsdfSample**:
-The result of sampling a BSDF: the scattered `Ray` (origin included, so transmissive offsets stay inside the BSDF), the throughput `weight` (`f·cos/pdf`), the `pdf`, and the `is_delta` flag. The `pdf` it reports is the same value `eval` would return for that direction pair.
+The result of sampling a BSDF: the scattered `Ray` (origin included, so transmissive offsets stay inside the BSDF), the throughput `weight` (`f·cos/pdf`), the `pdf`, the `is_delta` flag, and `eta` — the relative index of refraction η_t/η_i of a transmission (1 for reflection), which the integrator multiplies along the path so Russian roulette can use `max(throughput)·η²` as in Mitsuba 3. The `pdf` it reports is the same value `eval` would return for that direction pair.
 _Avoid_: ScatterResult, BounceResult.
 
 **Delta BSDF**:
@@ -40,6 +40,9 @@ _Avoid_: bounces (ambiguous about whether the camera ray or the light hit counts
 
 **Throughput** (`weight`):
 The accumulated attenuation along a path, `f·cos/pdf` folded together. Carried in `BsdfSample.weight` and multiplied into the path's running throughput.
+
+**Russian roulette**:
+Probabilistic path termination from depth `rr_depth` on; a surviving path's throughput is divided by the survival probability, so the estimate stays unbiased. The survival probability is `max(throughput)·η²` clamped to [0.05, 0.95], where η is the product of `BsdfSample.eta` along the path — the same η² compensation as Mitsuba 3, so paths inside glass are not killed just because transmission scaled their radiance by 1/η². Unlike Mitsuba 3, which decides after multiplying in the current vertex's BSDF weight, tinypt decides **before** BSDF sampling (after emission and NEE at the vertex), using the throughput without that weight: deciding after the weight makes the survival probability ≈ albedo right after a diffuse bounce, which with a shallow `rr_depth` costs far more variance than the time it saves (measured: 2.7× variance×time in diffuse regions of `sample/default.xml` at `rr_depth = 1`), while the glass-region benefit of the η² compensation is the same either way.
 
 **Firefly clamp**:
 Every contribution added to a path's radiance — any emitter/background hit (MIS-weighted or not, e.g. seen directly from the camera or after a delta bounce) **and** every NEE contribution — is luminance-scaled to at most `FIREFLY_CLAMP` (50) before being accumulated. Biased by design; applied per contribution (not per path), so both MIS strategies share the same limit.

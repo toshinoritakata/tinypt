@@ -4,7 +4,8 @@
 //! - **NEE（Next Event Estimation）**: 各バウンスで光源を直接サンプリングし直接照明を推定
 //! - **MIS**: BSDF サンプリングと光源サンプリングを Power Heuristic (β=2) で統合
 //! - **Russian Roulette**: スループットに基づく確率的なパス打ち切り（不偏性を維持）。
-//!   発光・NEE の寄与を積んだ後、BSDF サンプリングの直前で判定する
+//!   生存確率に Mitsuba 3 と同じ透過の η² 補償を入れる。判定位置は Mitsuba と異なり、
+//!   BSDF 重みを掛ける前（BSDF サンプリングの直前）: rr_depth が浅いときに拡散領域の効率が落ちないため
 //! - **Firefly クランプ**: 異常に明るい寄与を輝度ベースでクランプ。MIS の両側（BSDF サンプリングで
 //!   光源/背景に当たった寄与と、NEE の寄与）に寄与単位で同じ閾値を掛け、対称に保つ
 //!
@@ -75,6 +76,7 @@ pub fn radiance(
     let mut last_bsdf_pdf = 0.0;     // 前バウンスの BSDF PDF（MIS 用）
     let mut last_non_delta = false;   // 前バウンスが非デルタ散乱か（MIS 適用判定）
     let mut last_p = ray.o;           // 前バウンスのシェーディング点（面光源 MIS の light_pdf 計算用）
+    let mut eta_scale = 1.0;          // パス上の透過で掛かった相対屈折率 η_t/η_i の積（RR 用）
 
     for bounce in 0..limits.max_depth {
         // レイとシーンの交差判定
@@ -136,14 +138,29 @@ pub fn radiance(
             }
         }
 
-        // Russian Roulette: 確率的にパスを打ち切る（生存時は 1/p で補償するので不偏）。
-        // この頂点での発光・NEE の寄与を積んだ後、続きのパス（BSDF サンプリング）を
-        // 延ばすかどうかだけを判定する。打ち切っても既に得た直接光は失われない。
-        // 生存確率はスループットの最大成分を [0.05, 0.95] にクランプしたもの。
-        // 延長するのはパス長 bounce + 1 のパスなので、それが rr_depth 以上なら判定する。
+        // Russian Roulette: この頂点の発光・NEE の寄与を積んだ後、BSDF サンプリングの前に、
+        // パスを延長するかどうかを確率的に決める（生存時は 1/p で補償するので不偏）。
+        // 延長するパス長 bounce + 1 が rr_depth 以上なら判定する。
+        //
+        // 生存確率は max(throughput)·η² を [0.05, 0.95] にクランプしたもの（η² 補償は Mitsuba 3 と同じ）。
+        // η² はパス上の透過で掛かった放射輝度の 1/η² 倍を打ち消す。これが無いとガラスに入っただけで
+        // 生存確率が 1/η²（ior 1.5 で 0.44 倍）に下がり、ガラス内部を通る経路（コースティクス・全反射）
+        // が強く打ち切られ、生き残った経路に大きな 1/p が掛かってノイズになる。
+        //
+        // 判定位置は Mitsuba 3（BSDF 重みを掛けた**後**の throughput で判定）と意図的に異なり、
+        // この頂点の重みを掛ける**前**の throughput を使う。重み適用後で判定すると、拡散面では
+        // 最初の散乱直後から生存確率が ≈ アルベドになり、rr_depth が浅い設定で拡散主体の領域の
+        // ノイズが大きく増える（計測: rr_depth 1 で default.xml の拡散領域の分散×時間が 2.7 倍、
+        // cornell で 1.26 倍）。重み適用前ならこの悪化がなく、η² 補償によるガラス領域の分散低下は同じ
+        // （rr_depth 1: default 全体の分散×時間 0.62、cornell 0.99）。通常の設定（rr_depth 4〜5）では
+        // 両者に差はない。
+        let throughput_max = path_throughput.r().max(path_throughput.g()).max(path_throughput.b());
+        if throughput_max <= 0.0 {
+            break;
+        }
         if bounce + 1 >= limits.rr_depth {
-            let p = path_throughput.r().max(path_throughput.g()).max(path_throughput.b()).min(0.95).max(0.05);
-            if rng.next_f64() > p {
+            let p = rr_survival_probability(throughput_max, eta_scale);
+            if rng.next_f64() >= p {
                 break;
             }
             path_throughput = path_throughput / p;
@@ -151,18 +168,27 @@ pub fn radiance(
 
         // BSDF サンプリング: 散乱レイ・スループット重み・PDF を BSDF から取得
         match mat.sample(&ray, &hit, rng) {
-            Some(BsdfSample { scattered, weight, pdf, is_delta }) => {
+            Some(BsdfSample { scattered, weight, pdf, is_delta, eta }) => {
                 last_bsdf_pdf = pdf;
                 last_non_delta = !is_delta;
                 last_p = hit.p;
                 path_throughput = path_throughput.hadamard(weight);
+                eta_scale *= eta;
                 ray = scattered;
             }
             None => break,
         }
+
     }
 
     accumulated_radiance
+}
+
+/// Russian Roulette の生存確率: `max(throughput)·η²` を [0.05, 0.95] にクランプする。
+/// `eta_scale` はこの頂点までのパス上の透過の相対屈折率 η_t/η_i の積（Mitsuba 3 の path 積分器と同じ η² 補償。
+/// 下限 0.05 は tinypt 独自で、極端に小さい確率で生き残った経路の重みの爆発を抑える）。
+fn rr_survival_probability(throughput_max: f64, eta_scale: f64) -> f64 {
+    (throughput_max * eta_scale * eta_scale).min(0.95).max(0.05)
 }
 
 /// レイの進行方向に対して正しい向きの法線を返す（裏面判定）。
@@ -433,6 +459,69 @@ mod tests {
         for rr_depth in [1usize, 2, 5] {
             let (mean, se) = estimate(&world, &mats, &env, to_floor, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 11);
             assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "rr_depth={}: {} ± {} vs exact {}", rr_depth, mean, se, exact);
+        }
+    }
+
+    /// 生存確率は max(throughput)·η² を [0.05, 0.95] にクランプしたもの。
+    #[test]
+    fn rr_survival_probability_compensates_eta_squared() {
+        // ガラス（ior 1.5）に入った直後: 放射輝度の重み 1/1.5² と η_t/η_i = 1.5 が打ち消し合う
+        let after_entering = 1.0 / (1.5 * 1.5);
+        assert!((rr_survival_probability(after_entering, 1.5) - 0.95).abs() < 1e-12);
+        // 補償なし（η = 1）なら 0.444 に下がる
+        assert!((rr_survival_probability(after_entering, 1.0) - after_entering).abs() < 1e-12);
+        // 出た後は η の積が 1 に戻る
+        assert!((rr_survival_probability(0.3, 1.5 * (1.0 / 1.5)) - 0.3).abs() < 1e-12);
+        // クランプ
+        assert_eq!(rr_survival_probability(1e-6, 1.0), 0.05);
+        assert_eq!(rr_survival_probability(10.0, 1.0), 0.95);
+    }
+
+    /// 誘電体の BsdfSample.eta: 入る透過で ior、出る透過で 1/ior、反射で 1。
+    /// 吸収なしの透過では weight·eta² = 1（放射輝度の η² 倍率が eta で打ち消される）。
+    #[test]
+    fn dielectric_sample_reports_relative_ior() {
+        let ior = 1.5;
+        let mat = Material::Dielectric { ior, absorption: Color::new(0.0, 0.0, 0.0) };
+        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None };
+        let enter = Ray { o: Vec3::new(0.3, 1.0, 0.0), d: Vec3::new(-0.3, -1.0, 0.0).norm(), time: 0.0 };
+        let exit = Ray { o: Vec3::new(0.1, -1.0, 0.0), d: Vec3::new(-0.1, 1.0, 0.0).norm(), time: 0.0 };
+        let mut rng = Rng::new(2);
+        let (mut seen_enter_t, mut seen_exit_t, mut seen_refl) = (false, false, false);
+        for _ in 0..2000 {
+            for (ray, entering) in [(enter, true), (exit, false)] {
+                let s = mat.sample(&ray, &hit, &mut rng).unwrap();
+                let transmitted = s.scattered.d.dot(ray.d) > 0.0 && s.scattered.d.dot(hit.n).signum() == ray.d.dot(hit.n).signum();
+                if transmitted {
+                    let expect = if entering { ior } else { 1.0 / ior };
+                    assert!((s.eta - expect).abs() < 1e-12, "transmission eta {} vs {}", s.eta, expect);
+                    assert!((s.weight.r() * s.eta * s.eta - 1.0).abs() < 1e-9, "weight·eta² = {}", s.weight.r() * s.eta * s.eta);
+                    if entering { seen_enter_t = true } else { seen_exit_t = true }
+                } else {
+                    assert_eq!(s.eta, 1.0);
+                    seen_refl = true;
+                }
+            }
+        }
+        assert!(seen_enter_t && seen_exit_t && seen_refl);
+    }
+
+    /// 白炉テスト（ガラス）: 一様な環境光 L の中に置いた吸収のない誘電体球は、どこから見ても L に見える
+    /// （反射と透過の和が 1、入射と射出の η² 倍率が打ち消し合う）。深さ無制限・RR を最初の頂点から
+    /// 効かせても（rr_depth = 1）平均が L に一致し、RR の η² 補償と判定位置が不偏であることを確かめる。
+    #[test]
+    fn glass_sphere_white_furnace_is_unbiased_with_russian_roulette() {
+        use crate::geometry::Sphere;
+        let mats = vec![Material::Dielectric { ior: 1.5, absorption: Color::new(0.0, 0.0, 0.0) }];
+        let mut world = World::new();
+        world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 0 });
+        world.build_lights(&mats);
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        for (rr_depth, target_y) in [(1usize, 0.0), (1, 0.6), (1, 0.95), (3, 0.6)] {
+            let o = Vec3::new(0.0, 0.0, 5.0);
+            let ray = Ray { o, d: (Vec3::new(0.0, target_y, 0.0) - o).norm(), time: 0.0 };
+            let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 13);
+            assert!((mean - 1.0).abs() < 5.0 * se + 1e-3, "rr_depth={} y={}: {} ± {} vs 1", rr_depth, target_y, mean, se);
         }
     }
 

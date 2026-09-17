@@ -55,6 +55,10 @@ pub struct BsdfSample {
     pub pdf: f64,
     /// デルタ（鏡面）散乱か
     pub is_delta: bool,
+    /// この散乱での相対屈折率 η_t/η_i（透過で媒質に入ると > 1）。反射・非透過の BSDF では 1。
+    /// 透過の `weight` は放射輝度の η_i²/η_t² 倍を含むので、`throughput·eta²` はその倍率を
+    /// 打ち消した量になる。積分器が Russian Roulette の生存確率に使う（Mitsuba 3 の `BSDFSample3f::eta`）。
+    pub eta: f64,
 }
 
 impl Material {
@@ -87,6 +91,7 @@ impl Material {
                     weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
+                    eta: 1.0,
                 })
             }
             Material::Metal { albedo } => {
@@ -96,6 +101,7 @@ impl Material {
                     weight: *albedo,
                     pdf: 0.0,
                     is_delta: true,
+                    eta: 1.0,
                 })
             }
             Material::Dielectric { ior, absorption } => {
@@ -121,6 +127,8 @@ impl Material {
                 let refr_dir = refract(ray_in.d, n, eta);
 
                 let choose_refl = refr_dir.is_none() || rng.next_f64() < fresnel;
+                // 透過なら η_t/η_i（eta は η_i/η_t）、反射なら 1
+                let eta_scatter = if choose_refl { 1.0 } else { 1.0 / eta };
                 let d = if choose_refl {
                     current_beta = current_beta * (fresnel / fresnel.max(1e-6));
                     refl_dir
@@ -136,6 +144,7 @@ impl Material {
                     weight: current_beta,
                     pdf: 0.0,
                     is_delta: true,
+                    eta: eta_scatter,
                 })
             }
             Material::Ggx { albedo, alpha } => {
@@ -176,6 +185,7 @@ impl Material {
                     weight: spec * (cos_o / pdf.max(1e-6)),
                     pdf,
                     is_delta: false,
+                    eta: 1.0,
                 })
             }
             Material::Subsurface { albedo } => {
@@ -189,6 +199,7 @@ impl Material {
                     weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
+                    eta: 1.0,
                 })
             }
             Material::DiffuseLight { .. } => None,
