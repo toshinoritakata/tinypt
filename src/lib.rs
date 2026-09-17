@@ -19,7 +19,7 @@ pub mod ray;         // レイとカメラモデル
 pub mod geometry;    // 幾何プリミティブ（球・三角形・AABB）
 pub mod bvh;         // BVH（Bounding Volume Hierarchy）加速構造
 pub mod world;       // ワールド（全ジオメトリ・インスタンス・ライト）
-pub mod transform;   // 平行移動・Y軸回転・均一スケールの変換
+pub mod transform;   // アフィン変換（任意軸回転・非一様スケール・せん断）
 pub mod material;    // マテリアルと BSDF サンプリング
 pub mod integrator;  // パストレーシング積分器（MIS + NEE）
 pub mod task;        // タイル分割タスク定義

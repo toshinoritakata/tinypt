@@ -52,3 +52,7 @@ estimate the same shading point, keeping MIS consistent); `scatter_dist` was
 at first kept as a reserved, unused field and was later removed, leaving
 `Subsurface { albedo }`. A true BSSRDF would be a separate feature. No Mitsuba
 `bsdf` type maps to it.
+
+**Update:** Only `roughconductor` (mapped to `Ggx`) uses `albedo` as Schlick
+F0. `conductor` maps to `Metal`, a perfect mirror with constant reflectance
+`albedo` and no Fresnel term.

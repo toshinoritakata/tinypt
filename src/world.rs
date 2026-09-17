@@ -1085,6 +1085,59 @@ mod tests {
         assert!((b.min - expect_min).len() < 1e-8 && (b.max - expect_max).len() < 1e-8, "{:?} {:?}", (b.min.x, b.min.y, b.min.z), (b.max.x, b.max.y, b.max.z));
     }
 
+    /// インスタンスのワールド空間の境界ボックス（`Instance::world_bounds`）による事前棄却は、ヒットを落とさない。
+    /// 事前棄却を使わない参照実装（`hit_without_instance_pruning`）と、ビット単位で同じ結果になることを確かめる。
+    ///
+    /// 箱の境界ちょうどに当たるレイを多く含める。立方体の頂点は箱の角・辺・面の上にあり、軸平行の配置では
+    /// 立方体の面が箱の面と重なる。配置は大きさ 1e-3〜1e3、原点からの距離 0 と**絶対 1e8**、軸平行と
+    /// 回転＋非一様スケール。レイは頂点・辺・面を狙い、すれすれの方向（面にほぼ平行）も含める。
+    /// 箱のパディング（角の誤差上界と γ(3)·|座標|）を両方外すと、1e8 の配置でヒットを落として失敗する。
+    #[test]
+    fn instance_world_bounds_never_drop_hits() {
+        let mut rng = Rng::new(97);
+        let (mut hits, mut checked) = (0usize, 0usize);
+        for case in 0..160 {
+            let k = [1e-3, 1.0, 1e3][case % 3];
+            let dist = if case % 2 == 0 { 0.0 } else { 1e8 };
+            let rotated = case % 4 >= 2;
+            let offset = Vec3::new(dist, -0.6 * dist, 0.8 * dist) + uniform_sphere_dir(&mut rng) * k;
+            let mut xf = Transform::translate(offset);
+            if rotated {
+                xf = xf.compose(Transform::rotate(uniform_sphere_dir(&mut rng), 360.0 * rng.next_f64()));
+            }
+            let xf = xf.compose(Transform::scale(Vec3::new(k, (0.5 + rng.next_f64()) * k, (0.5 + rng.next_f64()) * k)));
+            let mut world = World::new();
+            world.add_mesh_instance(unit_box(), xf, None);
+            for i in 0..150 {
+                // 狙う点（物体空間）: 頂点・辺上・面上（座標の成分を ±1 に固定する数で切り替え）
+                let mut q = [rng.next_f64() * 2.0 - 1.0, rng.next_f64() * 2.0 - 1.0, rng.next_f64() * 2.0 - 1.0];
+                let fixed = 3 - i % 3; // 3 = 頂点, 2 = 辺, 1 = 面
+                let first = rng.next_u32() as usize % 3;
+                for j in 0..fixed {
+                    q[(first + j) % 3] = if rng.next_f64() < 0.5 { -1.0 } else { 1.0 };
+                }
+                let target = xf.apply_point(Vec3::new(q[0], q[1], q[2]));
+                // 方向: 一様な向き、または軸方向にほぼ平行（すれすれ）
+                let mut d = uniform_sphere_dir(&mut rng);
+                if i % 2 == 1 {
+                    let axis = rng.next_u32() as usize % 3;
+                    let mut a = [d.x * 1e-3, d.y * 1e-3, d.z * 1e-3];
+                    a[axis] = if rng.next_f64() < 0.5 { 1.0 } else { -1.0 };
+                    d = Vec3::new(a[0], a[1], a[2]).norm();
+                }
+                let o = target - d * (4.0 * k);
+                let r = Ray { o, d, time: 0.0 };
+                for &(tmin, tmax) in &[(0.0, 1e30), (0.0, 4.0 * k * (1.0 + 1e-12))] {
+                    let expect = hit_without_instance_pruning(&world, r, tmin, tmax);
+                    hits += expect.is_some() as usize;
+                    checked += 1;
+                    assert_same_hit(world.hit(r, tmin, tmax), expect, &format!("case {} (k={} dist={} rotated={}) ray {}", case, k, dist, rotated, i));
+                }
+            }
+        }
+        assert!(checked == 48_000 && hits > 10_000, "too few hits checked ({} of {})", hits, checked);
+    }
+
     /// 中心頂点 `c` の周りに 6 枚の三角形を並べた扇（共有辺 6 本と共有頂点 1 つ）。法線 `n` の平面上、半径 `rad`。
     fn triangle_fan(c: Vec3, n: Vec3, rad: f64) -> (Vec<Triangle>, Vec<Vec3>) {
         let a = if n.x.abs() > 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };

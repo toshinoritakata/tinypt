@@ -8,7 +8,7 @@
 //! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
 //! - `shape type="sphere"`: `center` / `radius`
 //! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
-//! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `twosided`(unwrap)
+//! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `thindielectric`・`roughdielectric`(dielectric 扱い) / `twosided`(unwrap)。未知の型は警告して diffuse
 //! - `emitter type="area"`: `radiance`（shape に付随）
 //! - `emitter type="envmap"`(filename) / `constant`(radiance): 環境マップ。`scale` 対応
 //! - `film`(width/height) / `sampler`(sample_count) / `integrator`(max_depth/rr_depth、Mitsuba と同じ意味、max_depth=-1 は無制限): RenderConfig へ反映

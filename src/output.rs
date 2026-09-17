@@ -4,7 +4,7 @@
 //! 蓄積バッファを一度だけ [`resolve_pixels`] でリニア RGB に解決し、フォーマットに
 //! 渡すだけでよい（露出・トーンマップ・色空間・ガンマの判断はフォーマット内部）。
 //!
-//! - **PPM**: 露出補正 → トーンマップ → sRGB エンコード（入力デコードと対称） → 8bit
+//! - **PPM**: 露出補正 → トーンマップ → sRGB エンコード（入力デコードと対称） → 8bit、バイナリ（P6）
 //! - **HDR**: リニア RGB を RGBE エンコーディングで出力（シーン参照値を保存）
 //! - **EXR**: リニア sRGB → ACEScg 変換後に float32 で出力（シーン参照値を保存）
 //!
@@ -33,7 +33,7 @@ pub struct OutputSettings {
 /// 出力フォーマット。各 variant が自身の色パイプラインを所有する。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutputFormat {
-    /// PPM（8bit, sRGB ガンマ）
+    /// PPM（P6 バイナリ, 8bit, sRGB ガンマ）
     Ppm,
     /// Radiance HDR（RGBE, リニア）
     Hdr,
@@ -66,18 +66,10 @@ impl OutputFormat {
     ) -> std::io::Result<()> {
         match self {
             OutputFormat::Ppm => {
-                // LDR: 露出補正 → トーンマップ → sRGB ガンマ → 8bit
+                // LDR: 露出補正 → トーンマップ → sRGB ガンマ → 8bit。バイナリ PPM（P6）で書く
                 let mut out = BufWriter::new(File::create(path)?);
-                writeln!(out, "P3\n{} {}\n255", w, h)?;
-                let scale = 2.0_f64.powf(settings.exposure);
-                for y in 0..h {
-                    for x in 0..w {
-                        let c = tonemap(pixels[idx(x, y, w)] * scale, settings.tonemap).clamp01();
-                        write!(out, "{} {} {} ", to_u8(c.r()), to_u8(c.g()), to_u8(c.b()))?;
-                    }
-                    writeln!(out)?;
-                }
-                Ok(())
+                write_ppm_p6(&mut out, w, h, &ppm_bytes(w, h, pixels, settings))?;
+                out.flush()
             }
             OutputFormat::Hdr => {
                 // シーン参照リニア値をそのまま RGBE 出力
@@ -90,6 +82,25 @@ impl OutputFormat {
             }
         }
     }
+}
+
+/// PPM の画素値（行優先、1 画素 R, G, B の 8bit）。露出補正 → トーンマップ → sRGB エンコード → 量子化。
+fn ppm_bytes(w: usize, h: usize, pixels: &[Color], settings: OutputSettings) -> Vec<u8> {
+    let scale = 2.0_f64.powf(settings.exposure);
+    let mut bytes = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let c = tonemap(pixels[idx(x, y, w)] * scale, settings.tonemap).clamp01();
+            bytes.extend_from_slice(&[to_u8(c.r()), to_u8(c.g()), to_u8(c.b())]);
+        }
+    }
+    bytes
+}
+
+/// バイナリ PPM（P6、maxval 255）を書く。ヘッダの後に画素値のバイト列がそのまま続く。
+fn write_ppm_p6(out: &mut impl Write, w: usize, h: usize, rgb: &[u8]) -> std::io::Result<()> {
+    write!(out, "P6\n{} {}\n255\n", w, h)?;
+    out.write_all(rgb)
 }
 
 /// 蓄積バッファを最終リニア RGB ピクセルに変換する（acc[i] / acc_w[i]）。
@@ -196,5 +207,121 @@ mod tests {
             let close = |x: f64, y: f64| (x - y).abs() <= pmax / 128.0 + 1e-6;
             assert!(close(a.r(), b.r()) && close(a.g(), b.g()) && close(a.b(), b.b()), "{:?} vs {:?}", a, b);
         }
+    }
+
+    /// 旧形式の ASCII PPM（P3）を書く（P6 への移行で画素値が変わらないことの比較用。旧 writer と同じ書式）。
+    fn write_ppm_p3(out: &mut impl Write, w: usize, h: usize, rgb: &[u8]) -> std::io::Result<()> {
+        writeln!(out, "P3\n{} {}\n255", w, h)?;
+        for row in rgb.chunks(w * 3) {
+            for px in row.chunks(3) {
+                write!(out, "{} {} {} ", px[0], px[1], px[2])?;
+            }
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+
+    /// P3 / P6 の PPM（maxval 255）を読み、(幅, 高さ, 画素値) を返す。ヘッダのコメント（`#`）にも対応する。
+    fn read_ppm(data: &[u8]) -> (usize, usize, Vec<u8>) {
+        let mut pos = 0;
+        // ヘッダのトークンを 1 つ読む（空白とコメントを飛ばす）
+        let mut token = || -> String {
+            loop {
+                while data[pos].is_ascii_whitespace() {
+                    pos += 1;
+                }
+                if data[pos] != b'#' {
+                    break;
+                }
+                while data[pos] != b'\n' {
+                    pos += 1;
+                }
+            }
+            let start = pos;
+            while pos < data.len() && !data[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            String::from_utf8(data[start..pos].to_vec()).unwrap()
+        };
+        let magic = token();
+        let w: usize = token().parse().unwrap();
+        let h: usize = token().parse().unwrap();
+        assert_eq!(token(), "255");
+        let rgb = match magic.as_str() {
+            // P6: maxval の後の空白 1 バイトの直後から画素値
+            "P6" => {
+                let body = &data[pos + 1..];
+                assert_eq!(body.len(), w * h * 3, "P6 body length");
+                body.to_vec()
+            }
+            "P3" => {
+                let v: Vec<u8> = std::str::from_utf8(&data[pos..]).unwrap().split_ascii_whitespace().map(|t| t.parse().unwrap()).collect();
+                assert_eq!(v.len(), w * h * 3, "P3 value count");
+                v
+            }
+            m => panic!("unknown PPM magic {}", m),
+        };
+        (w, h, rgb)
+    }
+
+    /// PPM 出力は P6（バイナリ）: ヘッダ + 3·w·h バイト。書いたファイルを読み戻すと、同じバッファから
+    /// 旧形式（P3）で書いたものと画素値が一致し、to_u8 で直接計算した値とも一致する（出力画素値は不変）。
+    /// 非正方形（行と列の取り違えを検出）、0 と 255 に飽和する値、露出・ACES の両方で確かめる。
+    #[test]
+    fn ppm_p6_roundtrip_matches_p3_values() {
+        let (w, h) = (7, 3);
+        let pixels: Vec<Color> = (0..w * h)
+            .map(|i| {
+                let f = i as f64 / (w * h) as f64;
+                Color::new(f * 1.5, (1.0 - f) * 0.3, if i % 5 == 0 { 20.0 } else { f * f })
+            })
+            .collect();
+        let dir = std::env::temp_dir();
+        for (k, settings) in [
+            OutputSettings { exposure: 0.0, tonemap: Tonemap::None },
+            OutputSettings { exposure: 1.5, tonemap: Tonemap::Aces },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.join(format!("tinypt_test_{}_{}.ppm", std::process::id(), k));
+            let path = path.to_str().unwrap();
+            OutputFormat::Ppm.write(path, w, h, &pixels, settings).unwrap();
+            let file = std::fs::read(path).unwrap();
+            std::fs::remove_file(path).ok();
+            let header = format!("P6\n{} {}\n255\n", w, h);
+            assert!(file.starts_with(header.as_bytes()), "P6 header");
+            assert_eq!(file.len(), header.len() + 3 * w * h, "P6 file size");
+
+            let (w6, h6, rgb6) = read_ppm(&file);
+            let mut p3 = Vec::new();
+            write_ppm_p3(&mut p3, w, h, &ppm_bytes(w, h, &pixels, settings)).unwrap();
+            let (w3, h3, rgb3) = read_ppm(&p3);
+            assert_eq!((w6, h6), (w, h));
+            assert_eq!((w3, h3), (w, h));
+            assert_eq!(rgb6, rgb3, "P6 and P3 decode to different pixel values");
+
+            let scale = 2.0_f64.powf(settings.exposure);
+            for y in 0..h {
+                for x in 0..w {
+                    let c = tonemap(pixels[idx(x, y, w)] * scale, settings.tonemap).clamp01();
+                    let i = 3 * (y * w + x);
+                    assert_eq!(&rgb6[i..i + 3], &[to_u8(c.r()), to_u8(c.g()), to_u8(c.b())], "pixel ({}, {})", x, y);
+                }
+            }
+            assert!(rgb6.contains(&255) && rgb6.contains(&0) || k == 1, "test values should saturate");
+        }
+    }
+
+    /// 読み取りの自己確認: 手書きの P3（コメント付き）と、同じ値の P6 のバイト列が同じ画素値に読める。
+    #[test]
+    fn read_ppm_parses_both_encodings() {
+        let p3 = b"P3\n# comment\n2 1\n255\n0 128 255  10 20 30\n";
+        let p6 = [b"P6\n2 1\n255\n".as_slice(), &[0, 128, 255, 10, 20, 30]].concat();
+        assert_eq!(read_ppm(p3), (2, 1, vec![0, 128, 255, 10, 20, 30]));
+        assert_eq!(read_ppm(&p6), (2, 1, vec![0, 128, 255, 10, 20, 30]));
+        // 画素値に空白・改行と同じバイト（10, 32）が含まれても、P6 は長さで読むので壊れない
+        let p6_ws = [b"P6\n2 1\n255\n".as_slice(), &[10, 32, 9, 13, 35, 10]].concat();
+        assert_eq!(read_ppm(&p6_ws), (2, 1, vec![10, 32, 9, 13, 35, 10]));
     }
 }

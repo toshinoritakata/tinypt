@@ -629,11 +629,13 @@ mod tests {
     const GOLDEN_REVISION: u32 = 10;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
-    /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
-    const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0xdd80_3964_fecc_5c3c);
+    /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
+    /// PPM を P3 から P6 に変えたとき、PPM のハッシュだけを更新した（蓄積バッファのハッシュと画素値は不変。
+    /// P6 の画素値を P3 に書き直すと旧ハッシュ 0xdd80_3964_fecc_5c3c / 0xf4e9_ab88_c297_cdc3 に一致した）。
+    const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0x7c6a_81d0_9dd4_74a2);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
-    const GOLDEN_SPHERES: (u64, u64) = (0x9d2f_abcf_f7df_7882, 0xf4e9_ab88_c297_cdc3);
+    const GOLDEN_SPHERES: (u64, u64) = (0x9d2f_abcf_f7df_7882, 0xdd5e_c0af_a8da_343c);
 
     /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
     /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。
