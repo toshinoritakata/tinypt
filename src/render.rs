@@ -626,14 +626,14 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 8;
+    const GOLDEN_REVISION: u32 = 9;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
     const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0xdd80_3964_fecc_5c3c);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
-    const GOLDEN_SPHERES: (u64, u64) = (0x6eb1_13c1_70b4_3086, 0xf4e9_ab88_c297_cdc3);
+    const GOLDEN_SPHERES: (u64, u64) = (0x9d2f_abcf_f7df_7882, 0xf4e9_ab88_c297_cdc3);
 
     /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
     /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。
@@ -731,8 +731,9 @@ mod tests {
     }
 
     /// スケール不変性: Cornell box を 1e-3 倍・1e3 倍にしても、画像（全体と 4×4 ブロックの平均輝度）は
-    /// 等倍と統計的に一致する。自己交差回避オフセットがシーンの大きさに比例する（`World::ray_epsilon`）ことの
-    /// 回帰テスト。以前の絶対オフセット 1e-4 では、1e-3 倍（箱の辺が 0.0006）で接地部の光漏れや角の暗さが出た。
+    /// 等倍と統計的に一致する。自己交差回避（交差点の誤差上界に基づく原点のずらし、`offset_ray_origin`）が
+    /// シーンのスケールに依存しないことの回帰テスト。以前の絶対オフセット 1e-4 では、1e-3 倍（箱の辺が 0.0006）で
+    /// 接地部の光漏れや角の暗さが出た。
     #[test]
     fn cornell_is_scale_invariant() {
         let (w, h, spp, seeds) = (24usize, 24usize, 32usize, 8u64);

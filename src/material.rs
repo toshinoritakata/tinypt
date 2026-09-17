@@ -19,7 +19,7 @@
 
 use std::f64::consts::PI;
 
-use crate::geometry::Hit;
+use crate::geometry::{offset_ray_origin, Hit};
 use crate::math::{reflect, refract, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
@@ -86,7 +86,7 @@ impl Material {
                 let d = sample_cosine_hemisphere(n, rng);
                 // f·cos/pdf = (albedo/π)·cos/(cos/π) = albedo
                 Some(BsdfSample {
-                    scattered: Ray { o: hit.p + hit.ray_eps * d, d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
                     weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
@@ -96,7 +96,7 @@ impl Material {
             Material::Metal { albedo } => {
                 let d = reflect(ray_in.d, n);
                 Some(BsdfSample {
-                    scattered: Ray { o: hit.p + hit.ray_eps * d, d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
                     weight: *albedo,
                     pdf: 0.0,
                     is_delta: true,
@@ -139,7 +139,7 @@ impl Material {
                     tdir
                 };
                 Some(BsdfSample {
-                    scattered: Ray { o: hit.p + hit.ray_eps * d, d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
                     weight: current_beta,
                     pdf: 0.0,
                     is_delta: true,
@@ -180,7 +180,7 @@ impl Material {
                 let pdf = ggx_pdf(alpha_val, n, wo, d);
 
                 Some(BsdfSample {
-                    scattered: Ray { o: hit.p + hit.ray_eps * d, d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
                     weight: spec * (cos_o / pdf.max(1e-6)),
                     pdf,
                     is_delta: false,
@@ -194,7 +194,7 @@ impl Material {
                 // （hit.p 起点）と別の点を推定して MIS が不整合になるため撤去した。
                 let d = sample_cosine_hemisphere(n, rng);
                 Some(BsdfSample {
-                    scattered: Ray { o: hit.p + hit.ray_eps * d, d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
                     weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
@@ -382,7 +382,7 @@ mod tests {
     /// 下向きレイが床（法線 +Y）に当たる状況の Hit を作る。
     fn floor_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, ray_eps: 1e-4 };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
         (ray, hit)
     }
 
@@ -405,7 +405,7 @@ mod tests {
     fn oblique_hit(theta_o: f64) -> (Ray, Hit, Vec3) {
         let wo = Vec3::new(theta_o.sin(), theta_o.cos(), 0.0);
         let ray = Ray { o: wo * 2.0, d: -wo, time: 0.0 };
-        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, ray_eps: 1e-4 };
+        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
         (ray, hit, wo)
     }
 
@@ -612,7 +612,7 @@ mod tests {
     /// 下から上向きのレイが床（幾何法線 +Y）の裏面に当たる状況の Hit を作る。
     fn floor_backface_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, -1.0, 0.0), d: Vec3::new(0.0, 1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, ray_eps: 1e-4 };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
         (ray, hit)
     }
 
@@ -671,7 +671,7 @@ mod tests {
             let d = s.scattered.d;
             assert!(n.dot(d) >= 0.0, "direction not in oriented hemisphere");
             assert!(s.pdf > 0.0 || n.dot(d) < 1e-9, "pdf = {}", s.pdf);
-            let expected_o = hit.p + hit.ray_eps * d;
+            let expected_o = offset_ray_origin(hit.p, hit.p_error, hit.n, d);
             assert!((s.scattered.o - expected_o).len() < 1e-12);
         }
     }

@@ -4,7 +4,7 @@
 //! 法線変換用に逆転置行列を事前計算する。任意軸回転・非均一スケール・任意の
 //! 4×4 行列を表現できる。
 
-use crate::math::{Mat3, Vec3};
+use crate::math::{gamma, Mat3, Vec3};
 
 #[derive(Clone, Copy, Debug)]
 /// オブジェクト → ワールドのアフィン変換 `p' = A·p + t`。
@@ -17,13 +17,35 @@ pub struct Transform {
     a_inv: Mat3,
     /// 法線変換行列（線形部の逆転置）
     normal_mat: Mat3,
+    /// 数値的な逆行列の残差 `max |(A·A⁻¹ − I)_ij|`（ワールド → オブジェクト変換の誤差上界に使う。
+    /// 条件数の大きい変換ほど大きい）
+    inv_residual: f64,
+    /// `|A|`（成分の絶対値、誤差上界の伝播用に事前計算）
+    abs_a: Mat3,
+    /// `|A⁻¹|`
+    abs_a_inv: Mat3,
+    /// `‖A⁻¹‖∞`（行の絶対値和の最大）
+    inv_linf: f64,
 }
 
 impl Transform {
     /// 線形部 `a` と平行移動 `t` からアフィン変換を構築する。
     pub fn from_affine(a: Mat3, t: Vec3) -> Self {
         let a_inv = a.invert();
-        Self { a, t, a_inv, normal_mat: a_inv.transpose() }
+        let prod = a.mul(a_inv);
+        let mut inv_residual: f64 = 0.0;
+        for i in 0..3 {
+            for j in 0..3 {
+                let ideal = if i == j { 1.0 } else { 0.0 };
+                inv_residual = inv_residual.max((prod.m[i][j] - ideal).abs());
+            }
+        }
+        let abs = |m: Mat3| Mat3 { m: m.m.map(|row| row.map(f64::abs)) };
+        let inv_linf = a_inv.m.iter().map(|row| row.iter().map(|x| x.abs()).sum::<f64>()).fold(0.0, f64::max);
+        Self {
+            a, t, a_inv, normal_mat: a_inv.transpose(), inv_residual,
+            abs_a: abs(a), abs_a_inv: abs(a_inv), inv_linf,
+        }
     }
 
     /// 恒等変換。
@@ -74,6 +96,43 @@ impl Transform {
     /// オブジェクト空間の点をワールド空間へ: `p' = A·p + t`。
     pub fn apply_point(self, p: Vec3) -> Vec3 {
         self.a.mul_vec(p) + self.t
+    }
+
+    /// オブジェクト空間の点 `p`（成分ごとの誤差上界 `p_err`）をワールド空間へ写し、
+    /// ワールド空間の点と、その成分ごとの誤差上界を返す（PBRT の `Transform::operator()(Point3fi)`）。
+    /// 変換自体の丸め `γ(3)·(|A|·|p| + |t|)` と、入力の誤差の伝播 `(1 + γ(3))·|A|·p_err` の和。
+    pub fn apply_point_with_error(self, p: Vec3, p_err: Vec3) -> (Vec3, Vec3) {
+        let pw = self.a.mul_vec(p) + self.t;
+        let err = (self.abs_a.mul_vec(p.abs()) + self.t.abs()) * gamma(3) + self.abs_a.mul_vec(p_err) * (1.0 + gamma(3));
+        (pw, err)
+    }
+
+    /// ワールド空間の点（誤差なし）をオブジェクト空間へ写し、オブジェクト空間の点と成分ごとの誤差上界を返す。
+    /// 平行移動の引き算・行列積の丸めに加え、数値的な逆行列が厳密な逆でないこと（残差 × |A⁻¹|）も含める。
+    pub fn apply_point_inv_with_error(self, p_world: Vec3) -> (Vec3, Vec3) {
+        let diff = p_world - self.t;
+        let diff_err = (p_world.abs() + self.t.abs()) * gamma(1);
+        let p = self.a_inv.mul_vec(diff);
+        let residual = self.inv_residual * diff.l1();
+        // |A⁻¹|·(γ(3)·|diff| + (1 + γ(3))·(diff_err + residual)) を 1 回の行列積で
+        let g = 1.0 + gamma(3);
+        let err = self.abs_a_inv.mul_vec(diff.abs() * gamma(3) + (diff_err + Vec3::new(residual, residual, residual)) * g);
+        (p, err)
+    }
+
+    /// ワールド空間の点をオブジェクト空間へ写し、全成分共通の誤差上界（L∞）と一緒に返す。
+    /// [`apply_point_inv_with_error`](Self::apply_point_inv_with_error) の成分ごとの上界を安価に上から抑えたもの
+    /// （インスタンスごと・レイごとに呼ぶため）:
+    /// `‖A⁻¹‖∞ · (γ(3)·‖d‖∞ + (1 + γ(3))·(γ(1)·(‖p‖∞ + ‖t‖∞) + 3·残差·‖d‖∞))`、d = p − t。
+    /// 引き算の丸めは座標の大きさに、行列積と逆行列の残差は平行移動からの距離 d に比例する。
+    #[inline]
+    pub fn apply_point_inv_with_error_linf(&self, p_world: Vec3) -> (Vec3, f64) {
+        let diff = p_world - self.t;
+        let p = self.a_inv.mul_vec(diff);
+        let dl = diff.max_abs();
+        let g3 = gamma(3);
+        let err = self.inv_linf * (g3 * dl + (1.0 + g3) * (gamma(1) * (p_world.max_abs() + self.t.max_abs()) + 3.0 * self.inv_residual * dl));
+        (p, err * (1.0 + 2.0 * g3))
     }
 
     /// ワールド空間の点をオブジェクト空間へ: `p = A⁻¹·(p' − t)`。

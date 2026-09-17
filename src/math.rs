@@ -78,6 +78,20 @@ impl Vec3 {
     pub fn clamp01(self) -> Vec3 { self.max(0.0).min(1.0) }
     /// Component-wise multiplication.
     pub fn hadamard(self, b: Vec3) -> Vec3 { Vec3::new(self.x*b.x, self.y*b.y, self.z*b.z) }
+    /// 成分ごとの絶対値。
+    pub fn abs(self) -> Vec3 { Vec3::new(self.x.abs(), self.y.abs(), self.z.abs()) }
+    /// 成分の絶対値の最大（L∞ ノルム）。
+    pub fn max_abs(self) -> f64 { self.x.abs().max(self.y.abs()).max(self.z.abs()) }
+    /// 成分の絶対値の和（L1 ノルム）。
+    pub fn l1(self) -> f64 { self.x.abs() + self.y.abs() + self.z.abs() }
+}
+
+/// 浮動小数点の誤差上界の係数 γ(n) = nε / (1 − nε)（ε = f64::EPSILON / 2、PBRT の `gamma`）。
+/// n 回の加減乗算を経た値の相対誤差の上界に使う。
+#[inline]
+pub fn gamma(n: u32) -> f64 {
+    let e = f64::EPSILON * 0.5 * n as f64;
+    e / (1.0 - e)
 }
 use std::ops::{Add, Sub, Mul, Div, Neg};
 impl Add for Vec3 { type Output = Vec3; fn add(self, b: Vec3) -> Vec3 { Vec3::new(self.x+b.x, self.y+b.y, self.z+b.z) } }
@@ -124,6 +138,16 @@ impl Mat3 {
             }
         }
         Mat3 { m: r }
+    }
+
+    /// 成分の絶対値を取った行列とベクトル（非負）の積 `|self| · v`（誤差上界の伝播用）。
+    pub fn abs_mul_vec(self, v: Vec3) -> Vec3 {
+        let m = self.m;
+        Vec3::new(
+            m[0][0].abs() * v.x + m[0][1].abs() * v.y + m[0][2].abs() * v.z,
+            m[1][0].abs() * v.x + m[1][1].abs() * v.y + m[1][2].abs() * v.z,
+            m[2][0].abs() * v.x + m[2][1].abs() * v.y + m[2][2].abs() * v.z,
+        )
     }
 
     /// ベクトルとの積 `self · v`。

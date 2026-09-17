@@ -242,7 +242,8 @@ impl Bvh {
         stack_buf[sp] = 0;
         sp += 1;
         let mut heap_stack: Vec<i32> = Vec::new();
-        let mut best: Option<Hit> = None;
+        // 最近接候補は (三角形, t, u, v) だけを保持し、交差点と誤差上界は最後に 1 回だけ計算する
+        let mut best: Option<(usize, f64, f64, f64)> = None;
 
         macro_rules! push_id {
             ($id:expr) => {{
@@ -283,10 +284,9 @@ impl Bvh {
                 let start = n.start as usize;
                 let end = start + n.count as usize;
                 for &ti in &self.indices[start..end] {
-                    if let Some(mut h) = tris[ti].hit(r, tmin, tmax) {
-                        h.prim_id = ti;
-                        tmax = h.t;
-                        best = Some(h);
+                    if let Some((t, u, v)) = tris[ti].intersect(r, tmin, tmax) {
+                        tmax = t;
+                        best = Some((ti, t, u, v));
                     }
                 }
             } else {
@@ -333,7 +333,11 @@ impl Bvh {
             }
         }
 
-        best
+        best.map(|(ti, t, u, v)| {
+            let mut h = tris[ti].hit_at(r, t, u, v);
+            h.prim_id = ti;
+            h
+        })
     }
 }
 
