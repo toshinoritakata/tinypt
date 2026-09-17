@@ -57,6 +57,9 @@ pub struct Instance {
     pub mat_override: Option<usize>,
 }
 
+/// インスタンスの交差判定で、ワールド空間の tmin 判定に却下された面の先を探し直す最大回数。
+const INSTANCE_RETRY_LIMIT: usize = 4;
+
 /// ジオメトリ・インスタンス・ライトの集合体。
 ///
 /// ジオメトリの追加は [`add_sphere`](World::add_sphere) /
@@ -156,31 +159,41 @@ impl World {
             let d_obj = d_obj_raw / d_len; // stabilize
             let r_obj = Ray { o: o_obj, d: d_obj, time: r.time };
 
-            // 現在の最近接距離を物体空間に写して BVH の枝刈りに使う。
-            // |r.d| = 1 なので t_obj = t_world·|A⁻¹d|。丸めで境界上の候補を落とさないよう
-            // 相対マージンを付ける（最終的な採否は下のワールド空間 t 判定が行うので結果は不変）。
-            // tmin は従来どおり物体空間にそのまま渡す（スケールすると自己交差の挙動が変わる）。
+            // ワールド空間の区間 (tmin, closest) を物体空間に写す。|r.d| = 1 なので t_obj = t_world·|A⁻¹d|。
+            // 丸めで境界上の候補を落とさないよう、両端とも相対 1e-9 だけ外側に広げる（採否は下の
+            // ワールド空間 t 判定が決めるので、広げても結果は変わらない）。tmin も同じく写す: 写さないと
+            // 拡大インスタンスでは近い面を取りこぼし（t_obj < tmin）、縮小インスタンスでは自己交差回避の
+            // 帯の中の面を BVH が返してしまう。
+            let tmin_obj = tmin * d_len * (1.0 - 1e-9);
             let tmax_obj = closest * d_len * (1.0 + 1e-9);
 
-            // Object-space BVH
-            if let Some(h_obj) = mesh.hit(r_obj, tmin, tmax_obj) {
+            // Object-space BVH。ワールド空間の判定で「近すぎる」（t_world <= tmin）と却下された場合は、
+            // 丸めで帯の内側に入った面なので、その面より先から同じインスタンスを探し直す（奥の面を
+            // 取りこぼさないため）。同一平面に重なった面が帯に多数あっても止まるよう回数を制限する。
+            let mut search_from = tmin_obj;
+            for _ in 0..=INSTANCE_RETRY_LIMIT {
+                let Some(h_obj) = mesh.hit(r_obj, search_from, tmax_obj) else { break };
                 let p_world = inst.xform.apply_point(h_obj.p);
-                let n_world = inst.xform.apply_normal(h_obj.n);
 
                 // r.d is normalized in Camera::ray()
                 let t_world = (p_world - r.o).dot(r.d);
-                if t_world > tmin && t_world < closest {
+                if t_world <= tmin {
+                    search_from = h_obj.t.next_up();
+                    continue;
+                }
+                if t_world < closest {
                     closest = t_world;
                     let mat_id = inst.mat_override.unwrap_or(h_obj.mat_id);
                     best = Some(Hit {
                         t: t_world,
                         p: p_world,
-                        n: n_world,
+                        n: inst.xform.apply_normal(h_obj.n),
                         mat_id,
                         prim_id: h_obj.prim_id,
                         inst_id: Some(inst_id),
                     });
                 }
+                break;
             }
         }
 
@@ -540,18 +553,28 @@ mod tests {
         world
     }
 
-    /// 旧実装（インスタンス BVH に tmax=1e30 を渡す）と同じ結果を返すことを確認するための参照実装。
+    /// 枝刈りなし（インスタンス BVH に tmax = 1e30）の参照実装。tmin の写像と再探索の規則は World::hit と同じ。
+    /// 枝刈り距離の誤りをビット単位で検出するために使う。
     fn hit_without_instance_pruning(world: &World, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
         let mut closest = tmax;
         let mut best: Option<Hit> = None;
         for (inst_id, inst) in world.instances.iter().enumerate() {
             let mesh = &world.meshes[inst.mesh_id];
             let o_obj = inst.xform.apply_point_inv(r.o);
-            let d_obj = inst.xform.apply_vec_inv(r.d).norm();
-            if let Some(h_obj) = mesh.hit(Ray { o: o_obj, d: d_obj, time: r.time }, tmin, 1e30) {
+            let d_raw = inst.xform.apply_vec_inv(r.d);
+            let d_len = d_raw.len().max(1e-30);
+            let r_obj = Ray { o: o_obj, d: d_raw / d_len, time: r.time };
+            // World::hit と同じ tmin の写像・再探索の規則で、tmax だけ無制限（枝刈りなし）
+            let mut search_from = tmin * d_len * (1.0 - 1e-9);
+            for _ in 0..=INSTANCE_RETRY_LIMIT {
+                let Some(h_obj) = mesh.hit(r_obj, search_from, 1e30) else { break };
                 let p_world = inst.xform.apply_point(h_obj.p);
                 let t_world = (p_world - r.o).dot(r.d);
-                if t_world > tmin && t_world < closest {
+                if t_world <= tmin {
+                    search_from = h_obj.t.next_up();
+                    continue;
+                }
+                if t_world < closest {
                     closest = t_world;
                     best = Some(Hit {
                         t: t_world,
@@ -562,6 +585,7 @@ mod tests {
                         inst_id: Some(inst_id),
                     });
                 }
+                break;
             }
         }
         for (idx, s) in world.spheres.iter().enumerate() {
@@ -589,7 +613,49 @@ mod tests {
         }
     }
 
-    /// インスタンス BVH を最近接距離で枝刈りしても、結果（t・点・法線・ID）はビット単位で不変。
+    /// ワールド空間の総当たり参照: 全インスタンスの全三角形をワールド座標に変換して直接交差判定する
+    /// （インスタンス変換・物体空間の tmin/tmax の写像に依存しない独立な実装）。球も含む。
+    fn hit_world_brute_force(world: &World, r: Ray, tmin: f64, tmax: f64) -> Option<(f64, Option<usize>, usize)> {
+        let mut closest = tmax;
+        let mut best = None;
+        for (inst_id, inst) in world.instances.iter().enumerate() {
+            for (tri_id, t) in world.meshes[inst.mesh_id].tris.iter().enumerate() {
+                let w = Triangle::new_static(inst.xform.apply_point(t.v0_0), inst.xform.apply_point(t.v1_0), inst.xform.apply_point(t.v2_0), t.mat_id);
+                if let Some(h) = w.hit(r, tmin, closest) {
+                    closest = h.t;
+                    best = Some((h.t, Some(inst_id), tri_id));
+                }
+            }
+        }
+        for (idx, s) in world.spheres.iter().enumerate() {
+            if let Some(h) = s.hit(r, tmin, closest) {
+                closest = h.t;
+                best = Some((h.t, None, idx));
+            }
+        }
+        best
+    }
+
+    /// World::hit とワールド空間総当たりが一致するか（計算経路が違うので t は相対 1e-7 で比較）。
+    /// 片方だけがヒットする場合は、そのヒットが tmin / tmax の境界（相対 1e-6 以内）にあるときだけ許す。
+    /// ID が違う場合は、t が一致する重なり面（同一平面・一致インスタンス）なら許す。
+    fn check_against_brute_force(world: &World, r: Ray, tmin: f64, tmax: f64, what: &str) {
+        let a = world.hit(r, tmin, tmax);
+        let b = hit_world_brute_force(world, r, tmin, tmax);
+        let near_bound = |t: f64| (t - tmin).abs() <= 1e-6 * tmin.max(t) || (t - tmax).abs() <= 1e-6 * tmax.max(t);
+        match (a, b) {
+            (None, None) => {}
+            (Some(h), None) => assert!(near_bound(h.t), "{}: World::hit found t={} (inst {:?}) but brute force found nothing", what, h.t, h.inst_id),
+            (None, Some((t, inst, _))) => assert!(near_bound(t), "{}: brute force found t={} (inst {:?}) but World::hit found nothing", what, t, inst),
+            (Some(h), Some((t, inst, prim))) => {
+                assert!((h.t - t).abs() <= 1e-7 * t.max(1e-3), "{}: t {} vs brute force {} (inst {:?} vs {:?})", what, h.t, t, h.inst_id, inst);
+                let _ = prim;
+            }
+        }
+    }
+
+    /// インスタンス BVH を最近接距離で枝刈りしても、結果（t・点・法線・ID）はビット単位で不変で、
+    /// かつワールド空間の総当たりと一致する（tmin の写像・再探索の正しさ）。
     ///
     /// 枝刈り距離の誤り（相対マージンの撤去・`|A⁻¹d|` の掛け忘れ・`|A⁻¹d|` で割る）を
     /// 検出できるよう、次を含める:
@@ -663,6 +729,11 @@ mod tests {
             let r = Ray { o, d: (target - o).norm(), time: 0.0 };
             let a = world.hit(r, 1e-4, 1e30);
             assert_same_hit(a, hit_without_instance_pruning(&world, r, 1e-4, 1e30), "primary");
+            // 総当たりは重いので最初の 4000 本だけ（二次レイ・シャドウレイも同様）
+            let brute = queries < 12_000;
+            if brute {
+                check_against_brute_force(&world, r, 1e-4, 1e30, "primary/brute");
+            }
             queries += 1;
             let Some(h) = a else { continue };
             primary_hits += 1;
@@ -671,6 +742,9 @@ mod tests {
             let d2 = uniform_sphere_dir(&mut rng);
             let r2 = Ray { o: h.p + 1e-4 * d2, d: d2, time: 0.0 };
             assert_same_hit(world.hit(r2, 1e-4, 1e30), hit_without_instance_pruning(&world, r2, 1e-4, 1e30), "secondary");
+            if brute {
+                check_against_brute_force(&world, r2, 1e-4, 1e30, "secondary/brute");
+            }
 
             // シャドウレイ（有限 tmax。別インスタンス内の点へ）
             let other = (rng.next_f64() * n_inst as f64) as usize % n_inst;
@@ -682,10 +756,92 @@ mod tests {
                 let r3 = Ray { o: h.p + 1e-4 * d3, d: d3, time: 0.0 };
                 let tmax = (dist - 2e-4).max(1e-4);
                 assert_same_hit(world.hit(r3, 1e-4, tmax), hit_without_instance_pruning(&world, r3, 1e-4, tmax), "shadow");
+                if brute {
+                    check_against_brute_force(&world, r3, 1e-4, tmax, "shadow/brute");
+                }
             }
             queries += 2;
         }
         assert!(primary_hits > 10_000, "too few hits to be meaningful: {} of {}", primary_hits, queries);
+    }
+
+    /// z = 0 と z = `gap` の 2 枚の板（xy は [-1, 1]）を `s` 倍に拡大縮小したインスタンスだけのワールド。
+    fn two_plates_world(gap: f64, s: f64) -> World {
+        let quad = |z: f64| {
+            vec![
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, -1.0, z), Vec3::new(1.0, 1.0, z), 0),
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(-1.0, 1.0, z), 0),
+            ]
+        };
+        let mut world = World::new();
+        let tris: Vec<Triangle> = quad(0.0).into_iter().chain(quad(gap)).collect();
+        world.add_mesh_instance(tris, Transform::scale(Vec3::new(s, s, s)), None);
+        world
+    }
+
+    /// ケース A（verify_batch1 の tminprobe）: ×100 の拡大インスタンスで、ワールド距離 0.005（> tmin）にある
+    /// 手前の板に当たる。旧実装は物体空間の t = 5e-5 < tmin で手前の板を取りこぼし、奥の板（t ≈ 100）に当たっていた。
+    #[test]
+    fn scaled_up_instance_keeps_near_surface_beyond_tmin() {
+        let world = two_plates_world(1.0, 100.0);
+        let r = Ray { o: Vec3::new(0.3, -0.2, -0.005), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        let h = world.hit(r, 1e-4, 1e30).expect("hit");
+        assert!((h.t - 0.005).abs() < 1e-9, "t = {}", h.t);
+    }
+
+    /// ケース B（verify_batch1 の tminprobe）: ×0.01 の縮小インスタンス（板はワールド z = 0 と z = 1）で、
+    /// 始点が手前の板の 5e-6（< tmin）手前。手前の板は自己交差回避の帯の中なので無視し、奥の板（t ≈ 1）に
+    /// 当たる。旧実装は物体空間で手前の板を返し、ワールド判定で却下してインスタンスごと None になっていた。
+    #[test]
+    fn scaled_down_instance_skips_surface_inside_tmin_and_finds_far_one() {
+        let world = two_plates_world(100.0, 0.01);
+        let r = Ray { o: Vec3::new(0.001, 0.002, -5e-6), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        let h = world.hit(r, 1e-4, 1e30).expect("the far plate must be found");
+        assert!((h.t - (1.0 + 5e-6)).abs() < 1e-9, "t = {}", h.t);
+    }
+
+    /// ケース C: 丸めで帯の境界に落ちる面。手前の板がワールド距離 tmin·(1 − 5e-10) にあると、物体空間では
+    /// 広げた下限 tmin_obj を超えるので BVH が返すが、ワールド判定では t <= tmin で却下される。この場合も
+    /// 再探索で同じインスタンスの奥の板が見つかる（再探索がないと None になる）。
+    #[test]
+    fn rejected_near_surface_retries_same_instance() {
+        let tmin = 1e-4;
+        let world = two_plates_world(100.0, 0.01);
+        let r = Ray { o: Vec3::new(0.001, 0.002, -tmin * (1.0 - 5e-10)), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        // 前提の確認: 物体空間では手前の板が下限を超える
+        let inst = &world.instances[0];
+        let d_len = inst.xform.apply_vec_inv(r.d).len();
+        let t_obj_near = (0.0 - inst.xform.apply_point_inv(r.o).z) / (inst.xform.apply_vec_inv(r.d).z / d_len);
+        assert!(t_obj_near > tmin * d_len * (1.0 - 1e-9), "test setup: the near plate must pass the object-space lower bound");
+        let h = world.hit(r, tmin, 1e30).expect("the far plate must be found after retrying");
+        assert!((h.t - (1.0 + tmin * (1.0 - 5e-10))).abs() < 1e-9, "t = {}", h.t);
+    }
+
+    /// 同一平面の面が自己交差回避の帯の中に多数重なっていても、再探索は上限回数で止まる（無限ループしない）。
+    /// その場合、帯の先にある面は諦めて None を返しうる（退化した入力に対する割り切り）。
+    #[test]
+    fn retry_limit_terminates_on_many_faces_inside_tmin_band() {
+        let tmin = 1e-4;
+        let quad = |z: f64| {
+            vec![
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, -1.0, z), Vec3::new(1.0, 1.0, z), 0),
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(-1.0, 1.0, z), 0),
+            ]
+        };
+        let mut world = World::new();
+        // 帯の中（ワールド距離 tmin の直前）に、わずかに z がずれた 20 枚。奥に 1 枚。
+        let mut tris = Vec::new();
+        for k in 0..20 {
+            tris.extend(quad(k as f64 * 1e-12));
+        }
+        tris.extend(quad(0.5));
+        world.add_mesh_instance(tris, Transform::identity(), None);
+        let r = Ray { o: Vec3::new(0.1, 0.1, -tmin * (1.0 - 1e-6)), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        // 終了すること自体が要件。結果は奥の板か None のどちらか
+        match world.hit(r, tmin, 1e30) {
+            None => {}
+            Some(h) => assert!((h.t - (0.5 + tmin * (1.0 - 1e-6))).abs() < 1e-9, "t = {}", h.t),
+        }
     }
 
     /// build_lights の重み = 面積 × 輝度（Light::area と共有された面積計算）。

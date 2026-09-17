@@ -626,11 +626,11 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 6;
+    const GOLDEN_REVISION: u32 = 7;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM のハッシュ。
-    const GOLDEN_CORNELL: (u64, u64) = (0x5156_c9fc_0c95_100e, 0xc733_0a4b_cf8f_a88d);
+    const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0xdd80_3964_fecc_5c3c);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
     const GOLDEN_SPHERES: (u64, u64) = (0xc55c_f4c9_e03c_de16, 0xf4e9_ab88_c297_cdc3);

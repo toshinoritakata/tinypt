@@ -525,6 +525,26 @@ mod tests {
         }
     }
 
+    /// 白炉テスト（拡散）: 一様な環境光 L = 1 の中の凸な Lambert 球（アルベド 0.8）は、どこから見ても 0.8
+    /// （反射光は球に再び当たらない）。rr_depth = 1 で RR を最初の頂点から効かせても平均が 0.8 に一致する。
+    /// 環境光の BSDF 側の MIS の取り分が大きいので、生存時の 1/p の補償を忘れると大きくずれる
+    /// （ガラスの白炉テストとは独立に、拡散経路で RR の補償を検証する）。
+    #[test]
+    fn lambert_sphere_white_furnace_is_unbiased_with_russian_roulette() {
+        use crate::geometry::Sphere;
+        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }];
+        let mut world = World::new();
+        world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 0 });
+        world.build_lights(&mats);
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        for (rr_depth, target_y) in [(1usize, 0.0), (1, 0.7), (2, 0.3)] {
+            let o = Vec3::new(0.0, 0.0, 5.0);
+            let ray = Ray { o, d: (Vec3::new(0.0, target_y, 0.0) - o).norm(), time: 0.0 };
+            let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 17);
+            assert!((mean - 0.8).abs() < 5.0 * se + 1e-3, "rr_depth={} y={}: {} ± {} vs 0.8", rr_depth, target_y, mean, se);
+        }
+    }
+
     /// 負値チャネルを含む色は黒扱いしない（寄与を変えないため輝度判定を使わない）。
     #[test]
     fn is_black_is_exact_per_channel() {
