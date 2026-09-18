@@ -176,6 +176,26 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/mesh.xml` | OBJ メッシュ (立方体) + transform/instance |
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
 | `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
+| `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
+
+
+#### 高ポリゴン検証シーン
+
+`sample/highpoly.xml` は、読み込み・BVH 構築・描画の性能を確かめるための高ポリゴンシーン
+(変位地形 + トーラス結び目のチューブ + 中規模メッシュ 36 インスタンス + 面光源 + 弱い環境光)。
+OBJ は 100 万三角形で 30MB を超えるためリポジトリには入っていない。**先に生成すること**:
+
+```bash
+python3 tools/gen_highpoly.py                   # 既定: シーン全体で約 100 万三角形
+python3 tools/gen_highpoly.py --tris 5000000    # 三角形数を変える (100 万 → 500 万)
+./target/release/tinypt --scene sample/highpoly.xml --spp 128 -o renders/highpoly.ppm
+```
+
+生成先は `assets/highpoly/` (`.gitignore` の `*.obj` で無視される。`sample/` は
+`!sample/**` で無視が打ち消されるので、そこには置かないこと)。`--tris` を変えても
+シーン XML は変更不要 — OBJ のファイル名とインスタンス配置は固定で、分割数だけが変わる。
+OBJ が無いまま実行すると shape ごとに `failed to load obj ...; skipped` と警告が出て、
+そのメッシュ抜きで描画が続く。全 OBJ が欠けると、ジオメトリの無い環境光だけの一様な青灰色のフレーム (画素平均 87/255) になり、真っ黒にはならないので、警告を見落とさないこと。
 
 ```bash
 ./target/release/tinypt --scene sample/mesh.xml -o mesh.ppm

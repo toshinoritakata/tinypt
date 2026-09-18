@@ -1,0 +1,393 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 高ポリゴン・テストシーン（読み込み / BVH 構築 / 描画の性能確認用）。
+
+     OBJ はリポジトリに入っていない。先に生成すること:
+         python3 tools/gen_highpoly.py            # 既定 約 993858 三角形
+         python3 tools/gen_highpoly.py --tris 5000000
+     生成物はこの XML から見て ../assets/highpoly/ に置かれる（.gitignore の *.obj で無視される）。
+     OBJ が無いと各 shape が "failed to load obj ...; skipped" と警告され、
+     そのメッシュ抜きで描画が続く点に注意（全 OBJ が欠けても真っ黒にはならず、環境光だけの一様な青灰色のフレームになる）。
+
+     構成: トーラス結び目のチューブ（密で均一な三角形）+ 変位地形（薄く広い、
+     細長い三角形混じり）+ 中規模メッシュ 36 インスタンス（diffuse /
+     roughconductor / dielectric）+ 天井の面光源 + 弱い constant 環境光。
+
+     使い方: tinypt --scene sample/highpoly.xml --spp 16 -o renders/highpoly.ppm -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="12"/>
+    <integer name="rr_depth" value="5"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="16"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="800"/>
+    <integer name="height" value="600"/>
+  </film>
+
+  <sensor type="perspective">
+    <float name="fov" value="42"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0, 4.4, 10.5" target="0, 1.0, -1.0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 変位地形（薄く広がるメッシュ） -->
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_terrain.obj"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.42, 0.45, 0.40"/></bsdf>
+  </shape>
+
+  <!-- トーラス結び目のチューブ（密で大きさの揃った三角形） -->
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_knot.obj"/>
+    <transform name="to_world">
+      <translate x="0" y="2.3" z="0"/>
+      <rotate x="1" y="0" z="0" angle="-20"/>
+      <scale value="1.35"/>
+    </transform>
+    <bsdf type="roughconductor">
+      <string name="distribution" value="ggx"/>
+      <float name="alpha" value="0.14"/>
+      <srgb name="specular_reflectance" value="0.95, 0.80, 0.42"/>
+    </bsdf>
+  </shape>
+
+  <!-- 中規模メッシュ（5400 三角形）の 6x6 インスタンス。tinypt は shape ごとに
+       OBJ を読み直して Mesh を作るので、ここは読み込みと BVH 構築の負荷でもある。 -->
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-5.600" y="0.510" z="-5.600"/>
+      <rotate x="0" y="1" z="0" angle="0"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-3.360" y="0.535" z="-5.600"/>
+      <rotate x="0" y="1" z="0" angle="37"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-1.120" y="0.560" z="-5.600"/>
+      <rotate x="0" y="1" z="0" angle="74"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="1.120" y="0.523" z="-5.600"/>
+      <rotate x="0" y="1" z="0" angle="111"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="3.360" y="0.548" z="-5.600"/>
+      <rotate x="0" y="1" z="0" angle="148"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="5.600" y="0.510" z="-5.600"/>
+      <rotate x="0" y="1" z="0" angle="185"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-5.600" y="0.548" z="-3.360"/>
+      <rotate x="0" y="1" z="0" angle="53"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-3.360" y="0.510" z="-3.360"/>
+      <rotate x="0" y="1" z="0" angle="90"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-1.120" y="0.535" z="-3.360"/>
+      <rotate x="0" y="1" z="0" angle="127"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="1.120" y="0.560" z="-3.360"/>
+      <rotate x="0" y="1" z="0" angle="164"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="3.360" y="0.523" z="-3.360"/>
+      <rotate x="0" y="1" z="0" angle="201"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="5.600" y="0.548" z="-3.360"/>
+      <rotate x="0" y="1" z="0" angle="238"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-5.600" y="0.523" z="-1.120"/>
+      <rotate x="0" y="1" z="0" angle="106"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-3.360" y="0.548" z="-1.120"/>
+      <rotate x="0" y="1" z="0" angle="143"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-1.120" y="0.510" z="-1.120"/>
+      <rotate x="0" y="1" z="0" angle="180"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="1.120" y="0.535" z="-1.120"/>
+      <rotate x="0" y="1" z="0" angle="217"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="3.360" y="0.560" z="-1.120"/>
+      <rotate x="0" y="1" z="0" angle="254"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="5.600" y="0.523" z="-1.120"/>
+      <rotate x="0" y="1" z="0" angle="291"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-5.600" y="0.560" z="1.120"/>
+      <rotate x="0" y="1" z="0" angle="159"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-3.360" y="0.523" z="1.120"/>
+      <rotate x="0" y="1" z="0" angle="196"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-1.120" y="0.548" z="1.120"/>
+      <rotate x="0" y="1" z="0" angle="233"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="1.120" y="0.510" z="1.120"/>
+      <rotate x="0" y="1" z="0" angle="270"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="3.360" y="0.535" z="1.120"/>
+      <rotate x="0" y="1" z="0" angle="307"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="5.600" y="0.560" z="1.120"/>
+      <rotate x="0" y="1" z="0" angle="344"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-5.600" y="0.535" z="3.360"/>
+      <rotate x="0" y="1" z="0" angle="212"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-3.360" y="0.560" z="3.360"/>
+      <rotate x="0" y="1" z="0" angle="249"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-1.120" y="0.523" z="3.360"/>
+      <rotate x="0" y="1" z="0" angle="286"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="1.120" y="0.548" z="3.360"/>
+      <rotate x="0" y="1" z="0" angle="323"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="3.360" y="0.510" z="3.360"/>
+      <rotate x="0" y="1" z="0" angle="0"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="5.600" y="0.535" z="3.360"/>
+      <rotate x="0" y="1" z="0" angle="37"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-5.600" y="0.510" z="5.600"/>
+      <rotate x="0" y="1" z="0" angle="265"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-3.360" y="0.535" z="5.600"/>
+      <rotate x="0" y="1" z="0" angle="302"/>
+      <scale value="0.390"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="-1.120" y="0.560" z="5.600"/>
+      <rotate x="0" y="1" z="0" angle="339"/>
+      <scale value="0.440"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.80, 0.35, 0.28"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="1.120" y="0.523" z="5.600"/>
+      <rotate x="0" y="1" z="0" angle="16"/>
+      <scale value="0.365"/>
+    </transform>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.12"/><srgb name="specular_reflectance" value="0.92, 0.90, 0.88"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="3.360" y="0.548" z="5.600"/>
+      <rotate x="0" y="1" z="0" angle="53"/>
+      <scale value="0.415"/>
+    </transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <shape type="obj">
+    <string name="filename" value="../assets/highpoly/hp_blob.obj"/>
+    <transform name="to_world">
+      <translate x="5.600" y="0.510" z="5.600"/>
+      <rotate x="0" y="1" z="0" angle="90"/>
+      <scale value="0.340"/>
+    </transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.55, 0.80"/></bsdf>
+  </shape>
+
+  <!-- 天井の面光源（下向き） -->
+  <shape type="rectangle">
+    <transform name="to_world">
+      <translate x="0" y="7.0" z="1.5"/><rotate x="1" angle="90"/><scale value="2.2"/>
+    </transform>
+    <emitter type="area"><rgb name="radiance" value="7.5, 7.0, 6.2"/></emitter>
+  </shape>
+
+  <!-- 弱い環境光（env NEE / MIS も通す） -->
+  <emitter type="constant"><rgb name="radiance" value="0.05, 0.08, 0.13"/></emitter>
+</scene>
