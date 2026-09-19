@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Rungholt（Minecraft の中世風の街 "Neu Rungholt"）を俯瞰する屋外シーン。
+     670 万三角形で、このリポジトリで扱う中では最大のシーン。
+
+     モデルはリポジトリに入っていない。先に取得すること:
+         tools/fetch_models.sh rungholt
+     展開先は assets/models/rungholt/（.gitignore 済み）。6,704,264 三角形。
+
+     出典: Morgan McGuire, Computer Graphics Archive, July 2017
+           (https://casual-effects.com/data)
+     Rungholt: CC BY 3.0, (c) kescha（Mineways で OBJ 化）
+
+     単位は m（1 ブロック = 1m）で 655m x 69m x 550m。スケール変換は不要。
+     MTL / テクスチャは未対応なので全体に 1 つの diffuse を割り当てている
+     （Minecraft のブロック形状そのものが陰影を作るので、単色でも街並みが読める）。
+
+     照明: 高所の面光源（太陽相当、斜め上から）+ constant の空。両方 NEE が効く。
+
+     使い方: tinypt --scene sample/rungholt.xml --spp 64 -o renders/rungholt.ppm -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="12"/>
+    <integer name="rr_depth" value="5"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="64"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="960"/>
+    <integer name="height" value="540"/>
+  </film>
+
+  <!-- 南東の上空から街の中心を見下ろす -->
+  <sensor type="perspective">
+    <float name="fov" value="45"/>
+    <string name="fov_axis" value="x"/>
+    <transform name="to_world">
+      <lookat origin="300, 165, 320" target="0, 10, -20" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <shape type="obj">
+    <string name="filename" value="../assets/models/rungholt/rungholt.obj"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.62, 0.60, 0.55"/></bsdf>
+  </shape>
+
+  <!-- 太陽相当の面光源（北西の高所、下向き） -->
+  <shape type="rectangle">
+    <transform name="to_world">
+      <translate x="-260" y="420" z="-220"/><rotate x="1" angle="90"/><scale value="70"/>
+    </transform>
+    <emitter type="area"><rgb name="radiance" value="110.0, 102.0, 86.0"/></emitter>
+  </shape>
+
+  <!-- 空 -->
+  <emitter type="constant"><rgb name="radiance" value="0.30, 0.42, 0.62"/></emitter>
+</scene>

@@ -9,3 +9,5 @@
 *.textClipping
 !sample/**
 /renders/
+# 外部モデル・生成メッシュの置き場（tools/fetch_models.sh / tools/gen_highpoly.py の出力）
+/assets/

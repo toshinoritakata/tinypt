@@ -105,6 +105,11 @@ cargo run --release -- [オプション]
 
 PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 で 23.9 MB) からバイナリ形式 (P6、6,220,817 バイト = 17 バイトのヘッダ + 1920 × 1080 × 3) に変わった。画素値は同じで、P3 のファイルを期待するツールで読む場合は変換が必要。
 
+**再現性はファイル単位ではなく画素単位**: 同じ設定なら画素値はスレッド数に依らず再現するが (`--seed`)、
+`.exr` だけは**同じ画素値でもファイルがバイト単位で一致しない** (圧縮ブロックの都合。同一シーン・同一 seed で
+2 回描くと、サイズは同じまま数十万バイト分が異なる)。`.ppm` と `.hdr` は 2 回描いてもバイト単位で一致する。
+回帰比較にハッシュを使うなら `.ppm` か `.hdr` を使うか、`.exr` はデコードして画素値で比べること。
+
 ### アダプティブサンプリングのバイアス
 
 `--adaptive` は、各画素で `--adaptive-min-spp` 以上のサンプルを取った後、サンプルの輝度の相対標準偏差 (標本標準偏差 / max(|平均|, 1e-4)。ほぼ黒い画素はすぐ打ち切られる) が `--adaptive-threshold` を下回った時点でその画素のサンプリングを打ち切り、それまでのサンプルの平均を出力する。**打ち切るかどうかを、平均を取るのと同じサンプルで決めるため、この推定は不偏ではない** (停止規則によるバイアス)。
@@ -177,6 +182,8 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
 | `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
 | `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
+| `sample/sponza.xml` | Crytek Sponza (262,267 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |
+| `sample/rungholt.xml` | Rungholt (6,704,264 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |
 
 
 #### 高ポリゴン検証シーン
@@ -196,6 +203,34 @@ python3 tools/gen_highpoly.py --tris 5000000    # 三角形数を変える (100 
 シーン XML は変更不要 — OBJ のファイル名とインスタンス配置は固定で、分割数だけが変わる。
 OBJ が無いまま実行すると shape ごとに `failed to load obj ...; skipped` と警告が出て、
 そのメッシュ抜きで描画が続く。全 OBJ が欠けると、ジオメトリの無い環境光だけの一様な青灰色のフレーム (画素平均 87/255) になり、真っ黒にはならないので、警告を見落とさないこと。
+
+
+#### 外部ベンチマークモデル (Sponza / Rungholt)
+
+広く使われている 2 つの公開モデルを取り込める。**モデルデータはリポジトリに入っていない**ので、
+取得スクリプトを先に実行すること (zip 合計 128MB、展開して 361MB。`assets/` は `.gitignore` 済み)。
+
+```bash
+tools/fetch_models.sh                # 両方 (既に展開済みならスキップ)
+tools/fetch_models.sh sponza         # 片方だけ
+./target/release/tinypt --scene sample/sponza.xml   --spp 256 -o renders/sponza.ppm
+./target/release/tinypt --scene sample/rungholt.xml --spp 512 -o renders/rungholt.ppm
+```
+
+| シーン | 三角形 | 内容 |
+|---|---:|---|
+| `sample/sponza.xml` | 262,267 | Crytek Sponza のアトリウム内部。モデルは cm 単位なので `to_world` で 0.01 倍している。MTL/テクスチャは未対応なので全体を 1 つの diffuse にし、BSDF の違いは床置きの球 3 個 (conductor / roughconductor / dielectric) で見る |
+| `sample/rungholt.xml` | 6,704,264 | Minecraft の街 "Neu Rungholt" を俯瞰。単位は m でスケール変換不要。全体を 1 つの diffuse に割り当て |
+
+どちらも「高所の面光源 (太陽相当) + `constant` の空」で照らしていて、面光源 NEE と環境 NEE の両方が効く。
+モデルが無いまま実行すると `failed to load obj ...; skipped` と警告が出た上で、終了コード 0 のままモデル抜きで
+描画が進む (Sponza は空に球 3 個だけ、Rungholt は空一色の画像になる)。その場合は `tools/fetch_models.sh` を実行すること。
+
+**出典・ライセンス**: Morgan McGuire, *Computer Graphics Archive*, July 2017
+(<https://casual-effects.com/data>)。
+Sponza Atrium は CC BY 3.0 / © 2010 Frank Meinl, Crytek (原型は 2002 年 Marko Dabrovic 作)、
+Rungholt は CC BY 3.0 / © kescha ("Neu Rungholt" を Mineways で OBJ 化)。
+再配布しないこと (スクリプトが配布元から直接取得する)。
 
 ```bash
 ./target/release/tinypt --scene sample/mesh.xml -o mesh.ppm
