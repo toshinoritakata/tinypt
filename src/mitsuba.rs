@@ -32,7 +32,7 @@ use crate::env::EnvMap;
 use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
-use crate::obj_loader::load_obj_triangles;
+use crate::obj_loader::{load_obj_mesh, MeshData};
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
@@ -84,6 +84,31 @@ impl Element {
         self.prop("string", name)?.attr("value")
     }
 
+    /// `<boolean name="..." value="true|false"/>` を既定値つきで読む。
+    ///
+    /// Mitsuba の boolean は `true` / `false` のみ（`1` / `yes` / `TRUE` は不正）。
+    /// 要素はあるのに値が解釈できない場合は**警告して既定値にフォールバック**する。
+    /// 黙って既定値にすると `value="1"` と書いた人が逆の挙動を静かに得てしまうため
+    /// （README の「未対応の要素・型・属性は警告してスキップ」に合わせる）。
+    fn boolean_or(&self, name: &str, default: bool) -> bool {
+        let Some(e) = self.prop("boolean", name) else { return default };
+        match e.attr("value").map(str::trim) {
+            Some("true") => true,
+            Some("false") => false,
+            Some(other) => {
+                warn(&format!(
+                    "boolean '{}' has invalid value '{}' (expected true or false); using {}",
+                    name, other, default
+                ));
+                default
+            }
+            None => {
+                warn(&format!("boolean '{}' has no value attribute; using {}", name, default));
+                default
+            }
+        }
+    }
+
     /// `point` プロパティ（`x`/`y`/`z` 属性または `value="x,y,z"`）。
     fn point(&self, name: &str) -> Option<Vec3> {
         let e = self.prop("point", name)?;
@@ -126,8 +151,31 @@ fn parse_vec3(s: &str) -> Option<Vec3> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// テスト中に `warn` が出したメッセージを記録するバッファ（[`capture_warnings`] が有効化する）。
+    /// 警告は stderr に出るだけなので、そのままでは「警告を出すこと」をテストできない。
+    static CAPTURED_WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn warn(msg: &str) {
+    #[cfg(test)]
+    CAPTURED_WARNINGS.with(|w| {
+        if let Some(v) = w.borrow_mut().as_mut() {
+            v.push(msg.to_string());
+        }
+    });
     eprintln!("[mitsuba] warning: {}", msg);
+}
+
+/// `f` の実行中に出た警告を集めて返す（同じスレッド内のみ。テスト専用）。
+#[cfg(test)]
+fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    CAPTURED_WARNINGS.with(|w| *w.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let msgs = CAPTURED_WARNINGS.with(|w| w.borrow_mut().take()).unwrap_or_default();
+    (out, msgs)
 }
 
 fn err(msg: &str) -> io::Error {
@@ -441,7 +489,11 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
     let mat_id = mats.len();
 
     // メッシュ系シェープの三角形（正準形オブジェクト空間）。
-    let tris: Vec<Triangle> = match el.typ() {
+    // Mitsuba の `face_normals`: true なら頂点法線を使わず面法線だけで陰影を付ける。
+    // 既定は false（= OBJ に頂点法線があれば補間する）。パラメトリック形状は元から
+    // 頂点法線を持たないので、この指定があっても結果は変わらない。
+    let face_normals = el.boolean_or("face_normals", false);
+    let mesh: MeshData = match el.typ() {
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
@@ -450,11 +502,11 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
             return;
         }
         // Mitsuba 正準形: 中心原点・法線 +Z・[-1,1]² の正方形
-        "rectangle" => unit_rectangle_tris(mat_id),
+        "rectangle" => MeshData::flat(unit_rectangle_tris(mat_id)),
         // Mitsuba 正準形: [-1,1]³ の立方体
-        "cube" => unit_cube_tris(mat_id),
+        "cube" => MeshData::flat(unit_cube_tris(mat_id)),
         // Mitsuba 正準形: z=0 平面の半径 1 の円盤
-        "disk" => unit_disk_tris(mat_id),
+        "disk" => MeshData::flat(unit_disk_tris(mat_id)),
         "obj" => {
             let filename = match el.string("filename") {
                 Some(f) => f,
@@ -464,8 +516,8 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
                 }
             };
             let resolved = resolve_path(base_dir, filename);
-            match load_obj_triangles(resolved.to_string_lossy().as_ref(), mat_id) {
-                Ok(t) => t,
+            match load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id) {
+                Ok(m) => if face_normals { m.into_flat() } else { m },
                 Err(e) => {
                     warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
                     return;
@@ -484,7 +536,7 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
         .map(parse_transform)
         .unwrap_or_else(Transform::identity);
     mats.push(mat);
-    world.add_mesh_instance(tris, xform, None);
+    world.add_mesh_data_instance(mesh, xform, None);
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -823,6 +875,87 @@ mod tests {
         assert_eq!(scene.world.meshes()[0].tris.len(), 2); // rectangle
         assert_eq!(scene.world.meshes()[1].tris.len(), 12); // cube
         assert_eq!(scene.world.meshes()[2].tris.len(), 64); // disk
+    }
+
+
+    /// `face_normals` の値が `true` / `false` 以外なら警告して既定（補間）にフォールバックする。
+    /// 黙って既定値にすると `value="1"` が逆の意味に解釈される。
+    #[test]
+    fn invalid_face_normals_value_warns_and_falls_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let obj = dir.join(format!("tinypt_fnbad_{}_{}.obj", std::process::id(), n));
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nvn 0 1 0\nvn 1 0 0\nf 1//1 2//2 3//3\n").unwrap();
+        let objname = obj.file_name().unwrap().to_string_lossy().into_owned();
+        let load = |flag: &str| {
+            let xml = format!(
+                r#"<scene version="3.0.0">
+                  <shape type="obj">
+                    <string name="filename" value="{}"/>{}
+                    <bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf>
+                  </shape>
+                </scene>"#,
+                objname, flag
+            );
+            let (r, warnings) = capture_warnings(|| load_scene_from_str(&xml, &dir, &cfg()).unwrap().0);
+            (r, warnings)
+        };
+        for bad in [r#"<boolean name="face_normals" value="1"/>"#,
+                    r#"<boolean name="face_normals" value="yes"/>"#,
+                    r#"<boolean name="face_normals" value="TRUE"/>"#,
+                    r#"<boolean name="face_normals"/>"#] {
+            let (scene, warnings) = load(bad);
+            assert!(scene.world.meshes()[0].is_smooth(), "{}: 既定（補間）にフォールバックする", bad);
+            assert!(
+                warnings.iter().any(|w| w.contains("face_normals")),
+                "{}: 警告が出ていない（warnings = {:?}）", bad, warnings
+            );
+        }
+        // 正しい値では警告を出さない
+        for good in ["", r#"<boolean name="face_normals" value="true"/>"#, r#"<boolean name="face_normals" value="false"/>"#] {
+            let (_, warnings) = load(good);
+            assert!(!warnings.iter().any(|w| w.contains("face_normals")), "{}: 余計な警告", good);
+        }
+        std::fs::remove_file(&obj).ok();
+    }
+
+    /// OBJ の頂点法線は既定で使われ、`<boolean name="face_normals" value="true"/>` で捨てられる。
+    /// パラメトリック形状（rectangle など）は元から頂点法線を持たないので、この指定で何も変わらない。
+    #[test]
+    fn face_normals_flag_controls_vertex_normal_use() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let obj = dir.join(format!("tinypt_fn_{}_{}.obj", std::process::id(), n));
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nvn 0 1 0\nvn 1 0 0\nf 1//1 2//2 3//3\n").unwrap();
+        let objname = obj.file_name().unwrap().to_string_lossy().into_owned();
+        let scene_of = |flag: &str| {
+            let xml = format!(
+                r#"<scene version="3.0.0">
+                  <shape type="obj">
+                    <string name="filename" value="{}"/>{}
+                    <bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf>
+                  </shape>
+                  <shape type="rectangle">{}<bsdf type="diffuse"/></shape>
+                </scene>"#,
+                objname, flag, flag
+            );
+            load_scene_from_str(&xml, &dir, &cfg()).unwrap().0
+        };
+        let smooth = scene_of("");
+        let flat = scene_of(r#"<boolean name="face_normals" value="true"/>"#);
+        let explicit_false = scene_of(r#"<boolean name="face_normals" value="false"/>"#);
+        std::fs::remove_file(&obj).ok();
+
+        assert!(smooth.world.meshes()[0].is_smooth(), "既定では頂点法線を使う");
+        assert!(explicit_false.world.meshes()[0].is_smooth(), "false は既定と同じ");
+        assert!(!flat.world.meshes()[0].is_smooth(), "face_normals=true で頂点法線を捨てる");
+        // rectangle は元から頂点法線を持たないので、どちらでも面法線
+        assert!(!smooth.world.meshes()[1].is_smooth());
+        assert!(!flat.world.meshes()[1].is_smooth());
     }
 
     #[test]

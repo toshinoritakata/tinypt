@@ -5,6 +5,7 @@ Rust 製のモンテカルロパストレーサー。
 ## 特徴
 
 - **BVH 加速構造** (SAH) による高速レイ-ジオメトリ交差判定
+- **スムーズシェーディング**: OBJ の頂点法線を補間 ([詳細](#スムーズシェーディング-法線の補間))
 - **マテリアル**: ランバート拡散・完全鏡面金属・GGX マイクロファセット・誘電体 (ガラス)・面光源 ([詳細](#マテリアル))
 - **Multiple Importance Sampling (MIS)** + **Next Event Estimation (NEE)** による分散低減
 - **Firefly クランプ**: 寄与単位・輝度ベース (閾値 50)。発光体/背景ヒットと NEE のすべての寄与に適用し、MIS の両側で同じ上限になる (バイアスあり)
@@ -14,6 +15,20 @@ Rust 製のモンテカルロパストレーサー。
 - **チェックポイント**: レンダリング途中状態の保存・再開 ([詳細](#チェックポイント))
 - **出力フォーマット**: PPM (バイナリ P6、トーンマップ後 8bit sRGB) / HDR (RGBE、リニア sRGB) / EXR (float32、リニア ACEScg)
 - **シーンファイル**: Mitsuba XML サブセットの読み込み (`--scene`) ([詳細](#シーンファイル-mitsuba-xml))
+
+### スムーズシェーディング (法線の補間)
+
+OBJ の頂点法線 (`vn`) を重心座標で補間し、BSDF の評価と NEE の cos 項に使う。分割の粗いメッシュでも陰影が滑らかになる。
+
+**幾何法線とシェーディング法線は別物として扱う**。自己交差回避のレイ原点ずらし・表裏の判定・光源の面積と pdf には常に**幾何法線** (面法線) を使い、BSDF と NEE の cos 項だけが**シェーディング法線** (補間法線) を見る。混同すると、スケール非依存の自己交差回避 (`offset_ray_origin`) が壊れる。
+
+補間法線のせいで散乱方向や NEE 方向が幾何的に面の裏側へ回る場合、その寄与は 0 にする (エネルギーを増やさない)。捨てるぶんは失われるが、出方はマテリアルによって違う:
+
+- **拡散面**: 損失は小さくメッシュ全体にほぼ一様に散る。粗い球 (144 三角形、隣接頂点法線の開き 30°) の白炉テストで全体 0.9%、輪郭に集中しないので暗い縁は見えない。
+- **透過 (誘電体)**: 損失が大きく輪郭付近に集中する。同じ球で棄却率は拡散の 1.0% に対し 2.8%、粗いガラス球では輪郭の内側に薄い暗部が見える。
+- GGX の棄却率 (粗さ 0.4 で約 15%) の大半はスムーズシェーディング以前からあるもの (VNDF が地平線下の反射方向を出す既知の性質で約 12.5%)。補間が足すぶんは数ポイント。
+
+頂点法線を持たないシーン (`rectangle` / `cube` / `disk` / `sphere`、`vn` の無い OBJ) の出力は**ビット単位で以前と同じ**。
 
 ## マテリアル
 
@@ -159,7 +174,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 |---|---|
 | `<sensor type="perspective">` | `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance` (DOF、焦点は視線に垂直な平面) |
 | `<shape type="sphere">` | `center` / `radius` |
-| `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` |
+| `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` + `face_normals` (下記) |
 | `<shape type="rectangle"\|"cube"\|"disk">` | Mitsuba 正準形メッシュ + `to_world` |
 | `<transform>` | `translate` / `rotate` (任意軸) / `scale` (均一・非均一) / `matrix` (4×4) |
 | `<bsdf>` | `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric`・`thindielectric`・`roughdielectric` (いずれも `Dielectric`、独自拡張の `absorption` 対応) / `twosided`。未知の型は警告して `diffuse` にフォールバック |
@@ -170,6 +185,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - **色**: `<rgb>` はリニア、`<srgb>` は sRGB (ガンマ展開)。
 - **CLI 優先**: `--spp` はシーンファイルの `sample_count` を上書きする (解像度・`max_depth`・`rr_depth` は CLI から変更不可)。
 - **背景**: 環境 emitter が無ければ黒 (Mitsuba 準拠)。組み込みシーンの手続き的な空は使わない。
+- **スムーズシェーディング**: OBJ に頂点法線 (`vn`) があれば重心座標で補間してシェーディングに使う (既定)。`<boolean name="face_normals" value="true"/>` を shape に書くと頂点法線を捨てて面法線だけで陰影を付ける。`rectangle` / `cube` / `disk` / `sphere` は元から頂点法線を持たないので、この指定で結果は変わらない。 値は Mitsuba と同じく `true` / `false` のみで、それ以外 (`1` / `yes` / `TRUE` など) は**警告して既定にフォールバック**する。
 - 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。ただし `<default>` と `<rfilter>` は**警告なし**で無視される。
 - スペクトルや `<default>`/`$param` 置換、環境マップの `to_world` 回転は未対応。`$param` に依存するシーンでも警告は出ない。
 

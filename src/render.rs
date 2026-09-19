@@ -626,12 +626,15 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 10;
+    const GOLDEN_REVISION: u32 = 11;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
     /// PPM を P3 から P6 に変えたとき、PPM のハッシュだけを更新した（蓄積バッファのハッシュと画素値は不変。
     /// P6 の画素値を P3 に書き直すと旧ハッシュ 0xdd80_3964_fecc_5c3c / 0xf4e9_ab88_c297_cdc3 に一致した）。
+    /// スムーズシェーディング導入（RENDER_REVISION 11）でも**値は変わっていない**: このシーンは
+    /// rectangle / cube だけで頂点法線を持たず、シェーディング法線 = 幾何法線のままだから。
+    /// 値が変わっていないこと自体が「頂点法線の無いシーンの出力は不変」の回帰テストになっている。
     const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0x7c6a_81d0_9dd4_74a2);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。

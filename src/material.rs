@@ -19,7 +19,7 @@
 
 use std::f64::consts::PI;
 
-use crate::geometry::{offset_ray_origin, Hit};
+use crate::geometry::{face_forward, offset_ray_origin, Hit};
 use crate::math::{reflect, refract, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
@@ -60,6 +60,22 @@ pub struct BsdfSample {
     pub eta: f64,
 }
 
+/// 散乱方向 `d` が、レイの来た側を向いた幾何法線 `ng` の**表側**にあるか。
+///
+/// シェーディング法線（頂点法線の補間）は実際の面の向きと一致しないので、それを基準に
+/// サンプルした方向が幾何的には面の裏へ潜ることがある。そのまま飛ばすと、原点ずらしは
+/// 幾何法線基準なのでレイが自分のメッシュの内側に入り、閉じた物体では光が漏れたり
+/// 黒い斑点が出たりする。tinypt はこの破綻したサンプルを**捨てる**（寄与 0）。
+///
+/// 捨てる＝そのぶんのエネルギーは失われる（増えることはない）。損失はシェーディング法線と
+/// 幾何法線が大きく開くグレージング付近に限られ、分割の粗いメッシュの輪郭に薄い暗い縁として出る。
+/// 代わりに「潜る方向を面に沿って倒す」補正も広く使われるが、pdf と weight の対応（`sample` の
+/// weight == f·cos/pdf、pdf == eval の pdf）が崩れて MIS が壊れるので採らない。
+#[inline]
+fn reflects_above(ng: Vec3, d: Vec3) -> bool {
+    d.dot(ng) > 0.0
+}
+
 impl Material {
     /// 発光体なら放射輝度を返す（`DiffuseLight` のみ `Some`）。
     pub fn emitted(&self) -> Option<Color> {
@@ -77,16 +93,26 @@ impl Material {
     /// 散乱レイ・スループット重み・PDF をサンプリングする。
     /// 発光体や無効サンプル（半球外など）の場合は `None`（パス終了）。
     pub fn sample(&self, ray_in: &Ray, hit: &Hit, rng: &mut Rng) -> Option<BsdfSample> {
-        // 法線をレイの進行方向に対して正しい向きに修正
-        let entering = hit.n.dot(ray_in.d) < 0.0; // レイが表面に入射するか
-        let n = if entering { hit.n } else { -hit.n };
+        // 表裏の判定は**幾何法線**で行う（シェーディング法線は補間でどちらを向くか保証が無い）。
+        let entering = hit.ng.dot(ray_in.d) < 0.0; // レイが表面に入射するか
+        // レイの来た側を向いた幾何法線。散乱方向が幾何的に妥当かの判定に使う
+        let ng = if entering { hit.ng } else { -hit.ng };
+        // BSDF が使うのは**シェーディング法線**（頂点法線の補間。無ければ ng と同じ）。
+        // 向きは ng と揃える（Hit 生成時に揃えてあるので、ここは entering の反転に追随するだけ）。
+        let n = face_forward(hit.ns, ng);
+        // レイの原点ずらしは常に幾何法線（hit.ng）で行う。シェーディング法線を使うと
+        // 誤差の箱を抜けられず自己交差する。
 
         match self {
             Material::Lambert { albedo } => {
                 let d = sample_cosine_hemisphere(n, rng);
+                // 補間法線のせいで幾何的な裏側へ飛ぶサンプルは捨てる（下の reflects_above を参照）
+                if !reflects_above(ng, d) {
+                    return None;
+                }
                 // f·cos/pdf = (albedo/π)·cos/(cos/π) = albedo
                 Some(BsdfSample {
-                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.ng, d), d, time: ray_in.time },
                     weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
@@ -95,8 +121,11 @@ impl Material {
             }
             Material::Metal { albedo } => {
                 let d = reflect(ray_in.d, n);
+                if !reflects_above(ng, d) {
+                    return None;
+                }
                 Some(BsdfSample {
-                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.ng, d), d, time: ray_in.time },
                     weight: *albedo,
                     pdf: 0.0,
                     is_delta: true,
@@ -138,8 +167,12 @@ impl Material {
                     current_beta = current_beta * scale * (eta * eta);
                     tdir
                 };
+                // 反射なら幾何的に表側、透過なら裏側でなければならない（補間法線による破綻を捨てる）
+                if choose_refl != reflects_above(ng, d) {
+                    return None;
+                }
                 Some(BsdfSample {
-                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.ng, d), d, time: ray_in.time },
                     weight: current_beta,
                     pdf: 0.0,
                     is_delta: true,
@@ -167,6 +200,9 @@ impl Material {
                     return None;
                 }
 
+                if !reflects_above(ng, d) {
+                    return None;
+                }
                 let cos_h = n.dot(m).max(0.0);
                 let d_ggx = ggx_distribution(alpha_val, cos_h);
                 let g = ggx_smith(alpha_val, cos_i, cos_o);
@@ -180,7 +216,7 @@ impl Material {
                 let pdf = ggx_pdf(alpha_val, n, wo, d);
 
                 Some(BsdfSample {
-                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.ng, d), d, time: ray_in.time },
                     weight: spec * (cos_o / pdf.max(1e-6)),
                     pdf,
                     is_delta: false,
@@ -193,8 +229,11 @@ impl Material {
                 // 以前は散乱距離ぶん原点を面の内側へずらしていたが、NEE のシャドウレイ
                 // （hit.p 起点）と別の点を推定して MIS が不整合になるため撤去した。
                 let d = sample_cosine_hemisphere(n, rng);
+                if !reflects_above(ng, d) {
+                    return None;
+                }
                 Some(BsdfSample {
-                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, d), d, time: ray_in.time },
+                    scattered: Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.ng, d), d, time: ray_in.time },
                     weight: *albedo,
                     pdf: n.dot(d).max(0.0) / PI,
                     is_delta: false,
@@ -382,7 +421,7 @@ mod tests {
     /// 下向きレイが床（法線 +Y）に当たる状況の Hit を作る。
     fn floor_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
         (ray, hit)
     }
 
@@ -392,7 +431,7 @@ mod tests {
         let mat = Material::Lambert { albedo: Color::new(0.6, 0.4, 0.2) };
         let (ray, hit) = floor_hit();
         let mut rng = Rng::new(1);
-        let n = hit.n; // 入射なので向き付き法線 = 幾何法線
+        let n = hit.ng; // 入射なので向き付き法線 = 幾何法線
         let wo = (-ray.d).norm();
         for _ in 0..1000 {
             let s = mat.sample(&ray, &hit, &mut rng).unwrap();
@@ -405,7 +444,7 @@ mod tests {
     fn oblique_hit(theta_o: f64) -> (Ray, Hit, Vec3) {
         let wo = Vec3::new(theta_o.sin(), theta_o.cos(), 0.0);
         let ray = Ray { o: wo * 2.0, d: -wo, time: 0.0 };
-        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
+        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
         (ray, hit, wo)
     }
 
@@ -425,7 +464,7 @@ mod tests {
         for &(alpha, theta_o) in &GGX_CASES {
             let mat = Material::Ggx { albedo: Color::new(0.9, 0.8, 0.7), alpha };
             let (ray, hit, wo) = oblique_hit(theta_o);
-            let n = hit.n;
+            let n = hit.ng;
             let trials = 2000;
             let mut valid = 0;
             for _ in 0..trials {
@@ -474,7 +513,7 @@ mod tests {
         for &(alpha, theta_o) in &GGX_CASES {
             let mat = Material::Ggx { albedo: Color::new(1.0, 1.0, 1.0), alpha };
             let (ray, hit, wo) = oblique_hit(theta_o);
-            let n = hit.n;
+            let n = hit.ng;
 
             let m = 200_000;
             let (mut sw, mut sw2, mut valid) = (0.0, 0.0, 0usize);
@@ -612,7 +651,7 @@ mod tests {
     /// 下から上向きのレイが床（幾何法線 +Y）の裏面に当たる状況の Hit を作る。
     fn floor_backface_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, -1.0, 0.0), d: Vec3::new(0.0, 1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
         (ray, hit)
     }
 
@@ -625,7 +664,7 @@ mod tests {
     fn subsurface_sample_pdf_matches_eval() {
         let mat = subsurface();
         for (ray, hit) in [floor_hit(), floor_backface_hit()] {
-            let n = if hit.n.dot(ray.d) < 0.0 { hit.n } else { -hit.n };
+            let n = if hit.ng.dot(ray.d) < 0.0 { hit.ng } else { -hit.ng };
             let wo = (-ray.d).norm();
             let mut rng = Rng::new(5);
             for _ in 0..1000 {
@@ -641,7 +680,7 @@ mod tests {
     fn subsurface_weight_matches_f_cos_over_pdf() {
         let mat = subsurface();
         let (ray, hit) = floor_hit();
-        let n = hit.n;
+        let n = hit.ng;
         let wo = (-ray.d).norm();
         let mut rng = Rng::new(13);
         for _ in 0..1000 {
@@ -664,14 +703,14 @@ mod tests {
     fn subsurface_backface_hit_has_positive_pdf() {
         let mat = subsurface();
         let (ray, hit) = floor_backface_hit();
-        let n = -hit.n;
+        let n = -hit.ng;
         let mut rng = Rng::new(21);
         for _ in 0..1000 {
             let s = mat.sample(&ray, &hit, &mut rng).unwrap();
             let d = s.scattered.d;
             assert!(n.dot(d) >= 0.0, "direction not in oriented hemisphere");
             assert!(s.pdf > 0.0 || n.dot(d) < 1e-9, "pdf = {}", s.pdf);
-            let expected_o = offset_ray_origin(hit.p, hit.p_error, hit.n, d);
+            let expected_o = offset_ray_origin(hit.p, hit.p_error, hit.ng, d);
             assert!((s.scattered.o - expected_o).len() < 1e-12);
         }
     }
@@ -755,5 +794,147 @@ mod tests {
         let emit = Color::new(3.0, 3.0, 3.0);
         assert!(Material::DiffuseLight { emit }.emitted().is_some());
         assert!(Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) }.emitted().is_none());
+    }
+
+    // ---- スムーズシェーディング: 幾何法線とシェーディング法線の分離 ----
+
+    /// シェーディング法線が幾何法線と違っても、**レイの原点ずらしは幾何法線で行う**。
+    ///
+    /// これは仕様であると同時にミューテーション検出でもある: `sample` の
+    /// `offset_ray_origin(..., hit.ng, d)` を `hit.ns` に書き換えると、
+    /// 下の 2 つの assert のうち後者（ns 基準とは一致しない）が落ちる。
+    #[test]
+    fn ray_origin_offset_uses_the_geometric_normal_not_the_shading_normal() {
+        let ng = Vec3::new(0.0, 1.0, 0.0);
+        let ns = Vec3::new(0.6, 0.8, 0.0).norm(); // 幾何法線から約 37 度
+        let hit = Hit {
+            t: 1.0,
+            p: Vec3::new(3.0, 5.0, -7.0), // 原点から離して p_error を成分ごとに非ゼロにする
+            ng,
+            ns,
+            mat_id: 0,
+            prim_id: 0,
+            inst_id: None,
+            p_error: Vec3::new(4e-16, 7e-16, 9e-16),
+            bary: (0.25, 0.25),
+        };
+        let ray = Ray { o: hit.p + Vec3::new(0.3, 1.0, 0.2), d: Vec3::new(-0.3, -1.0, -0.2).norm(), time: 0.0 };
+        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
+        let mut rng = Rng::new(5);
+        let mut checked = 0;
+        for _ in 0..200 {
+            let Some(s) = mat.sample(&ray, &hit, &mut rng) else { continue };
+            let d = s.scattered.d;
+            let by_ng = offset_ray_origin(hit.p, hit.p_error, ng, d);
+            let by_ns = offset_ray_origin(hit.p, hit.p_error, ns, d);
+            assert_eq!(s.scattered.o.x.to_bits(), by_ng.x.to_bits(), "原点ずらしは幾何法線基準であること");
+            assert_eq!(s.scattered.o.y.to_bits(), by_ng.y.to_bits());
+            assert_eq!(s.scattered.o.z.to_bits(), by_ng.z.to_bits());
+            assert_ne!(by_ng.x.to_bits(), by_ns.x.to_bits(), "この配置では 2 つのずらし方は実際に違う");
+            checked += 1;
+        }
+        assert!(checked > 100, "サンプルが少なすぎる ({})", checked);
+    }
+
+    /// **破綻判定は全マテリアルで幾何法線が基準**: 反射サンプルは必ず幾何的に表側へ、
+    /// 透過サンプルは必ず幾何的に裏側へ出る。
+    ///
+    /// シェーディング法線が傾いていると、`ns` 基準では「面を突き抜けていない」方向を透過と判定したり、
+    /// 幾何的には面の裏へ潜る方向を反射として残したりしうる。そのまま飛ばすと、原点ずらしは
+    /// 幾何法線基準なのでレイが自分のメッシュの内側を進む。
+    ///
+    /// ミューテーション検出: どのマテリアルでも `reflects_above(ng, d)` の `ng` を `n`（ns）にすると落ちる。
+    /// **マテリアルごとに同じ判定が書かれている**ので、1 つだけ直して安心しないようループで回す
+    /// （`Ggx` だけ ns 基準にすると画像が 13% 変わるのに、誘電体だけのテストでは素通りした）。
+    #[test]
+    fn breakdown_check_is_geometric_for_every_material() {
+        let ng = Vec3::new(0.0, 1.0, 0.0);
+        let ns = Vec3::new(0.6, 0.8, 0.0).norm(); // ng から約 37 度
+        // 浅い角度から深い角度まで掃く（全反射の境界付近も含める）
+        let dirs = [
+            Vec3::new(0.10, -1.0, 0.0).norm(),
+            Vec3::new(0.60, -1.0, 0.0).norm(),
+            Vec3::new(1.00, -0.6, 0.0).norm(),
+            Vec3::new(1.00, -0.2, 0.0).norm(),
+            Vec3::new(-1.0, -0.3, 0.0).norm(),
+            Vec3::new(-0.4, -1.0, 0.3).norm(),
+        ];
+        let cases: [(&str, Material, bool); 5] = [
+            ("Lambert", Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }, false),
+            ("Metal", Material::Metal { albedo: Color::new(0.9, 0.9, 0.9) }, false),
+            ("Ggx", Material::Ggx { albedo: Color::new(0.9, 0.9, 0.9), alpha: 0.35 }, false),
+            ("Subsurface", Material::Subsurface { albedo: Color::new(0.7, 0.7, 0.7) }, false),
+            ("Dielectric", Material::Dielectric { ior: 1.5, absorption: Color::new(0.0, 0.0, 0.0) }, true),
+        ];
+        for (name, mat, transmits) in cases {
+            let mut rng = Rng::new(77);
+            let (mut accepted, mut transmitted, mut rejected) = (0usize, 0usize, 0usize);
+            for d in dirs {
+                let hit = Hit {
+                    t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng, ns, mat_id: 0, prim_id: 0, inst_id: None,
+                    p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25),
+                };
+                let ray = Ray { o: -d * 2.0, d, time: 0.0 };
+                for _ in 0..4000 {
+                    match mat.sample(&ray, &hit, &mut rng) {
+                        Some(s) => {
+                            let side = s.scattered.d.dot(ng);
+                            // eta == 1 が反射、それ以外が透過（BsdfSample の規約）
+                            if s.eta == 1.0 {
+                                assert!(side > 0.0, "{}: 反射なのに幾何的に裏側へ出た（d·ng = {}）", name, side);
+                            } else {
+                                assert!(side < 0.0, "{}: 透過なのに幾何的に表側へ出た（d·ng = {}）", name, side);
+                                transmitted += 1;
+                            }
+                            accepted += 1;
+                        }
+                        None => rejected += 1,
+                    }
+                }
+            }
+            assert!(accepted > 1000, "{}: 採用されたサンプルが少なすぎる ({})", name, accepted);
+            // 傾いた ns のせいで捨てられるサンプルが実際に出ている（テストが空回りしていないこと）
+            assert!(rejected > 0, "{}: 破綻サンプルが 1 つも出ない配置ではテストにならない", name);
+            if transmits {
+                assert!(transmitted > 1000, "{}: 透過サンプルが少なすぎる ({})", name, transmitted);
+                assert!(accepted - transmitted > 200, "{}: 反射サンプルが少なすぎる ({})", name, accepted - transmitted);
+            } else {
+                assert_eq!(transmitted, 0, "{}: 透過しないはずのマテリアルで透過サンプルが出た", name);
+            }
+        }
+    }
+
+    /// 散乱方向は**シェーディング法線**の周りに分布する（cos 重み付き半球が ns 側に寄る）。
+    /// 同時に、幾何法線の裏側へ出るサンプルは 1 つも返らない（破綻サンプルは捨てる方針）。
+    #[test]
+    fn scattering_follows_the_shading_normal_and_never_goes_below_the_geometry() {
+        let ng = Vec3::new(0.0, 1.0, 0.0);
+        let ns = Vec3::new(0.6, 0.8, 0.0).norm();
+        let hit = Hit {
+            t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng, ns, mat_id: 0, prim_id: 0, inst_id: None,
+            p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25),
+        };
+        let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
+        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
+        let mut rng = Rng::new(9);
+        let (mut kept, mut rejected) = (0, 0);
+        let mut mean = Vec3::new(0.0, 0.0, 0.0);
+        for _ in 0..20_000 {
+            match mat.sample(&ray, &hit, &mut rng) {
+                Some(s) => {
+                    assert!(s.scattered.d.dot(ng) > 0.0, "幾何法線の裏へ出るサンプルが残っている");
+                    mean = mean + s.scattered.d;
+                    kept += 1;
+                }
+                None => rejected += 1,
+            }
+        }
+        assert!(rejected > 0, "ns が ng から 37 度傾いていれば、捨てられるサンプルが出るはず");
+        // 平均方向は ns 側に寄る（面法線周りなら x 成分は 0 になる）
+        let mean = mean / (kept as f64);
+        assert!(mean.x > 0.05, "散乱の平均方向が ns 側に寄っていない: {:?}", mean);
+        // 捨てた割合は「ns 基準の半球のうち ng の裏側」の面積比なので、極端に大きくはならない
+        let reject_frac = rejected as f64 / (kept + rejected) as f64;
+        assert!(reject_frac < 0.2, "捨てすぎ: {}", reject_frac);
     }
 }

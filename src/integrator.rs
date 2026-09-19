@@ -120,21 +120,24 @@ pub fn radiance(
             break;
         }
 
-        let n = oriented_normal(hit.n, ray.d);
+        // 向き付けは幾何法線で決め、シェーディング法線はそれに追随させる
+        // （補間法線をレイ方向で向き付けると、幾何法線と逆側を向いて面の裏を照らしうる）。
+        let ng = oriented_normal(hit.ng, ray.d);
+        let n = if hit.is_smooth() { face_forward(hit.ns, ng) } else { ng };
 
         // NEE（Next Event Estimation）はデルタ散乱マテリアルでは行わない
         if !mat.is_delta() {
             // NEE: Environment map
             if let Some(env_map) = env {
                 let occluded = |shadow: Ray| world.hit(shadow, 0.0, RAY_T_MAX).is_some();
-                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, &hit, n, ray, rng);
+                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, &hit, n, ng, ray, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
             if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
                 let contrib = nee_area_light(
                     |shadow: Ray, tmax: f64| world.hit(shadow, 0.0, tmax),
-                    &mat, path_throughput, &hit, n, ray, &ls,
+                    &mat, path_throughput, &hit, n, ng, ray, &ls,
                 );
                 accumulated_radiance = accumulated_radiance + contrib;
             }
@@ -198,7 +201,7 @@ fn oriented_normal(n: Vec3, ray_d: Vec3) -> Vec3 {
     if n.dot(ray_d) < 0.0 { n } else { -n }
 }
 
-use crate::geometry::{offset_ray_origin, Hit};
+use crate::geometry::{face_forward, offset_ray_origin, Hit};
 use crate::world::LightSample;
 
 /// 環境マップに対する NEE（Next Event Estimation / 直接照明推定）。
@@ -219,6 +222,7 @@ fn nee_environment(
     path_throughput: Color,
     hit: &Hit,
     n: Vec3,
+    ng: Vec3,
     ray: Ray,
     rng: &mut Rng,
 ) -> Color {
@@ -227,9 +231,14 @@ fn nee_environment(
     if cos <= 0.0 || pdf_env <= 0.0 || is_black(li) {
         return Color::new(0.0, 0.0, 0.0);
     }
+    // シェーディング法線から見て表でも、幾何的に面の裏へ向かう方向は寄与 0
+    // （シャドウレイの原点は幾何法線基準にずらすので、そのまま撃つと自分のメッシュの内側を通る）
+    if wi.dot(ng) <= 0.0 {
+        return Color::new(0.0, 0.0, 0.0);
+    }
 
     // シャドウレイ（無限遠へ）: 原点を面の誤差の箱の外へ wi の側にずらす
-    let shadow = Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.n, wi), d: wi, time: ray.time };
+    let shadow = Ray { o: offset_ray_origin(hit.p, hit.p_error, hit.ng, wi), d: wi, time: ray.time };
     if occluded(shadow) {
         return Color::new(0.0, 0.0, 0.0);
     }
@@ -258,6 +267,7 @@ fn nee_area_light(
     path_throughput: Color,
     hit: &Hit,
     n: Vec3,
+    ng: Vec3,
     ray: Ray,
     ls: &LightSample,
 ) -> Color {
@@ -278,6 +288,10 @@ fn nee_area_light(
     if cos <= 0.0 {
         return Color::new(0.0, 0.0, 0.0);
     }
+    // 幾何的に面の裏へ向かう方向は寄与 0（nee_environment と同じ理由）
+    if wi.dot(ng) <= 0.0 {
+        return Color::new(0.0, 0.0, 0.0);
+    }
 
     // シャドウレイ（PBRT の SpawnRayTo と同じ考え方）: 始点はシェーディング点の誤差の箱の外へ光源側に、
     // 終点は光源上の点の誤差の箱の外へシェーディング点側にずらし、その間の線分で遮蔽を調べる。
@@ -286,7 +300,7 @@ fn nee_area_light(
     // レイと球の交差の t の誤差上界が終点側のずらし量（光源点の p_error）を超えうるので、終点を箱の外へ
     // ずらしても光源面が線分の内側（t < 線分長）でヒットすることがある。除外を外すと、そのサンプルが
     // 遮蔽扱いになり、sample/default.xml で画像が約 6%（−6.1%）暗くなる（verify_batch3c で計測）。
-    let from = offset_ray_origin(hit.p, hit.p_error, hit.n, to_light);
+    let from = offset_ray_origin(hit.p, hit.p_error, hit.ng, to_light);
     let to = offset_ray_origin(ls.position, ls.p_error, ls.normal, from - ls.position);
     let seg = to - from;
     let seg_len = seg.len();
@@ -328,7 +342,7 @@ mod tests {
 
     /// 点 `p`・法線 `n` の交差情報（誤差上界は十分小さい値）。NEE の単体テスト用。
     fn test_hit(p: Vec3, n: Vec3) -> crate::geometry::Hit {
-        crate::geometry::Hit { t: 1.0, p, n, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) }
+        crate::geometry::Hit { t: 1.0, p, ng: n, ns: n, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) }
     }
 
     fn floor_setup() -> (Material, Vec3, Vec3, Ray) {
@@ -351,7 +365,7 @@ mod tests {
         for _ in 0..1000 {
             let c = nee_environment(
                 |_| { calls.set(calls.get() + 1); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &mut rng,
             );
             let _ = env.sample_dir(&mut reference);
             assert!(is_black(c));
@@ -371,7 +385,7 @@ mod tests {
         for _ in 0..1000 {
             let c = nee_environment(
                 |_| { calls.set(calls.get() + 1); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &mut rng,
             );
             total += c.luminance();
         }
@@ -387,7 +401,7 @@ mod tests {
         let mut rng = Rng::new(7);
         let mut max_l: f64 = 0.0;
         for _ in 0..200 {
-            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, ray, &mut rng);
+            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &mut rng);
             max_l = max_l.max(c.luminance());
         }
         assert!(max_l > 0.0);
@@ -408,7 +422,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, ray, &ls);
+        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
         assert!((c.luminance() - FIREFLY_CLAMP).abs() < 1e-9, "luminance = {}", c.luminance());
         assert!((c.r() / c.g() - 2.0).abs() < 1e-9);
     }
@@ -427,7 +441,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, ray, &ls);
+        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
         let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), Vec3::new(0.0, 1.0, 0.0), n);
         let expected = f.r() * mis_weight(1.0, pdf_bsdf);
         assert!((c.r() - expected).abs() < 1e-12, "{} vs {}", c.r(), expected);
@@ -517,7 +531,7 @@ mod tests {
     fn dielectric_sample_reports_relative_ior() {
         let ior = 1.5;
         let mat = Material::Dielectric { ior, absorption: Color::new(0.0, 0.0, 0.0) };
-        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), n: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15) };
+        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
         let enter = Ray { o: Vec3::new(0.3, 1.0, 0.0), d: Vec3::new(-0.3, -1.0, 0.0).norm(), time: 0.0 };
         let exit = Ray { o: Vec3::new(0.1, -1.0, 0.0), d: Vec3::new(-0.1, 1.0, 0.0).norm(), time: 0.0 };
         let mut rng = Rng::new(2);
@@ -525,7 +539,7 @@ mod tests {
         for _ in 0..2000 {
             for (ray, entering) in [(enter, true), (exit, false)] {
                 let s = mat.sample(&ray, &hit, &mut rng).unwrap();
-                let transmitted = s.scattered.d.dot(ray.d) > 0.0 && s.scattered.d.dot(hit.n).signum() == ray.d.dot(hit.n).signum();
+                let transmitted = s.scattered.d.dot(ray.d) > 0.0 && s.scattered.d.dot(hit.ng).signum() == ray.d.dot(hit.ng).signum();
                 if transmitted {
                     let expect = if entering { ior } else { 1.0 / ior };
                     assert!((s.eta - expect).abs() < 1e-12, "transmission eta {} vs {}", s.eta, expect);
@@ -583,6 +597,287 @@ mod tests {
                 assert!((mean - expect).abs() < 5.0 * se + 1e-3, "k={} offset={} expect {}: {} ± {}", k, offset, expect, mean, se);
             }
         }
+    }
+
+    // ---- スムーズシェーディング: NEE が幾何法線を使っていることを守るテスト ----
+
+    /// 幾何法線 +z の面に、そこから 60 度傾いたシェーディング法線を持たせた交差情報。
+    /// `ns` から見れば表、`ng` から見れば裏、という方向が存在する配置（薄い面の光漏れが起きる条件）。
+    fn tilted_hit() -> (Hit, Vec3, Vec3, Ray) {
+        let ng = Vec3::new(0.0, 0.0, 1.0);
+        let ns = Vec3::new(0.866_025_403_784_438_6, 0.0, 0.5); // ng から 60 度
+        let hit = Hit {
+            t: 1.0,
+            p: Vec3::new(0.0, 0.0, 0.0),
+            ng,
+            ns,
+            mat_id: 0,
+            prim_id: 0,
+            inst_id: None,
+            p_error: Vec3::new(1e-15, 1e-15, 1e-15),
+            bary: (0.25, 0.25),
+        };
+        let ray = Ray { o: Vec3::new(0.0, 0.0, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        (hit, ng, ns, ray)
+    }
+
+    /// 面光源 NEE のシャドウレイは**幾何法線**基準にずらした点から出る。
+    ///
+    /// ミューテーション検出: `nee_area_light` の `offset_ray_origin(..., hit.ng, ...)` を
+    /// `hit.ns` に書き換えると、捕まえた原点が ng 基準の値と一致せず落ちる。
+    #[test]
+    fn area_light_nee_shadow_ray_starts_from_the_geometric_offset() {
+        let (hit, ng, ns, ray) = tilted_hit();
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        // ns 側にも ng 側にもある方向（どちらの半球でも表）に光源を置く
+        let light_p = Vec3::new(1.0, 0.0, 1.0);
+        let ls = LightSample {
+            position: light_p,
+            normal: Vec3::new(0.0, 0.0, -1.0),
+            emit: Color::new(1.0, 1.0, 1.0),
+            pdf: 1.0,
+            p_error: Vec3::new(0.0, 0.0, 0.0),
+            visible: true,
+            inst_id: None,
+            prim_id: 0,
+        };
+        let seen: Cell<Option<Vec3>> = Cell::new(None);
+        let c = nee_area_light(
+            |shadow: Ray, _| { seen.set(Some(shadow.o)); None },
+            &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls,
+        );
+        assert!(c.luminance() > 0.0, "この配置では寄与が出るはず");
+        let o = seen.get().expect("シャドウレイが撃たれていない");
+        let to_light = light_p - hit.p;
+        let by_ng = offset_ray_origin(hit.p, hit.p_error, ng, to_light);
+        let by_ns = offset_ray_origin(hit.p, hit.p_error, ns, to_light);
+        assert_eq!(o.x.to_bits(), by_ng.x.to_bits(), "シャドウレイの原点は幾何法線基準であること");
+        assert_eq!(o.y.to_bits(), by_ng.y.to_bits());
+        assert_eq!(o.z.to_bits(), by_ng.z.to_bits());
+        assert_ne!(by_ng.x.to_bits(), by_ns.x.to_bits(), "この配置では 2 つのずらし方は実際に違う");
+    }
+
+    /// 環境 NEE のシャドウレイも幾何法線基準（上と同じミューテーション検出）。
+    #[test]
+    fn env_nee_shadow_ray_starts_from_the_geometric_offset() {
+        let (hit, ng, ns, ray) = tilted_hit();
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        let mut rng = Rng::new(4);
+        let seen: Cell<Option<(Vec3, Vec3)>> = Cell::new(None);
+        let mut checked = 0;
+        for _ in 0..200 {
+            let c = nee_environment(
+                |shadow: Ray| { seen.set(Some((shadow.o, shadow.d))); false },
+                &env, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &mut rng,
+            );
+            let Some((o, d)) = seen.get() else { continue };
+            seen.set(None);
+            if is_black(c) {
+                continue; // 裏側ガードで落ちた方向（シャドウレイは撃たれていない）
+            }
+            let by_ng = offset_ray_origin(hit.p, hit.p_error, ng, d);
+            assert_eq!(o.x.to_bits(), by_ng.x.to_bits(), "環境 NEE の原点も幾何法線基準であること");
+            assert_eq!(o.z.to_bits(), by_ng.z.to_bits());
+            checked += 1;
+        }
+        assert!(checked > 10, "確認できたサンプルが少なすぎる ({})", checked);
+    }
+
+    /// **薄い面の光漏れ防止**: シェーディング法線から見て表でも、幾何的に面の裏へ向かう方向の
+    /// NEE 寄与は 0。ガードが無いと、原点は幾何法線基準で裏側へずらされるのに寄与だけが加算され、
+    /// 1 枚ポリゴンの向こう側にある光源が「透けて」見える。
+    ///
+    /// ミューテーション検出: `wi.dot(ng) <= 0.0` のガードを `n`（= ns）基準に変える、または削ると、
+    /// 下の 2 つの assert が落ちる（遮蔽物が無いので寄与が正になる）。
+    #[test]
+    fn nee_contributions_below_the_geometry_are_dropped() {
+        let (hit, ng, ns, ray) = tilted_hit();
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        // ns から見て表（cos > 0）だが ng から見て裏（z < 0）の方向にある光源。
+        // 面は 1 枚ポリゴンなので、遮蔽判定（closest_hit）は何も返さない = 遮られない。
+        let wedge = Vec3::new(0.9, 0.0, -0.436).norm();
+        assert!(wedge.dot(ns) > 0.0 && wedge.dot(ng) < 0.0, "テスト前提: ns 側で表・ng 側で裏");
+        let ls = LightSample {
+            position: hit.p + wedge * 2.0,
+            normal: -wedge,
+            emit: Color::new(5.0, 5.0, 5.0),
+            pdf: 1.0,
+            p_error: Vec3::new(0.0, 0.0, 0.0),
+            visible: true,
+            inst_id: None,
+            prim_id: 0,
+        };
+        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls);
+        assert!(is_black(c), "幾何的に裏側の光源から寄与が漏れている: {:?}", (c.r(), c.g(), c.b()));
+
+        // 環境 NEE も同じ: ng の裏半球だけが光る環境にすると寄与は 0 になる
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        let mut rng = Rng::new(31);
+        let mut leaked = 0;
+        for _ in 0..2000 {
+            let c = nee_environment(
+                |_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &mut rng,
+            );
+            // 寄与が出た方向は必ず幾何法線の表側から来ていること（裏なら 0 のはず）を、
+            // 同じ乱数列で方向を引き直して突き合わせる
+            if !is_black(c) {
+                leaked += 1;
+            }
+        }
+        // 表側の方向は残るので全部 0 にはならない（テストが空回りしていないことの確認）
+        assert!(leaked > 0, "全部 0 ではテストにならない");
+
+        // ガードの本丸: 裏向きの方向だけを明示的に渡す面光源の方は必ず 0
+        let ls_back = LightSample { position: hit.p + Vec3::new(0.2, 0.0, -1.0), ..ls };
+        let c2 = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls_back);
+        assert!(is_black(c2), "真裏の光源から寄与が漏れている");
+    }
+
+    /// **向き付けの基準は幾何法線**であることを、描画経路（`radiance`）で守る。
+    ///
+    /// 面法線 +z の 1 枚ポリゴンに、そこから 60 度傾いたシェーディング法線を持たせ、
+    /// **幾何法線から見れば表から入射するのに、シェーディング法線から見ると背面から入射する**
+    /// かすめる視線で見る。正しい実装は向き付けを `oriented_normal(hit.ng, …)` で決めるので
+    /// シェーディング法線はそのまま（光源側を向いたまま）だが、基準を `hit.ns` にすると
+    /// `face_forward` が `-ns` を返し、NEE の cos とガードが揃って光源を弾いて真っ暗になる。
+    #[test]
+    fn nee_orientation_is_based_on_the_geometric_normal() {
+        use crate::geometry::Sphere;
+        use crate::transform::Transform;
+        use crate::world::test_meshes::tilted_quad;
+        let ns = Vec3::new(0.866_025_403_784_438_6, 0.0, 0.5); // 面法線 +z から 60 度
+        let mats = vec![
+            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) },
+            Material::DiffuseLight { emit: Color::new(40.0, 40.0, 40.0) },
+        ];
+        let mut world = World::new();
+        world.add_mesh_data_instance(tilted_quad(8.0, ns, 0), Transform::identity(), None);
+        // 幾何法線・シェーディング法線のどちらから見ても表側にある光源
+        let light_dir = Vec3::new(0.9, 0.0, 0.436).norm();
+        assert!(light_dir.dot(Vec3::new(0.0, 0.0, 1.0)) > 0.0 && light_dir.dot(ns) > 0.0,
+                "テスト前提: 光源はどちらの法線から見ても表側");
+        world.add_sphere(Sphere { c: light_dir * 3.0, r: 0.35, mat_id: 1 });
+        world.build_lights(&mats);
+
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0)); // 背景は真っ黒（光源はこの球だけ）
+        // かすめる視線。ng から見れば表から入射する（ng·d < 0）が、ns から見ると背面から入射する
+        // （ns·d > 0）配置にする。ここで向き付けの基準を ns にすると n が -ns に反転してしまう。
+        let d = Vec3::new(0.99, 0.0, -0.141).norm();
+        // 原点ちょうどに当たるように置く（光源の向きは原点基準で決めてあるため）
+        let ray = Ray { o: -d * 4.0, d, time: 0.0 };
+        assert!(ns.dot(d) > 0.0, "テスト前提: ns·d > 0（かすめる視線でシェーディング法線が視点と逆を向く）");
+        let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: 3, rr_depth: 8 }, 40_000, 5);
+        // 正しい実装では 0.434、基準を ns にすると 8.5e-5（NEE が丸ごと落ちて BSDF サンプリングの
+        // 取りこぼしだけが残る）。5000 倍離れているので閾値は余裕を持って 0.1 に置く。
+        assert!(mean > 0.1, "幾何法線を基準に向き付けていない（mean = {} ± {}、期待 0.43 付近）", mean, se);
+    }
+
+    /// 傾いたシェーディング法線を持つ 1 枚ポリゴンと、その真上の光源からなるシーンを作る。
+    /// `ns_sign` が −1 なら面を裏側から見る（`face_forward` が仕事をする配置）。
+    fn tilted_quad_scene(ns: Vec3, light_dir: Vec3, view_from: Vec3) -> (World, Vec<Material>, Ray) {
+        use crate::geometry::Sphere;
+        use crate::transform::Transform;
+        use crate::world::test_meshes::tilted_quad;
+        let mats = vec![
+            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) },
+            Material::DiffuseLight { emit: Color::new(60.0, 60.0, 60.0) },
+        ];
+        let mut world = World::new();
+        world.add_mesh_data_instance(tilted_quad(8.0, ns, 0), Transform::identity(), None);
+        // 小さく遠い光源にして、BSDF サンプリングが偶然当たる寄与より NEE の寄与が支配的になるようにする
+        world.add_sphere(Sphere { c: light_dir.norm() * 6.0, r: 0.30, mat_id: 1 });
+        world.build_lights(&mats);
+        let d = (Vec3::new(0.0, 0.0, 0.0) - view_from).norm();
+        (world, mats, Ray { o: view_from, d, time: 0.0 })
+    }
+
+    /// **`radiance` は NEE にシェーディング法線を渡す**（直接光にスムーズシェーディングが効く）。
+    ///
+    /// 面法線 +z の 1 枚ポリゴンに 60 度傾いた頂点法線を与え、真上に小さな光源を置く。
+    /// NEE の cos 項がシェーディング法線なら cos = ns·wi ≒ 0.5、幾何法線なら cos = ng·wi ≒ 1 なので、
+    /// 頂点法線ありのシーンは頂点法線なしのシーンより**はっきり暗くなる**。
+    ///
+    /// ミューテーション検出: `radiance` が `nee_environment` / `nee_area_light` に渡す `n` を `ng` にすると、
+    /// 直接光でスムーズシェーディングが効かなくなり、この比が 1 に近づいて落ちる。
+    /// （NEE の単体テストは `n` と `ng` を自分で渡すので、「呼び出し側がどちらを渡すか」は通らない。）
+    #[test]
+    fn radiance_passes_the_shading_normal_to_nee() {
+        let ns = Vec3::new(0.866_025_403_784_438_6, 0.0, 0.5); // 面法線 +z から 60 度
+        let light_dir = Vec3::new(0.0, 0.0, 1.0); // 真上
+        let view_from = Vec3::new(0.0, -2.0, 2.5);
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+        // max_depth = 2（直接照明まで）にして、間接光の混入を避ける
+        let limits = PathLimits { max_depth: 2, rr_depth: 8 };
+
+        let (w_smooth, mats, ray) = tilted_quad_scene(ns, light_dir, view_from);
+        let (w_flat, _, _) = tilted_quad_scene(Vec3::new(0.0, 0.0, 1.0), light_dir, view_from);
+        let (mean_smooth, se_s) = estimate(&w_smooth, &mats, &env, ray, limits, 60_000, 11);
+        let (mean_flat, se_f) = estimate(&w_flat, &mats, &env, ray, limits, 60_000, 11);
+
+        assert!(mean_flat > 0.0 && mean_smooth > 0.0, "どちらも光が届いていない（{} / {}）", mean_smooth, mean_flat);
+        let ratio = mean_smooth / mean_flat;
+        // cos の比 0.5 が理論値。BSDF サンプリング側の寄与が少し混ざるので幅を持たせる。
+        // 法線を取り違えると比は 1 付近になるので、0.8 を上限にすれば十分に分離できる。
+        assert!(
+            ratio < 0.8,
+            "直接光にシェーディング法線が効いていない（smooth/flat = {:.4}、期待 0.5 付近。\
+             mean_smooth = {} ± {}, mean_flat = {} ± {}）",
+            ratio, mean_smooth, se_s, mean_flat, se_f
+        );
+        assert!(ratio > 0.2, "暗くなりすぎ（{:.4}）。cos の比 0.5 から大きく外れている", ratio);
+    }
+
+    /// **裏面から当たるスムーズ面でも、シェーディング法線は入射側へ向け直される**（`face_forward`）。
+    ///
+    /// 片面の 1 枚ポリゴンを**裏側**から見て、その裏側にある光源を照らす配置。
+    /// 正しい実装は `face_forward(hit.ns, ng)` で `ns` を入射側（−z 側）に向け直すので光源が見えるが、
+    /// 生の `hit.ns`（+z 側を向いたまま）を使うと cos が負になり、NEE が丸ごと落ちて真っ暗になる。
+    ///
+    /// ミューテーション検出: `radiance` の `face_forward(hit.ns, ng)` を `hit.ns` にすると落ちる。
+    #[test]
+    fn shading_normal_is_face_forwarded_for_backside_hits() {
+        let ns = Vec3::new(0.866_025_403_784_438_6, 0.0, 0.5); // 面法線 +z から 60 度
+        // 面の裏（−z 側）にある光源。−ns 側から見れば表になる向きを選ぶ
+        let light_dir = Vec3::new(-0.9, 0.0, -0.436);
+        let view_from = Vec3::new(0.0, -2.0, -2.5); // 裏側から見る
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+        let (world, mats, ray) = tilted_quad_scene(ns, light_dir, view_from);
+        assert!(light_dir.norm().dot(ns) < 0.0, "テスト前提: 光源は ns の裏側");
+        let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: 2, rr_depth: 8 }, 60_000, 19);
+        assert!(mean > 0.05, "裏面ヒットで ns が向け直されていない（mean = {} ± {}）", mean, se);
+    }
+
+    /// 白炉テスト（スムーズシェーディング）: 頂点法線を付けた Lambert の球メッシュでも、
+    /// 一様な環境光 L = 1 の中での見え方はアルベド 0.8 に十分近い。
+    ///
+    /// 補間法線を使う BSDF は厳密にはエネルギーを保存しない: 散乱方向が幾何法線の裏へ出る
+    /// サンプルを捨てるぶん暗くなる（`reflects_above`）。許容誤差はそのバイアスの見積もりから決める。
+    /// 24x12 分割の球では、隣り合う頂点法線の開きは最大でも 360/24/2 = 7.5 度で、捨てられるのは
+    /// シェーディング法線基準の半球のうち幾何半球からはみ出す部分＝cos 重みで測って最大でも
+    /// sin²(7.5°) ≒ 1.7% 程度。多重散乱で 2 乗に効くほど深くはないので、2% を上限に取る
+    /// （面法線メッシュとの差も同時に確認して、原因が補間であることを示す）。
+    #[test]
+    fn smooth_sphere_mesh_white_furnace_loses_little_energy() {
+        use crate::transform::Transform;
+        use crate::world::test_meshes::uv_sphere;
+        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }];
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        let mut means = Vec::new();
+        for smooth in [true, false] {
+            let mut world = World::new();
+            world.add_mesh_data_instance(
+                uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 24, 12, 0, smooth), Transform::identity(), None);
+            world.build_lights(&mats);
+            let o = Vec3::new(0.0, 0.0, 5.0);
+            let ray = Ray { o, d: (Vec3::new(0.0, 0.4, 0.0) - o).norm(), time: 0.0 };
+            let (mean, se) = estimate(&world, &mats, &env, ray, PathLimits { max_depth: usize::MAX, rr_depth: 3 }, 200_000, 17);
+            assert!(mean <= 0.8 + 5.0 * se, "smooth={}: {} はアルベドを超えている（エネルギーを作っている）", smooth, mean);
+            assert!(mean > 0.8 * 0.98 - 5.0 * se, "smooth={}: {} は 0.8 から 2% 以上暗い", smooth, mean);
+            means.push(mean);
+        }
+        // 面法線メッシュ（凸なので破綻サンプルが無い）とほぼ同じ明るさに収まる
+        assert!((means[0] - means[1]).abs() < 0.02, "smooth {} と flat {} の差が大きすぎる", means[0], means[1]);
     }
 
     /// 白炉テスト（拡散）: 一様な環境光 L = 1 の中の凸な Lambert 球（アルベド 0.8）は、どこから見ても 0.8

@@ -11,8 +11,9 @@
 //! PDF は `Light::pdf_omega` に一本化され、`sample_light` と `light_pdf` が共有する。
 
 use crate::bvh::Bvh;
-use crate::geometry::{Aabb, Hit, Sphere, Triangle};
+use crate::geometry::{face_forward, Aabb, Hit, Sphere, Triangle};
 use crate::material::Material;
+use crate::obj_loader::{MeshData, NO_NORMAL};
 use crate::math::{cdf_search, gamma, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
@@ -27,20 +28,74 @@ use crate::transform::Transform;
 pub struct Mesh {
     /// メッシュの三角形リスト
     pub tris: Vec<Triangle>,
+    /// 頂点法線（OBJ の `vn`、正規化済み）。スムーズシェーディングしないメッシュでは空
+    vn: Vec<Vec3>,
+    /// 三角形ごとの `vn` の添字。空ならメッシュ全体が面法線
+    tri_vn: Vec<[u32; 3]>,
     /// メッシュ内の BVH（高速交差判定用）
     bvh: Bvh,
 }
 
 impl Mesh {
-    /// 三角形リストからメッシュと BVH を構築する。
+    /// 三角形リストからメッシュと BVH を構築する（面法線のみ）。
     pub fn new(tris: Vec<Triangle>) -> Self {
         let bvh = Bvh::build(&tris);
-        Self { tris, bvh }
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), bvh }
+    }
+
+    /// 頂点法線付きでメッシュを構築する。`tri_vn` の長さが三角形数と合わない場合は
+    /// 面法線だけのメッシュとして扱う（壊れた入力で添字がずれるより安全側）。
+    pub fn with_normals(tris: Vec<Triangle>, vn: Vec<Vec3>, tri_vn: Vec<[u32; 3]>) -> Self {
+        if vn.is_empty() || tri_vn.len() != tris.len() {
+            return Self::new(tris);
+        }
+        let bvh = Bvh::build(&tris);
+        Self { tris, vn, tri_vn, bvh }
+    }
+
+    /// [`MeshData`] からメッシュを構築する。
+    pub fn with_normals_from(data: MeshData) -> Self {
+        Self::with_normals(data.tris, data.vn, data.tri_vn)
+    }
+
+    /// このメッシュがスムーズシェーディング（頂点法線の補間）を行うか。
+    pub fn is_smooth(&self) -> bool {
+        !self.tri_vn.is_empty()
+    }
+
+    /// 頂点法線の本数（メモリ量の報告用）。
+    pub fn normal_count(&self) -> usize {
+        self.vn.len()
     }
 
     /// メッシュ内三角形に対するレイ交差判定（オブジェクト空間）。
+    /// 頂点法線を持つ三角形なら、重心座標で補間したシェーディング法線を `Hit::ns` に入れる。
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
-        self.bvh.hit(&self.tris, r, tmin, tmax)
+        let mut h = self.bvh.hit(&self.tris, r, tmin, tmax)?;
+        if !self.tri_vn.is_empty() {
+            if let Some(ns) = self.shading_normal(h.prim_id, h.bary, h.ng) {
+                h.ns = ns;
+            }
+        }
+        Some(h)
+    }
+
+    /// 三角形 `tri_id` の重心座標 `(b1, b2)` での補間法線。頂点法線が無い三角形や、
+    /// 補間結果が退化した（長さ 0 の）場合は `None`（= 面法線のまま）。
+    fn shading_normal(&self, tri_id: usize, bary: (f64, f64), ng: Vec3) -> Option<Vec3> {
+        let idx = *self.tri_vn.get(tri_id)?;
+        if idx[0] == NO_NORMAL {
+            return None;
+        }
+        let (b1, b2) = bary;
+        let b0 = 1.0 - b1 - b2;
+        let n = self.vn[idx[0] as usize] * b0 + self.vn[idx[1] as usize] * b1 + self.vn[idx[2] as usize] * b2;
+        let len = n.len();
+        if !(len > 0.0) {
+            return None;
+        }
+        // 幾何法線と同じ側に揃える（向きの取り違えを Hit の不変条件として吸収する）
+        Some(face_forward(n / len, ng))
     }
 }
 
@@ -161,8 +216,19 @@ impl World {
     /// 三角形群からメッシュを構築し、`xform` で配置したインスタンスを追加する。
     /// 追加したインスタンスの ID を返す。
     pub fn add_mesh_instance(&mut self, tris: Vec<Triangle>, xform: Transform, mat_override: Option<usize>) -> usize {
+        self.add_mesh(Mesh::new(tris), xform, mat_override)
+    }
+
+    /// OBJ から読んだメッシュ（頂点法線付きでありうる）を `xform` で配置したインスタンスを追加する。
+    pub fn add_mesh_data_instance(&mut self, data: MeshData, xform: Transform, mat_override: Option<usize>) -> usize {
+        let MeshData { tris, vn, tri_vn } = data;
+        self.add_mesh(Mesh::with_normals(tris, vn, tri_vn), xform, mat_override)
+    }
+
+    /// 構築済みのメッシュを登録してインスタンスを追加する（上の 2 つの共通部分）。
+    fn add_mesh(&mut self, mesh: Mesh, xform: Transform, mat_override: Option<usize>) -> usize {
         let mesh_id = self.meshes.len();
-        self.meshes.push(Mesh::new(tris));
+        self.meshes.push(mesh);
         let inst_id = self.instances.len();
         let world_bounds = instance_world_bounds(&self.meshes[mesh_id], &xform);
         self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds });
@@ -246,14 +312,25 @@ impl World {
                 if t_world < closest {
                     closest = t_world;
                     let mat_id = inst.mat_override.unwrap_or(h_obj.mat_id);
+                    // 法線は逆転置行列で変換する（非一様スケールでも面に垂直なまま）。
+                    // 鏡像（負のスケール）を含む変換では逆転置が向きを反転させうるので、
+                    // シェーディング法線は変換後の幾何法線と同じ側に揃え直す。
+                    let ng = inst.xform.apply_normal(h_obj.ng);
+                    let ns = if h_obj.is_smooth() {
+                        face_forward(inst.xform.apply_normal(h_obj.ns), ng)
+                    } else {
+                        ng
+                    };
                     best = Some(Hit {
                         t: t_world,
                         p: p_world,
-                        n: inst.xform.apply_normal(h_obj.n),
+                        ng,
+                        ns,
                         mat_id,
                         prim_id: h_obj.prim_id,
                         inst_id: Some(inst_id),
                         p_error,
+                        bary: h_obj.bary,
                     });
                 }
                 break;
@@ -360,7 +437,7 @@ impl World {
         };
         let info = &self.lights[light_id];
         let pdf_select = info.weight / self.light_total;
-        pdf_select * info.light.pdf_omega(self, time, from, hit.p, hit.n)
+        pdf_select * info.light.pdf_omega(self, time, from, hit.p, hit.ng)
     }
 
     /// CDF を使ってライトを重点的にサンプリングし、位置・法線・放射輝度・PDF を返す。
@@ -661,6 +738,59 @@ impl LightSample {
     }
 }
 
+/// テスト用のメッシュ生成（頂点法線つき）。スムーズシェーディングの検証で world / integrator の
+/// 両方から使う。
+#[cfg(test)]
+pub(crate) mod test_meshes {
+    use super::*;
+    use crate::obj_loader::MeshData;
+
+    /// z=0 平面の四角形（2 三角形、面法線 +z）。頂点法線を `ns` で指定できる。
+    /// 幾何法線とシェーディング法線を大きく食い違わせた「1 枚ポリゴン」を作るのに使う。
+    pub fn tilted_quad(half: f64, ns: Vec3, mat_id: usize) -> MeshData {
+        let v = |x: f64, y: f64| Vec3::new(x, y, 0.0);
+        let tris = vec![
+            Triangle::new_static(v(-half, -half), v(half, -half), v(half, half), mat_id),
+            Triangle::new_static(v(-half, -half), v(half, half), v(-half, half), mat_id),
+        ];
+        MeshData { tris, vn: vec![ns.norm()], tri_vn: vec![[0, 0, 0], [0, 0, 0]] }
+    }
+
+    /// 経度 `nu` × 緯度 `nv` の UV 球。頂点法線は解析的な法線（中心からの単位ベクトル）。
+    /// `smooth = false` なら頂点法線を付けない（面法線だけの同一形状）。
+    pub fn uv_sphere(center: Vec3, radius: f64, nu: usize, nv: usize, mat_id: usize, smooth: bool) -> MeshData {
+        let mut pos: Vec<Vec3> = Vec::new();
+        let at = |iu: usize, iv: usize| -> Vec3 {
+            let theta = std::f64::consts::PI * (iv as f64) / (nv as f64);
+            let phi = 2.0 * std::f64::consts::PI * (iu as f64) / (nu as f64);
+            Vec3::new(theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin())
+        };
+        for iv in 0..=nv {
+            for iu in 0..nu {
+                pos.push(at(iu, iv));
+            }
+        }
+        let idx = |iu: usize, iv: usize| iv * nu + (iu % nu);
+        let mut tris = Vec::new();
+        let mut tri_vn = Vec::new();
+        let push = |a: usize, b: usize, c: usize, tris: &mut Vec<Triangle>, tri_vn: &mut Vec<[u32; 3]>, pos: &Vec<Vec3>| {
+            let p = |i: usize| center + pos[i] * radius;
+            tris.push(Triangle::new_static(p(a), p(b), p(c), mat_id));
+            tri_vn.push([a as u32, b as u32, c as u32]);
+        };
+        for iv in 0..nv {
+            for iu in 0..nu {
+                let (a, b, c, d) = (idx(iu, iv), idx(iu + 1, iv), idx(iu + 1, iv + 1), idx(iu, iv + 1));
+                push(a, b, c, &mut tris, &mut tri_vn, &pos);
+                push(a, c, d, &mut tris, &mut tri_vn, &pos);
+            }
+        }
+        // 頂点法線 = 単位球面上の位置（解析的な法線）
+        let vn = pos.clone();
+        if smooth { MeshData { tris, vn, tri_vn } } else { MeshData::flat(tris) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,14 +829,22 @@ mod tests {
                 }
                 if t_world < closest {
                     closest = t_world;
+                    let ng = inst.xform.apply_normal(h_obj.ng);
+                    let ns = if h_obj.is_smooth() {
+                        face_forward(inst.xform.apply_normal(h_obj.ns), ng)
+                    } else {
+                        ng
+                    };
                     best = Some(Hit {
                         t: t_world,
                         p: p_world,
-                        n: inst.xform.apply_normal(h_obj.n),
+                        ng,
+                        ns,
                         mat_id: inst.mat_override.unwrap_or(h_obj.mat_id),
                         prim_id: h_obj.prim_id,
                         inst_id: Some(inst_id),
                         p_error,
+                        bary: h_obj.bary,
                     });
                 }
                 break;
@@ -730,7 +868,8 @@ mod tests {
                 let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
                 assert_eq!(a.t.to_bits(), b.t.to_bits(), "{}: t {} vs {}", what, a.t, b.t);
                 assert_eq!(bits(a.p), bits(b.p), "{}: p", what);
-                assert_eq!(bits(a.n), bits(b.n), "{}: n", what);
+                assert_eq!(bits(a.ng), bits(b.ng), "{}: ng", what);
+                assert_eq!(bits(a.ns), bits(b.ns), "{}: ns", what);
                 assert_eq!((a.mat_id, a.prim_id, a.inst_id), (b.mat_id, b.prim_id, b.inst_id), "{}: ids", what);
             }
             (a, b) => panic!("{}: hit mismatch {:?} vs {:?}", what, a.map(|h| (h.t, h.inst_id)), b.map(|h| (h.t, h.inst_id))),
@@ -1007,19 +1146,19 @@ mod tests {
                     let Some(h) = world.hit(Ray { o, d: (target - o).norm(), time: 0.0 }, 0.0, 1e30) else { continue };
                     // 三角形の法線の向き（巻き順）は保証されないので、実際に当たった物体の中心から外向きにそろえる
                     let hit_center = if h.inst_id.is_some() { box_center } else { center };
-                    let n = if h.n.dot(h.p - hit_center) < 0.0 { -h.n.norm() } else { h.n.norm() };
+                    let n = if h.ng.dot(h.p - hit_center) < 0.0 { -h.ng.norm() } else { h.ng.norm() };
                     for _ in 0..4 {
                         let mut d = uniform_sphere_dir(&mut rng);
                         if d.dot(n) < 0.0 { d = -d; }
                         // 外向き
-                        if let Some(h2) = world.hit(Ray { o: offset_ray_origin(h.p, h.p_error, h.n, d), d, time: 0.0 }, 0.0, 1e30) {
+                        if let Some(h2) = world.hit(Ray { o: offset_ray_origin(h.p, h.p_error, h.ng, d), d, time: 0.0 }, 0.0, 1e30) {
                             assert!(!(h2.inst_id == h.inst_id && (h.inst_id.is_some() || h2.prim_id == h.prim_id)),
                                 "k={} dist={}: outward ray re-hit its own object at t={} (p_error {:?})", k, dist, h2.t, h.p_error.max_abs());
                         }
                         // 内向き（浅すぎる角度は除く）
                         let di = -d;
                         if di.dot(-n) > 0.1 {
-                            let h2 = world.hit(Ray { o: offset_ray_origin(h.p, h.p_error, h.n, di), d: di, time: 0.0 }, 0.0, 1e30)
+                            let h2 = world.hit(Ray { o: offset_ray_origin(h.p, h.p_error, h.ng, di), d: di, time: 0.0 }, 0.0, 1e30)
                                 .unwrap_or_else(|| panic!("k={} dist={}: inward ray escaped its object", k, dist));
                             // 入射面への再ヒットかどうか: 立方体なら新しい交点の面が入射面と平行で、入射面の上（法線方向の
                             // 変位が誤差上界程度）に残る。球なら新しい交点が入射点とほぼ一致する。立方体の辺の近くでは
@@ -1029,7 +1168,7 @@ mod tests {
                             let same_object = h2.inst_id == h.inst_id;
                             let rehit = same_object
                                 && if h.inst_id.is_some() {
-                                    h2.n.norm().dot(h.n.norm()).abs() > 0.999 && (h2.p - h.p).dot(n).abs() <= 10.0 * err
+                                    h2.ng.norm().dot(h.ng.norm()).abs() > 0.999 && (h2.p - h.p).dot(n).abs() <= 10.0 * err
                                 } else {
                                     (h2.p - h.p).len() <= 100.0 * err
                                 };
@@ -1065,7 +1204,7 @@ mod tests {
         let h = world.hit(Ray { o: p + Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 }, 0.0, 1e30).expect("floor hit");
         assert!((h.p - p).len() < 1e-9 && h.inst_id == Some(0));
         let d = Vec3::new(1.0, 0.002, 0.0).norm();
-        let o = offset_ray_origin(h.p, h.p_error, h.n, d);
+        let o = offset_ray_origin(h.p, h.p_error, h.ng, d);
         assert!((o - h.p).len() < 1e-9, "offset {} must be far below the distance to the wall", (o - h.p).len());
         let occluded = world.hit(Ray { o, d, time: 0.0 }, 0.0, 10.0);
         assert!(matches!(occluded, Some(w) if w.inst_id == Some(1)), "thin occluder not detected");
@@ -1253,11 +1392,13 @@ mod tests {
                 let hit = Hit {
                     t: 0.0,
                     p: ls.position,
-                    n: ls.normal,
+                    ng: ls.normal,
+                    ns: ls.normal,
                     mat_id: 0,
                     prim_id: 0,
                     inst_id: None,
                     p_error: Vec3::new(0.0, 0.0, 0.0),
+                    bary: (0.0, 0.0),
                 };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() < 1e-9 * ls.pdf.max(1.0), "light_pdf {} != sample_light pdf {}", pdf, ls.pdf);
@@ -1300,7 +1441,7 @@ mod tests {
                     let wi = (ls.position - from).norm();
                     assert!(ls.normal.dot(-wi) > 0.0, "{}: sampled a point not visible from outside", name);
                 }
-                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0) };
+                let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0) };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "{}: light_pdf {} != sample pdf {}", name, pdf, ls.pdf);
             }
@@ -1456,7 +1597,7 @@ mod tests {
                     let wi = (ls.position - from).norm();
                     assert!(ls.normal.dot(-wi) > 0.0, "r={} eps={:e}: cone sample on the hidden side", r, eps);
                 }
-                let hit = Hit { t: 0.0, p: ls.position, n: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0) };
+                let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0) };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "r={} eps={:e}: light_pdf {} != sample pdf {}", r, eps, pdf, ls.pdf);
             }
@@ -1476,11 +1617,13 @@ mod tests {
         let hit = Hit {
             t: 0.0,
             p: Vec3::new(10.0, 0.0, 0.0),
-            n: Vec3::new(1.0, 0.0, 0.0),
+            ng: Vec3::new(1.0, 0.0, 0.0),
+            ns: Vec3::new(1.0, 0.0, 0.0),
             mat_id: 0,
             prim_id: 3, // no sphere at this index
             inst_id: None,
             p_error: Vec3::new(0.0, 0.0, 0.0),
+            bary: (0.0, 0.0),
         };
         assert_eq!(world.light_pdf(Vec3::new(5.0, 0.0, 0.0), 0.0, &hit), 0.0);
     }
@@ -1612,5 +1755,402 @@ mod tests {
         // 面積比: 4π·1² : 4π·2² = 1 : 4 -> 選択確率 0.2 : 0.8
         assert!((frac1 - 0.2).abs() < 0.05, "sphere1 fraction {} not near 0.2", frac1);
         assert!((frac2 - 0.8).abs() < 0.05, "sphere2 fraction {} not near 0.8", frac2);
+    }
+
+    // ---- スムーズシェーディング（頂点法線の補間） ----
+
+    use test_meshes::uv_sphere;
+
+    /// 全頂点の法線が同じなら、補間したシェーディング法線は面法線と（向きも含めて）一致する。
+    /// 頂点法線を持たないメッシュとの差が出ないことの最小確認。
+    #[test]
+    fn uniform_vertex_normals_reproduce_the_face_normal() {
+        let n = Vec3::new(0.0, 0.0, 1.0);
+        let tris = vec![Triangle::new_static(
+            Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+        let mesh = Mesh::with_normals(tris, vec![n, n, n], vec![[0, 1, 2]]);
+        for (x, y) in [(0.0, 0.0), (0.4, -0.3), (-0.3, -0.5), (0.0, 0.8)] {
+            let o = Vec3::new(x, y, 3.0);
+            let h = mesh.hit(Ray { o, d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+            assert!((h.ns - h.ng).len() < 1e-15, "ns {:?} != ng {:?}", h.ns, h.ng);
+            assert!(!h.is_smooth(), "一様な頂点法線は面法線と同一なので is_smooth は false");
+        }
+    }
+
+    /// 球メッシュの補間法線は解析的な法線と一致し、面法線の誤差は分割を上げるまで大きい。
+    ///
+    /// 中心が原点の球で頂点法線 = 頂点位置（単位ベクトル）にすると、交点 p は三角形上の
+    /// 重心座標の線形結合なので `normalize(Σ bᵢ·vᵢ) == normalize(p)`、つまり補間法線は
+    /// **分割によらず解析解と一致する**（丸め誤差のみ）。面法線の方は三角形の大きさぶんずれ、
+    /// 分割を上げると 1/nu のオーダーで減る。この 2 つの差が「補間が効いている」ことの証拠。
+    #[test]
+    fn interpolated_normals_match_the_analytic_sphere_normal() {
+        let center = Vec3::new(0.0, 0.0, 0.0);
+        let mut prev_flat = f64::INFINITY;
+        for &nu in &[8usize, 16, 32, 64] {
+            let smooth = Mesh::with_normals_from(uv_sphere(center, 1.0, nu, nu / 2, 0, true));
+            let flat = Mesh::with_normals_from(uv_sphere(center, 1.0, nu, nu / 2, 0, false));
+            let (mut worst_smooth, mut worst_flat) = (0.0f64, 0.0f64);
+            let mut rng = Rng::new(7);
+            for _ in 0..300 {
+                let dir = uniform_sphere_dir(&mut rng);
+                let o = center + dir * 4.0;
+                let r = Ray { o, d: -dir, time: 0.0 };
+                let (Some(hs), Some(hf)) = (smooth.hit(r, 0.0, 1e30), flat.hit(r, 0.0, 1e30)) else { continue };
+                let ang = |n: Vec3, p: Vec3| n.dot((p - center).norm()).clamp(-1.0, 1.0).acos();
+                worst_smooth = worst_smooth.max(ang(hs.ns, hs.p));
+                worst_flat = worst_flat.max(ang(hf.ns, hf.p));
+            }
+            assert!(worst_smooth < 1e-6, "nu={}: 補間法線は解析解と一致するはず（最大 {} rad）", nu, worst_smooth);
+            assert!(worst_flat > 20.0 * worst_smooth.max(1e-9), "nu={}: 面法線 {} は補間 {} より明確に大きいはず", nu, worst_flat, worst_smooth);
+            assert!(worst_flat < prev_flat, "nu={}: 面法線の誤差は分割を上げると減るはず（{} -> {}）", nu, prev_flat, worst_flat);
+            prev_flat = worst_flat;
+        }
+        // 面法線は 64 分割でもまだ 1 度以上ずれている（補間の 1e-6 rad とは桁が違う）
+        assert!(prev_flat > 0.02, "面法線の最大誤差 {} rad", prev_flat);
+    }
+
+    /// 補間しても `Hit::ng` は面法線のまま（＝自己交差回避の基準が動かない）。
+    /// さらに、原点ずらしを**シェーディング法線で行うミューテーション**では自己交差が起きることを
+    /// 同じテストの中で示す（分離が効いていることの証拠）。
+    #[test]
+    fn geometric_normal_is_kept_for_ray_offsets() {
+        // 大きく傾けた頂点法線を持つ 1 枚の三角形（z=0 平面、面法線は +z）
+        let tris = vec![Triangle::new_static(
+            Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+        let tilted = Vec3::new(0.9, 0.0, 0.436).norm(); // 面法線から約 64 度
+        let mesh = Mesh::with_normals(tris, vec![tilted; 3], vec![[0, 1, 2]]);
+        let h = mesh.hit(Ray { o: Vec3::new(0.0, 0.0, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+        assert!((h.ng - Vec3::new(0.0, 0.0, 1.0)).len() < 1e-15, "ng は面法線のまま: {:?}", h.ng);
+        assert!(h.is_smooth() && (h.ns - tilted).len() < 1e-12);
+
+        // 面に沿って浅く出ていく方向。幾何法線基準なら誤差の箱の外に出るので自己交差しない
+        let d = Vec3::new(1.0, 0.0, 1e-9).norm();
+        let o_geom = crate::geometry::offset_ray_origin(h.p, h.p_error, h.ng, d);
+        assert!(mesh.hit(Ray { o: o_geom, d, time: 0.0 }, 0.0, 1e30).is_none(), "幾何法線でずらせば自分に当たらない");
+    }
+
+    /// 非一様スケールと鏡像（負のスケール）を含むインスタンスでも、
+    /// シェーディング法線は幾何法線と同じ側を向き、単位長のままになる。
+    #[test]
+    fn instance_transform_keeps_shading_normal_on_the_geometric_side() {
+        for scale in [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(2.0, 0.5, 1.0),   // 非一様
+            Vec3::new(-1.0, 1.0, 1.0),  // 鏡像
+            Vec3::new(-2.0, 0.5, 3.0),  // 鏡像 + 非一様
+        ] {
+            let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+            let mut world = World::new();
+            let xform = Transform::scale(scale);
+            world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 24, 12, 0, true), xform, None);
+            world.build_lights(&mats);
+
+            let mut rng = Rng::new(11);
+            let mut checked = 0;
+            for _ in 0..200 {
+                let dir = uniform_sphere_dir(&mut rng);
+                let o = dir * 20.0;
+                let Some(h) = world.hit(Ray { o, d: -dir, time: 0.0 }, 0.0, 1e30) else { continue };
+                assert!((h.ns.len() - 1.0).abs() < 1e-12, "scale {:?}: ns が単位長でない ({})", scale, h.ns.len());
+                assert!((h.ng.len() - 1.0).abs() < 1e-12, "scale {:?}: ng が単位長でない ({})", scale, h.ng.len());
+                assert!(h.ns.dot(h.ng) > 0.0, "scale {:?}: ns が ng の反対を向いた（{:?} vs {:?}）", scale, h.ns, h.ng);
+                checked += 1;
+            }
+            assert!(checked > 100, "scale {:?}: ヒットが少なすぎる ({})", scale, checked);
+        }
+    }
+
+    /// `MeshData` の頂点法線を捨てた（face_normals=true 相当）メッシュは、
+    /// 頂点法線を最初から持たないメッシュと完全に同じヒットを返す。
+    #[test]
+    fn face_normals_flag_matches_a_mesh_without_normals() {
+        let smooth_dropped = Mesh::with_normals_from(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 16, 8, 0, true).into_flat());
+        let never_had = Mesh::with_normals_from(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 16, 8, 0, false));
+        assert!(!smooth_dropped.is_smooth() && !never_had.is_smooth());
+        let mut rng = Rng::new(3);
+        for _ in 0..200 {
+            let dir = uniform_sphere_dir(&mut rng);
+            let r = Ray { o: dir * 5.0, d: -dir, time: 0.0 };
+            match (smooth_dropped.hit(r, 0.0, 1e30), never_had.hit(r, 0.0, 1e30)) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.t.to_bits(), b.t.to_bits());
+                    assert_eq!(a.ng.x.to_bits(), b.ng.x.to_bits());
+                    assert_eq!(a.ns.x.to_bits(), b.ns.x.to_bits());
+                }
+                (None, None) => {}
+                _ => panic!("ヒットの有無が食い違う"),
+            }
+        }
+    }
+
+    /// 頂点法線の配列長が三角形数と合わない壊れた入力は、面法線メッシュとして扱う（添字ずれで落ちない）。
+    #[test]
+    fn mismatched_normal_index_array_is_ignored() {
+        let tris = vec![
+            Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0),
+            Triangle::new_static(Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0),
+        ];
+        let mesh = Mesh::with_normals(tris, vec![Vec3::new(0.0, 0.0, 1.0)], vec![[0, 0, 0]]); // 1 個しかない
+        assert!(!mesh.is_smooth());
+    }
+
+    // ---- スムーズシェーディング: ng / ns の取り違えを検出するテスト ----
+
+    /// せん断・鏡像を含む「意地悪な」変換の一覧（法線の逆転置がもっとも効く形）。
+    fn tricky_transforms() -> Vec<(&'static str, Transform)> {
+        let m = |a: [[f64; 4]; 4]| Transform::from_matrix4(a);
+        vec![
+            ("shear x+=2z", m([[1.0, 0.0, 2.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])),
+            ("shear+mirror x", m([[-1.0, 0.0, 2.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])),
+            ("shear+mirror y", m([[1.0, 3.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])),
+            ("shear xyz + mirror", m([[-1.0, 1.5, 2.5, 0.0], [0.5, 1.0, 0.0, 0.0], [2.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])),
+            ("anisotropic + shear + mirror", m([[-4.0, 2.0, 0.0, 0.0], [0.0, 0.25, 3.0, 0.0], [1.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]])),
+            ("mirror xyz", Transform::scale(Vec3::new(-1.0, -1.0, -1.0))),
+            ("anisotropic", Transform::scale(Vec3::new(-5.0, 0.2, 2.0))),
+        ]
+    }
+
+    /// インスタンス変換の後も `ns · ng > 0` が保たれる（せん断 + 鏡像を含む）。
+    ///
+    /// ミューテーション検出: `World::hit` の変換後の `face_forward` を外すと、
+    /// せん断と鏡像を組み合わせた変換で `ns` が `ng` の反対側へ回り、このテストが落ちる。
+    /// 粗い球（8x4 = 48 三角形）を使うのは、オブジェクト空間での `ns` と `ng` の開きが
+    /// 大きいほど逆転置による向きの入れ替わりが起きやすいから。
+    #[test]
+    fn shading_normal_stays_on_the_geometric_side_through_shearing_transforms() {
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        for (name, xform) in tricky_transforms() {
+            let mut world = World::new();
+            world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 8, 4, 0, true), xform, None);
+            world.build_lights(&mats);
+            let mut rng = Rng::new(17);
+            let (mut checked, mut worst) = (0usize, f64::INFINITY);
+            for _ in 0..4000 {
+                let dir = uniform_sphere_dir(&mut rng);
+                let o = dir * 40.0;
+                let Some(h) = world.hit(Ray { o, d: -dir, time: 0.0 }, 0.0, 1e30) else { continue };
+                let dot = h.ns.dot(h.ng);
+                worst = worst.min(dot);
+                assert!(dot > 0.0, "{}: ns が ng の裏へ回った（ns·ng = {}）", name, dot);
+                assert!((h.ns.len() - 1.0).abs() < 1e-12, "{}: ns が単位長でない", name);
+                checked += 1;
+            }
+            assert!(checked > 500, "{}: ヒットが少なすぎる ({})", name, checked);
+            let _ = worst;
+        }
+    }
+
+    /// **シェーディング法線はインスタンス変換で実際に変換される**（オブジェクト空間のまま使われない）。
+    ///
+    /// 頂点法線が一様なメッシュ（面ごとに補間値が定数）なら、変換後の `ns` は
+    /// `face_forward(apply_normal(ns_obj), ng)` と一致するはず。正しい実装を再実装せずに書ける形にしてある。
+    /// 重心座標での補間（`Σ bᵢ·vᵢ` を計算してから正規化）が入るぶん完全なビット一致にはならないので、
+    /// 許容差 1e-12 で比べる（取り違えたときの差は 0.1 rad 以上なので、これで十分に鋭い）。
+    ///
+    /// ミューテーション検出: `World::hit` で `ns` を変換せず `h_obj.ns` のまま使うと落ちる。
+    /// `ns·ng > 0` と単位長だけを見るテストでは、この取り違えは通り抜ける
+    /// （オブジェクト空間の法線でも両方の条件を満たしてしまうため）。
+    #[test]
+    fn instance_transform_actually_transforms_the_shading_normal() {
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        // 面法線 +z から 50 度傾けた一様な頂点法線。回転・非一様・せん断で「変換しない」と
+        // 明確に違う向きになる。
+        let ns_obj = Vec3::new(0.766, 0.0, 0.643).norm();
+        let mut meaningful_transforms = 0usize;
+        for (name, xform) in tricky_transforms() {
+            let mut world = World::new();
+            world.add_mesh_data_instance(test_meshes::tilted_quad(4.0, ns_obj, 0), xform, None);
+            world.build_lights(&mats);
+
+            let expected_raw = xform.apply_normal(ns_obj);
+            // 点対称（-I）のように、法線の向きが符号だけしか変わらない変換では
+            // 「変換しない」ミューテーションと区別できない。その変換では下の空回り判定を外す。
+            let direction_changes = expected_raw.dot(ns_obj).abs() < 1.0 - 1e-12;
+            if direction_changes {
+                meaningful_transforms += 1;
+            }
+            let mut rng = Rng::new(37);
+            let mut checked = 0usize;
+            let mut differs_from_object_space = 0usize;
+            for _ in 0..2000 {
+                let dir = uniform_sphere_dir(&mut rng);
+                let o = dir * 30.0;
+                let Some(h) = world.hit(Ray { o, d: -dir, time: 0.0 }, 0.0, 1e30) else { continue };
+                let expected = face_forward(expected_raw, h.ng);
+                assert!(
+                    (h.ns - expected).len() < 1e-12,
+                    "{}: ns が変換後の値と違う（ns = {:?}, 期待 {:?}）", name, h.ns, expected
+                );
+                // オブジェクト空間の法線とは実際に違う（テストが空回りしていないこと）
+                if (h.ns - face_forward(ns_obj, h.ng)).len() > 1e-9 {
+                    differs_from_object_space += 1;
+                }
+                checked += 1;
+            }
+            assert!(checked > 200, "{}: ヒットが少なすぎる ({})", name, checked);
+            if direction_changes {
+                assert!(
+                    differs_from_object_space > checked / 2,
+                    "{}: 変換前後で ns が変わらない配置ばかり（テストが空回り）", name
+                );
+            }
+        }
+        assert!(meaningful_transforms >= 4, "向きを変える変換が少なすぎる（{}）", meaningful_transforms);
+    }
+
+    /// **幾何法線はスムーズ化の影響を受けない**: 同じ形状・同じ変換で、頂点法線の有無だけが違う
+    /// 2 つのインスタンスは、同じレイに対して**ビット単位で同じ `ng`** を返す（`ns` だけが違う）。
+    ///
+    /// ミューテーション検出: `World::hit` で `ng` と `ns` を取り違える（入れ替える）と落ちる。
+    /// 幾何法線は自己交差回避・表裏判定・光源 pdf の基準なので、ここが補間値に化けると静かに壊れる。
+    #[test]
+    fn instance_geometric_normal_is_unaffected_by_vertex_normals() {
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        for (name, xform) in tricky_transforms() {
+            let mut smooth_world = World::new();
+            smooth_world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 12, 6, 0, true), xform, None);
+            smooth_world.build_lights(&mats);
+            let mut flat_world = World::new();
+            flat_world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 12, 6, 0, false), xform, None);
+            flat_world.build_lights(&mats);
+
+            let mut rng = Rng::new(23);
+            let (mut checked, mut smooth_seen) = (0usize, 0usize);
+            for _ in 0..2000 {
+                let dir = uniform_sphere_dir(&mut rng);
+                let o = dir * 40.0;
+                let r = Ray { o, d: -dir, time: 0.0 };
+                match (smooth_world.hit(r, 0.0, 1e30), flat_world.hit(r, 0.0, 1e30)) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.t.to_bits(), b.t.to_bits(), "{}: 交差距離が違う", name);
+                        assert_eq!(a.ng.x.to_bits(), b.ng.x.to_bits(), "{}: ng が頂点法線に汚染されている", name);
+                        assert_eq!(a.ng.y.to_bits(), b.ng.y.to_bits(), "{}: ng が頂点法線に汚染されている", name);
+                        assert_eq!(a.ng.z.to_bits(), b.ng.z.to_bits(), "{}: ng が頂点法線に汚染されている", name);
+                        assert_eq!(b.ns.x.to_bits(), b.ng.x.to_bits(), "{}: 面法線メッシュは ns == ng", name);
+                        if a.is_smooth() {
+                            smooth_seen += 1;
+                        }
+                        checked += 1;
+                    }
+                    (None, None) => {}
+                    _ => panic!("{}: ヒットの有無が食い違う", name),
+                }
+            }
+            assert!(checked > 300, "{}: ヒットが少なすぎる ({})", name, checked);
+            assert!(smooth_seen > checked / 2, "{}: 補間が効いているヒットが少なすぎる（テストが空回り）", name);
+        }
+    }
+
+    /// **法線あり／なしが混在するメッシュ**を交差判定（描画が通る経路）で扱える。
+    ///
+    /// `f 1//1 2//2 3//3` と `f 1 2 3` が混ざった OBJ は実在する。ローダーは法線を持たない
+    /// 三角形に番兵 `NO_NORMAL` を入れ、`Mesh::shading_normal` がそれを見て面法線に落とす。
+    ///
+    /// ミューテーション検出: 番兵チェック（`if idx[0] == NO_NORMAL { return None }`）を外すと、
+    /// 法線を持たない三角形に当たった瞬間に `vn[u32::MAX]` で**添字外アクセスのパニック**になる。
+    /// `obj_loader` 側には混在のパーステストがあるが、そこはヒットを通らないので気づけない。
+    #[test]
+    fn mesh_with_mixed_vertex_normals_is_hit_without_panicking() {
+        // 三角形 0（z=0 平面、y<0 側）は傾いた頂点法線つき、三角形 1（y>0 側）は法線なし
+        let tilted = Vec3::new(0.6, 0.0, 0.8).norm();
+        let tris = vec![
+            Triangle::new_static(Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, -0.05, 0.0), 0),
+            Triangle::new_static(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(0.0, 0.05, 0.0), Vec3::new(1.0, 1.0, 0.0), 0),
+        ];
+        let mesh = Mesh::with_normals(tris, vec![tilted], vec![[0, 0, 0], [NO_NORMAL; 3]]);
+        assert!(mesh.is_smooth(), "混在メッシュはスムーズ扱い（三角形ごとに分岐する）");
+
+        let shoot = |y: f64| {
+            mesh.hit(Ray { o: Vec3::new(0.0, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30)
+        };
+        // 頂点法線を持つ側: 補間法線が使われる
+        let h_smooth = shoot(-0.5).expect("法線つきの三角形に当たらない");
+        assert!(h_smooth.is_smooth(), "頂点法線を持つ三角形で補間されていない");
+        assert!((h_smooth.ns - tilted).len() < 1e-12, "補間法線が頂点法線と違う: {:?}", h_smooth.ns);
+        // 頂点法線を持たない側: 面法線のまま（ここで番兵の分岐を踏む）
+        let h_flat = shoot(0.5).expect("法線なしの三角形に当たらない");
+        assert!(!h_flat.is_smooth(), "法線なしの三角形が補間されている");
+        assert_eq!(h_flat.ns.z.to_bits(), h_flat.ng.z.to_bits(), "法線なしの三角形は ns == ng");
+
+        // インスタンス経由（World::hit）でも同じ。変換つきでも番兵の分岐を踏む
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        let mut world = World::new();
+        world.add_mesh_data_instance(
+            MeshData {
+                tris: mesh.tris.clone(),
+                vn: vec![tilted],
+                tri_vn: vec![[0, 0, 0], [NO_NORMAL; 3]],
+            },
+            Transform::scale(Vec3::new(2.0, 0.5, 1.5)),
+            None,
+        );
+        world.build_lights(&mats);
+        let mut smooth_hits = 0;
+        let mut flat_hits = 0;
+        for i in 0..40 {
+            let y = -1.2 + 2.4 * (i as f64) / 39.0;
+            let r = Ray { o: Vec3::new(0.0, y, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+            if let Some(h) = world.hit(r, 0.0, 1e30) {
+                if h.is_smooth() { smooth_hits += 1 } else { flat_hits += 1 }
+            }
+        }
+        assert!(smooth_hits > 0 && flat_hits > 0,
+                "両方の三角形を通っていない（smooth {} / flat {}）", smooth_hits, flat_hits);
+    }
+
+    /// 頂点法線が面法線と逆を向いている（壊れた、あるいは巻き順の違う）メッシュでも、
+    /// `Hit::ns` は `ng` と同じ側に揃う。
+    ///
+    /// ミューテーション検出: `Mesh::shading_normal` の `face_forward` を外すと落ちる。
+    #[test]
+    fn shading_normal_is_flipped_to_the_geometric_side_at_the_mesh() {
+        // 面法線は +z（反時計回り）だが、頂点法線は全て -z を向いている
+        let tris = vec![Triangle::new_static(
+            Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+        let back = Vec3::new(0.0, 0.0, -1.0);
+        let mesh = Mesh::with_normals(tris, vec![back; 3], vec![[0, 1, 2]]);
+        let h = mesh.hit(Ray { o: Vec3::new(0.0, 0.0, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+        assert!(h.ns.dot(h.ng) > 0.0, "ns が ng の裏を向いたまま: ns={:?} ng={:?}", h.ns, h.ng);
+    }
+
+    /// **スムーズな発光メッシュの `light_pdf` は幾何法線で計算される**。
+    ///
+    /// 光源上の点の pdf は「その点の面が参照点をどれだけ斜めに見るか」で決まるので、
+    /// シェーディング法線を使うと MIS の重みが狂う（BSDF サンプリングで光源に当たった経路の重み）。
+    /// 頂点法線の有無だけが違う 2 つの発光メッシュで、同じレイのヒットに対する `light_pdf` が
+    /// ビット単位で一致することを確かめる。
+    ///
+    /// ミューテーション検出: `World::light_pdf` の `hit.ng` を `hit.ns` にすると落ちる。
+    /// （既存の `light_pdf` のテストは球・矩形の光源しか使っておらず、`ns == ng` なので素通りする。）
+    #[test]
+    fn light_pdf_on_a_smooth_emissive_mesh_uses_the_geometric_normal() {
+        let mats = vec![Material::DiffuseLight { emit: Color::new(5.0, 5.0, 5.0) }];
+        let build = |smooth: bool| {
+            let mut w = World::new();
+            w.add_mesh_data_instance(
+                uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 12, 6, 0, smooth), Transform::identity(), None);
+            w.build_lights(&mats);
+            w
+        };
+        let (smooth_world, flat_world) = (build(true), build(false));
+        let mut rng = Rng::new(29);
+        let (mut checked, mut smooth_hits) = (0usize, 0usize);
+        for _ in 0..1500 {
+            let dir = uniform_sphere_dir(&mut rng);
+            let from = dir * 6.0;
+            let r = Ray { o: from, d: -dir, time: 0.0 };
+            let (Some(hs), Some(hf)) = (smooth_world.hit(r, 0.0, 1e30), flat_world.hit(r, 0.0, 1e30)) else { continue };
+            let ps = smooth_world.light_pdf(from, 0.0, &hs);
+            let pf = flat_world.light_pdf(from, 0.0, &hf);
+            assert!(ps > 0.0, "発光メッシュへのヒットなのに pdf が 0");
+            assert_eq!(ps.to_bits(), pf.to_bits(), "light_pdf が頂点法線に影響されている（{} vs {}）", ps, pf);
+            if hs.is_smooth() {
+                smooth_hits += 1;
+            }
+            checked += 1;
+        }
+        assert!(checked > 300, "ヒットが少なすぎる ({})", checked);
+        assert!(smooth_hits > checked / 2, "補間が効いているヒットが少なすぎる（テストが空回り）");
     }
 }

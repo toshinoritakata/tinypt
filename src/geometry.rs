@@ -16,8 +16,14 @@ pub struct Hit {
     pub t: f64,
     /// 交差点のワールド座標
     pub p: Vec3,
-    /// 交差点の法線ベクトル
-    pub n: Vec3,
+    /// **幾何法線**: 実際の面（三角形の面法線・球の中心からの向き）の法線。単位ベクトル。
+    /// 自己交差回避の原点ずらし（[`offset_ray_origin`]）、表裏（entering）の判定、
+    /// 光源の面積・pdf に使う。シェーディング法線と混同すると 3c の自己交差回避が壊れる。
+    pub ng: Vec3,
+    /// **シェーディング法線**: 頂点法線を重心座標で補間したもの。頂点法線が無ければ `ng` と同じ。
+    /// 単位ベクトルで、常に `ng` と同じ側を向く（反対を向いていたらメッシュ側で反転済み）。
+    /// BSDF の `sample` / `eval` と NEE の cos 項に使う。
+    pub ns: Vec3,
     /// 交差したマテリアルのインデックス
     pub mat_id: usize,
     /// ヒットしたプリミティブのインデックス（球: World::spheres 上の位置、
@@ -30,6 +36,24 @@ pub struct Hit {
     /// `p ± p_error` の箱の中にある。新しいレイを出すときは [`offset_ray_origin`] でこの箱の外へ
     /// 幾何法線方向にずらす（シーンの大きさや絶対位置に依存しない自己交差回避）。
     pub p_error: Vec3,
+    /// 三角形の重心座標 (b1, b2)（v1, v2 の重み。v0 の重みは 1 − b1 − b2）。
+    /// メッシュが頂点法線を持つときの補間に使う。球のヒットでは (0, 0)。
+    pub bary: (f64, f64),
+}
+
+impl Hit {
+    /// シェーディング法線が幾何法線と別物か（頂点法線の補間が効いているか）。
+    /// 変換や向き揃えを、補間していないヒットで無駄に行わないための判定。
+    #[inline]
+    pub fn is_smooth(&self) -> bool {
+        self.ns.x != self.ng.x || self.ns.y != self.ng.y || self.ns.z != self.ng.z
+    }
+}
+
+/// `n` を `reference` と同じ側に向ける（内積が負なら反転）。PBRT の `FaceForward`。
+#[inline]
+pub fn face_forward(n: Vec3, reference: Vec3) -> Vec3 {
+    if n.dot(reference) < 0.0 { -n } else { n }
 }
 
 /// PBRT v4 の `OffsetRayOrigin`: 交差点 `p`（誤差上界 `p_err`、幾何法線 `n`）から方向 `w` へ出すレイの原点。
@@ -264,7 +288,8 @@ impl Sphere {
         let p = self.c + p_obj;
         let p_error = p_obj.abs() * gamma(5) + (self.c.abs() + p_obj.abs()) * gamma(2);
         let n = p_obj / self.r;
-        Some(Hit { t, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error })
+        // 解析的な球なので幾何法線とシェーディング法線は同一（補間する頂点法線を持たない）
+        Some(Hit { t, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (0.0, 0.0) })
     }
 }
 
@@ -399,6 +424,7 @@ impl Triangle {
         let p = v0 * b0 + v1 * u + v2 * v;
         let p_error = ((v0 * b0).abs() + (v1 * u).abs() + (v2 * v).abs()) * gamma(9);
         let n = e1.cross(e2).norm();
-        Hit { t: thit, p, n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error }
+        // 頂点法線の補間はメッシュ側（三角形は自分の法線配列を知らない）。ここでは ns = ng。
+        Hit { t: thit, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (u, v) }
     }
 }
