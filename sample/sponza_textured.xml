@@ -13,7 +13,8 @@
      モデルは cm 単位（横 37m 相当）なので to_world で 0.01 倍して m 単位にしている。
      このシーンは sponza.mtl とテクスチャ（assets/models/sponza/textures/）を使う本来の見た目版。
      obj の <shape> に <bsdf> を書かない = MTL から材質を作る（<bsdf> を書くと全体を上書き = sponza.xml）。
-     MTL の d / map_d / map_bump / map_Ka は未対応（警告が出る）。BSDF の違いは床置きの球 3 個で見る。
+     MTL の map_Kd（色）・map_d（アルファマスク）・map_bump（バンプ。強度は -bm × MTL_BUMP_K）を使う。
+     未対応の map_Ka / Ke は警告が出る。BSDF の違いは床置きの球 3 個で見る。
 
      照明: 開いた屋根の上の面光源（太陽相当）+ 弱い constant 環境光。両方 NEE が効く。
 

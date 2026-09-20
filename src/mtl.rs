@@ -21,8 +21,12 @@ pub struct MtlMaterial {
     pub map_kd: Option<String>,
     /// `map_d`（T3 まで未対応）
     pub map_d: Option<String>,
-    /// `map_bump` / `bump`（未対応）
+    /// `map_bump` / `bump`（ハイトマップ）
     pub map_bump: Option<String>,
+    /// `map_bump` の `-bm` 強度（既定 1.0）
+    pub bm: f64,
+    /// `norm`（MTL 拡張: タンジェント空間ノーマルマップ）
+    pub norm: Option<String>,
     /// `map_Ka`（未対応）
     pub map_ka: Option<String>,
 }
@@ -39,6 +43,8 @@ impl MtlMaterial {
             map_kd: None,
             map_d: None,
             map_bump: None,
+            bm: 1.0,
+            norm: None,
             map_ka: None,
         }
     }
@@ -58,20 +64,95 @@ impl MtlFile {
     }
 }
 
-/// テクスチャのパス引数を取り出す。`-s 1 1 1 file.png` のようなオプション付きは最後のトークンを
-/// パスとし、オプションが無ければ行の残り全体（空白入りファイル名を許す）。`\` は `/` に直す。
-fn parse_map_path(rest: &str) -> Option<String> {
-    let rest = rest.trim();
-    let path = if rest.starts_with('-') {
-        rest.split_whitespace().last().unwrap_or("")
-    } else {
-        rest
-    };
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.replace('\\', "/"))
+/// テクスチャ行のオプション（使うものだけ）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapOptions {
+    /// `-bm`（バンプ強度）。指定が無ければ 1.0
+    pub bm: f64,
+}
+
+impl Default for MapOptions {
+    fn default() -> Self {
+        Self { bm: 1.0 }
     }
+}
+
+/// 既知のテクスチャオプションと、その引数の個数。
+const MAP_FLAGS: &[(&str, usize)] = &[
+    ("-bm", 1), ("-s", 3), ("-o", 3), ("-t", 3), ("-mm", 2), ("-imfchan", 1), ("-texres", 1),
+    ("-type", 1), ("-clamp", 1), ("-blendu", 1), ("-blendv", 1), ("-cc", 1), ("-boost", 1),
+];
+
+/// テクスチャ行の引数を「パス + オプション」に分ける。既知のオプション（[`MAP_FLAGS`]）は引数の個数ぶん
+/// 読み飛ばし、残りの行全体をパスとする（空白入りファイル名を許す）。`\` は `/` に直す。
+/// 未知の `-x` に当たったら、従来どおり「最後のトークンだけをパスにする」挙動に退避する。
+fn parse_map_args(rest: &str) -> (Option<String>, MapOptions) {
+    let rest = rest.trim();
+    let mut opts = MapOptions::default();
+    let mut pos = 0usize;
+    // 次のトークン（開始, 終了）を返す
+    let next = |from: usize| -> Option<(usize, usize)> {
+        let bytes = rest.as_bytes();
+        let mut i = from;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let start = i;
+        while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        Some((start, i))
+    };
+    loop {
+        let Some((s, e)) = next(pos) else { break };
+        let tok = &rest[s..e];
+        if !tok.starts_with('-') {
+            break;
+        }
+        match MAP_FLAGS.iter().find(|(f, _)| *f == tok) {
+            Some(&(flag, n)) => {
+                let mut p = e;
+                let mut first: Option<&str> = None;
+                for k in 0..n {
+                    match next(p) {
+                        Some((s2, e2)) => {
+                            if k == 0 {
+                                first = Some(&rest[s2..e2]);
+                            }
+                            p = e2;
+                        }
+                        None => return (None, opts), // 引数が足りない
+                    }
+                }
+                if flag == "-bm" {
+                    if let Some(v) = first.and_then(|t| t.parse::<f64>().ok()) {
+                        opts.bm = v;
+                    }
+                }
+                pos = p;
+            }
+            None => {
+                // 未知のオプション: 最後のトークンだけをパスにする
+                let last = rest.split_whitespace().last().unwrap_or("");
+                let path = if last.is_empty() { None } else { Some(last.replace('\\', "/")) };
+                return (path, MapOptions::default());
+            }
+        }
+    }
+    let path = rest[pos..].trim();
+    if path.is_empty() {
+        (None, opts)
+    } else {
+        (Some(path.replace('\\', "/")), opts)
+    }
+}
+
+/// パスだけが要るとき（`-bm` 以外のオプションは無視）。
+fn parse_map_path(rest: &str) -> Option<String> {
+    parse_map_args(rest).0
 }
 
 fn parse3(rest: &str, fallback: [f64; 3]) -> [f64; 3] {
@@ -138,7 +219,12 @@ pub fn parse_mtl(text: &str) -> MtlFile {
             }
             "map_Kd" => m.map_kd = parse_map_path(rest),
             "map_d" => m.map_d = parse_map_path(rest),
-            "map_bump" | "bump" => m.map_bump = parse_map_path(rest),
+            "map_bump" | "bump" | "map_Bump" => {
+                let (path, opts) = parse_map_args(rest);
+                m.map_bump = path;
+                m.bm = opts.bm;
+            }
+            "norm" => m.norm = parse_map_path(rest),
             "map_Ka" => m.map_ka = parse_map_path(rest),
             _ => {} // Ni / Tf / illum / Ka など: 使わない
         }
@@ -196,5 +282,34 @@ mod tests {
         assert!((m.d - 0.75).abs() < 1e-12);
         assert_eq!(m.map_kd.as_deref(), Some("dir/t.png"));
         assert_eq!(m.kd, [0.4; 3]);
+    }
+
+    #[test]
+    fn map_options_are_consumed_and_bm_is_read() {
+        let a = parse_map_args("-bm 0.5 textures/x.png");
+        assert_eq!(a.0.as_deref(), Some("textures/x.png"));
+        assert_eq!(a.1.bm, 0.5);
+        let a = parse_map_args("-s 1 1 1 -bm 2 dir\\t.png");
+        assert_eq!((a.0.as_deref(), a.1.bm), (Some("dir/t.png"), 2.0));
+        // 空白入りファイル名（オプションの後ろは行の残り全体）
+        let a = parse_map_args("-bm 3 my dir/a b.png");
+        assert_eq!((a.0.as_deref(), a.1.bm), (Some("my dir/a b.png"), 3.0));
+        // オプション無し: 既定 bm = 1、パスは行全体
+        let a = parse_map_args("plain name.png");
+        assert_eq!((a.0.as_deref(), a.1.bm), (Some("plain name.png"), 1.0));
+        // 未知のフラグは「最後のトークン」に退避（bm は既定）
+        let a = parse_map_args("-zz 1 file.png");
+        assert_eq!((a.0.as_deref(), a.1.bm), (Some("file.png"), 1.0));
+        // 引数が足りない
+        assert_eq!(parse_map_args("-bm").0, None);
+    }
+
+    #[test]
+    fn map_bump_bm_and_norm_keys_are_parsed() {
+        let f = parse_mtl("newmtl A\n\tmap_Bump -bm 0.5 t\\b.png\n\tnorm n.png\nnewmtl B\n\tbump h.png\n");
+        let a = f.get("A").unwrap();
+        assert_eq!((a.map_bump.as_deref(), a.bm, a.norm.as_deref()), (Some("t/b.png"), 0.5, Some("n.png")));
+        let b = f.get("B").unwrap();
+        assert_eq!((b.map_bump.as_deref(), b.bm, b.norm.as_deref()), (Some("h.png"), 1.0, None));
     }
 }

@@ -34,6 +34,7 @@ use crate::material::Material;
 use crate::math::{Color, Vec3};
 use crate::material::TexId;
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
+use crate::constants::normal_map::MTL_BUMP_K;
 use crate::normal_map::{HeightMap, MapId, NormalMap};
 use crate::obj_loader::{load_obj_groups, load_obj_mesh, MeshData, ObjGroups};
 use crate::texture::{AlphaMask, Texture, Wrap};
@@ -527,7 +528,7 @@ fn parse_shape(
         && el.child_tag("emitter").is_none()
         && el.boolean_or("use_mtl", true)
     {
-        parse_obj_with_mtl(el, base_dir, world, mats, mat_maps, textures, mtl_state);
+        parse_obj_with_mtl(el, base_dir, world, mats, mat_maps, textures, normal_maps, mtl_state);
         return;
     }
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
@@ -601,6 +602,13 @@ fn push_material(mats: &mut Vec<Material>, mat_maps: &mut Vec<Option<MapId>>, ma
     mats.len() - 1
 }
 
+/// 法線マップの種別（キャッシュのキー）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MapKind {
+    Height,
+    Tangent,
+}
+
 /// MTL 読み込みの状態（シーン読み込み 1 回ぶん）。
 #[derive(Default)]
 struct MtlState {
@@ -608,6 +616,10 @@ struct MtlState {
     tex_cache: std::collections::HashMap<PathBuf, Option<TexId>>,
     /// 解決済み絶対パス → アルファマスク（`map_d`）。テクスチャと同じく同じ画像を 2 度読まない
     mask_cache: std::collections::HashMap<PathBuf, Option<Arc<AlphaMask>>>,
+    /// 解決済み絶対パス + 種別 + 強度（`f64` のビット）→ 登録済みマップ。同じ画像を 2 度読まない。
+    /// 種別をキーに含めるのは、同じ画像をハイト用／ノーマル用の両方に読む場合があるため。強度も含めるのは、
+    /// `HeightMap` が強度を持つので `-bm` の違う材質が同じ登録を共有すると強度が入れ替わるため
+    map_cache: std::collections::HashMap<(PathBuf, MapKind, u64), Option<MapId>>,
     /// 定数の `d < 1`（マスク無し）を無視する警告を出したか（シーンで 1 回だけ）
     warned_alpha: bool,
 }
@@ -623,6 +635,7 @@ fn parse_obj_with_mtl(
     mats: &mut Vec<Material>,
     mat_maps: &mut Vec<Option<MapId>>,
     textures: &mut Vec<Texture>,
+    normal_maps: &mut Vec<NormalMap>,
     state: &mut MtlState,
 ) {
     let filename = match el.string("filename") {
@@ -667,23 +680,26 @@ fn parse_obj_with_mtl(
     let base = mats.len();
     // 材質ごとのアルファ（マスク, d）。`mat_names` と同じ添字
     let mut alphas: Vec<Option<(Arc<AlphaMask>, f32)>> = Vec::with_capacity(mat_names.len());
-    for name in &mat_names {
+    let mut maps: Vec<Option<MapId>> = Vec::with_capacity(mat_names.len());
+    for (mi, name) in mat_names.iter().enumerate() {
         let found = libs.iter().find_map(|(dir, f)| f.get(name).map(|m| (dir, m)));
         let mat = match found {
             Some((dir, m)) => {
-                let (mat, alpha) = mtl_to_material(m, dir, textures, state);
+                let (mat, alpha, map) = mtl_to_material(m, dir, textures, normal_maps, state);
                 alphas.push(alpha);
+                maps.push(map);
                 mat
             }
             None => {
                 alphas.push(None);
+                maps.push(None);
                 if !name.is_empty() && !mtllibs.is_empty() {
                     warn(&format!("material '{}' not found in mtl; defaulting to diffuse", name));
                 }
                 Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }
             }
         };
-        push_material(mats, mat_maps, mat, None);
+        push_material(mats, mat_maps, mat, maps[mi]);
     }
     for t in mesh.tris.iter_mut() {
         t.mat_id += base;
@@ -737,6 +753,44 @@ fn load_mtl_texture(dir: &Path, rel: &str, textures: &mut Vec<Texture>, state: &
     id
 }
 
+/// MTL の `norm` / `map_bump` を読んで `normal_maps` に登録し、その添字を返す（キャッシュ経由）。
+/// どちらもリニア（データ）として読む。読み込みに失敗したら警告して `None`（摂動なし）。
+fn load_mtl_map(
+    dir: &Path,
+    rel: &str,
+    kind: MapKind,
+    strength: f64,
+    normal_maps: &mut Vec<NormalMap>,
+    state: &mut MtlState,
+) -> Option<MapId> {
+    let joined = dir.join(rel);
+    let key = std::fs::canonicalize(&joined).unwrap_or(joined);
+    let cache_key = (key.clone(), kind, strength.to_bits());
+    if let Some(&cached) = state.map_cache.get(&cache_key) {
+        return cached;
+    }
+    let path = key.to_string_lossy();
+    let map = match kind {
+        MapKind::Tangent => Texture::load(path.as_ref(), false, Wrap::Repeat)
+            .map(|tex| NormalMap::Tangent { tex, scale: 1.0 }),
+        MapKind::Height => {
+            HeightMap::load(path.as_ref(), Wrap::Repeat).map(|map| NormalMap::Height { map, strength })
+        }
+    };
+    let id = match map {
+        Ok(m) => {
+            normal_maps.push(m);
+            Some((normal_maps.len() - 1) as MapId)
+        }
+        Err(e) => {
+            warn(&format!("failed to load normal/bump map '{}': {}; ignored", key.display(), e));
+            None
+        }
+    };
+    state.map_cache.insert(cache_key, id);
+    id
+}
+
 /// MTL の `map_d` をアルファマスクとして（キャッシュ経由で）読む。リニア（データ）扱い。
 fn load_mtl_mask(dir: &Path, rel: &str, state: &mut MtlState) -> Option<Arc<AlphaMask>> {
     let joined = dir.join(rel);
@@ -761,10 +815,10 @@ fn mtl_to_material(
     m: &MtlMaterial,
     dir: &Path,
     textures: &mut Vec<Texture>,
+    normal_maps: &mut Vec<NormalMap>,
     state: &mut MtlState,
-) -> (Material, Option<(Arc<AlphaMask>, f32)>) {
+) -> (Material, Option<(Arc<AlphaMask>, f32)>, Option<MapId>) {
     let mut unsupported: Vec<&str> = Vec::new();
-    if m.map_bump.is_some() { unsupported.push("map_bump"); }
     if m.map_ka.is_some() { unsupported.push("map_Ka"); }
     if m.ke.iter().any(|&c| c != 0.0) { unsupported.push("Ke (emission)"); }
     if !unsupported.is_empty() {
@@ -785,15 +839,28 @@ fn mtl_to_material(
         }
     };
 
+    // 法線の摂動: `norm`（タンジェント空間ノーマルマップ）があればそれ、無ければ `map_bump`（ハイトマップ）。
+    // GGX の分岐でも同じく付くので、材質の種類を決める前に取得する
+    if m.norm.is_some() && m.map_bump.is_some() {
+        warn(&format!("mtl material '{}': both norm and map_bump given; using norm", m.name));
+    }
+    let map = if let Some(p) = m.norm.as_deref() {
+        load_mtl_map(dir, p, MapKind::Tangent, 1.0, normal_maps, state)
+    } else if let Some(p) = m.map_bump.as_deref() {
+        load_mtl_map(dir, p, MapKind::Height, m.bm * MTL_BUMP_K, normal_maps, state)
+    } else {
+        None
+    };
+
     let kd = Color::new(m.kd[0], m.kd[1], m.kd[2]);
     let ks = Color::new(m.ks[0], m.ks[1], m.ks[2]);
     if ks.luminance() > 0.05 && m.ns > 1.0 {
         // Blinn-Phong 指数 → GGX の粗さ: alpha = sqrt(2 / (Ns + 2))
         let rough = (2.0 / (m.ns + 2.0)).sqrt().clamp(1e-3, 1.0);
-        return (Material::Ggx { albedo: ks, alpha: rough }, alpha);
+        return (Material::Ggx { albedo: ks, alpha: rough }, alpha, map);
     }
     let tex = m.map_kd.as_deref().and_then(|p| load_mtl_texture(dir, p, textures, state));
-    (Material::Lambert { albedo: kd, albedo_tex: tex }, alpha)
+    (Material::Lambert { albedo: kd, albedo_tex: tex }, alpha, map)
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -1931,6 +1998,89 @@ mod tests {
             assert_eq!(s.mat_maps.len(), 1);
             // 外側のマップ（2 番目に登録されたもの）が使われる
             assert_eq!(s.mat_maps[0], Some(1));
+        });
+    }
+
+    // ---- MTL の map_bump / norm（NM S5） ----
+
+    /// UV 付きの OBJ（2 三角形: 材質 A, B）と、指定の MTL を書く。テクスチャは textures/a.png（1x1）。
+    fn write_uv_obj_and_mtl(dir: &Path, mtl: &str) {
+        let obj = "mtllib m.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n\
+                   usemtl A\nf 1/1 2/2 3/3\nusemtl B\nf 1/1 2/2 3/3\n";
+        std::fs::write(dir.join("m.obj"), obj).unwrap();
+        std::fs::write(dir.join("m.mtl"), mtl).unwrap();
+    }
+
+    /// `map_bump` を持つ材質だけがバンプ付きになり、強度は `bm · MTL_BUMP_K`。`unsupported` の警告は出ない。
+    #[test]
+    fn map_bump_attaches_only_to_its_material() {
+        with_mtl_dir(|dir| {
+            write_uv_obj_and_mtl(dir, "newmtl A\n\tKd 1 1 1\n\tmap_bump -bm 2 textures\\a.png\nnewmtl B\n\tKd 1 1 1\n");
+            let (s, w) = capture_warnings(|| load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0);
+            assert_eq!(s.mats.len(), 2);
+            assert_eq!(s.mat_maps.len(), s.mats.len());
+            assert_eq!((s.mat_maps[0].is_some(), s.mat_maps[1].is_some()), (true, false));
+            match &s.normal_maps[s.mat_maps[0].unwrap() as usize] {
+                NormalMap::Height { strength, .. } => assert!((strength - 2.0 * MTL_BUMP_K).abs() < 1e-12),
+                _ => panic!("ハイトマップのはず"),
+            }
+            assert!(!w.iter().any(|m| m.contains("map_bump")), "{:?}", w);
+        });
+    }
+
+    /// `<bsdf>` 上書きと `use_mtl=false` ではマップは付かない。
+    #[test]
+    fn bump_maps_are_not_attached_when_mtl_is_bypassed() {
+        with_mtl_dir(|dir| {
+            write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tmap_bump textures\\a.png\n");
+            let over = obj_scene_xml(r#"<bsdf type="diffuse"/>"#);
+            let s = load_scene_from_str(&over, dir, &cfg(), (None, None)).unwrap().0;
+            assert!(s.mat_maps.is_empty() && s.normal_maps.is_empty());
+            let off = obj_scene_xml(r#"<boolean name="use_mtl" value="false"/>"#);
+            let s = load_scene_from_str(&off, dir, &cfg(), (None, None)).unwrap().0;
+            assert!(s.mat_maps.is_empty() && s.normal_maps.is_empty());
+        });
+    }
+
+    /// GGX の分岐（明るい Ks かつ Ns > 1）でもマップは付く。
+    #[test]
+    fn ggx_materials_get_the_bump_map_too() {
+        with_mtl_dir(|dir| {
+            write_uv_obj_and_mtl(dir, "newmtl A\n\tKs 0.9 0.9 0.9\n\tNs 100\n\tmap_bump textures\\a.png\nnewmtl B\n\tKd 1 1 1\n");
+            let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert!(matches!(s.mats[0], Material::Ggx { .. }));
+            assert!(s.mat_maps[0].is_some());
+        });
+    }
+
+    /// `norm` があれば `norm`（タンジェント）を採用し、`map_bump` 併存の警告は材質ごとに 1 回。
+    #[test]
+    fn norm_wins_over_map_bump_with_one_warning_per_material() {
+        with_mtl_dir(|dir| {
+            write_uv_obj_and_mtl(
+                dir,
+                "newmtl A\n\tnorm textures\\a.png\n\tmap_bump textures\\a.png\nnewmtl B\n\tnorm textures\\a.png\n\tmap_bump textures\\a.png\n",
+            );
+            let (s, w) = capture_warnings(|| load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0);
+            assert!(s.normal_maps.iter().all(|m| matches!(m, NormalMap::Tangent { .. })));
+            assert_eq!(w.iter().filter(|m| m.contains("both norm and map_bump")).count(), 2, "{:?}", w);
+        });
+    }
+
+    /// 同じ画像・同じ種別・同じ強度は 1 度だけ読む。強度が違えば別登録、種別が違えば別登録。
+    #[test]
+    fn map_cache_is_keyed_by_path_kind_and_strength() {
+        with_mtl_dir(|dir| {
+            write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tmap_bump textures/a.png\n");
+            let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(s.normal_maps.len(), 1);
+            assert_eq!(s.mat_maps[0], s.mat_maps[1]);
+            write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tmap_bump -bm 3 textures/a.png\n");
+            let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(s.normal_maps.len(), 2, "強度違いが同じ登録を共有した");
+            write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tnorm textures/a.png\n");
+            let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(s.normal_maps.len(), 2, "種別違いが同じ登録を共有した");
         });
     }
 }
