@@ -34,6 +34,7 @@ use crate::material::Material;
 use crate::math::{Color, Vec3};
 use crate::material::TexId;
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
+use crate::normal_map::{HeightMap, MapId, NormalMap};
 use crate::obj_loader::{load_obj_groups, load_obj_mesh, MeshData, ObjGroups};
 use crate::texture::{AlphaMask, Texture, Wrap};
 use std::sync::Arc;
@@ -289,6 +290,8 @@ pub fn load_scene_from_str(
     let mut mats: Vec<Material> = Vec::new();
     let mut textures: Vec<Texture> = Vec::new();
     let mut mtl_state = MtlState::default();
+    let mut normal_maps: Vec<NormalMap> = Vec::new();
+    let mut mat_maps: Vec<Option<MapId>> = Vec::new();
     let mut cam: Option<Camera> = None;
     let mut env: Option<EnvMap> = None;
 
@@ -301,7 +304,9 @@ pub fn load_scene_from_str(
                     warn(&format!("unsupported sensor type '{}', ignored", child.typ()));
                 }
             }
-            "shape" => parse_shape(child, base_dir, &mut world, &mut mats, &mut textures, &mut mtl_state),
+            "shape" => parse_shape(
+                child, base_dir, &mut world, &mut mats, &mut mat_maps, &mut textures, &mut normal_maps, &mut mtl_state,
+            ),
             // シーン直下の emitter は環境マップ（envmap / constant）
             "emitter" => {
                 if let Some(e) = parse_scene_emitter(child, base_dir) {
@@ -330,7 +335,12 @@ pub fn load_scene_from_str(
     let env = Some(env.unwrap_or_else(|| EnvMap::constant(Color::new(0.0, 0.0, 0.0))));
 
     world.build_lights(&mats);
-    Ok((Scene { cam, world, mats, textures, env }, settings))
+    // マップを持つ材質が 1 つも無ければテーブルを空にする（積分器は空テーブルなら何も引かない）
+    if mat_maps.iter().all(|m| m.is_none()) {
+        mat_maps.clear();
+    }
+    debug_assert!(mat_maps.is_empty() || mat_maps.len() == mats.len());
+    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
@@ -499,12 +509,15 @@ fn parse_lookat(el: &Element) -> Option<(Vec3, Vec3, Vec3)> {
 /// `shape` を World へ追加する。
 /// `sphere` は解析的プリミティブ、`obj` / `rectangle` / `cube` / `disk` は
 /// 三角形メッシュ + インスタンス（`to_world` 変換）として配置する。
+#[allow(clippy::too_many_arguments)]
 fn parse_shape(
     el: &Element,
     base_dir: &Path,
     world: &mut World,
     mats: &mut Vec<Material>,
+    mat_maps: &mut Vec<Option<MapId>>,
     textures: &mut Vec<Texture>,
+    normal_maps: &mut Vec<NormalMap>,
     mtl_state: &mut MtlState,
 ) {
     // OBJ で `<bsdf>` も `<emitter>` も無く、`use_mtl` が false でなければ MTL から材質を作る。
@@ -514,17 +527,17 @@ fn parse_shape(
         && el.child_tag("emitter").is_none()
         && el.boolean_or("use_mtl", true)
     {
-        parse_obj_with_mtl(el, base_dir, world, mats, textures, mtl_state);
+        parse_obj_with_mtl(el, base_dir, world, mats, mat_maps, textures, mtl_state);
         return;
     }
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
-    let mat = if let Some(em) = el.child_tag("emitter") {
-        parse_emitter(em)
+    let (mat, map) = if let Some(em) = el.child_tag("emitter") {
+        (parse_emitter(em), None)
     } else if let Some(b) = el.child_tag("bsdf") {
-        parse_bsdf(b, base_dir, textures)
+        parse_bsdf(b, base_dir, textures, normal_maps)
     } else {
         warn(&format!("shape type '{}' without bsdf or emitter; defaulting to diffuse", el.typ()));
-        Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }
+        (Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }, None)
     };
     let mat_id = mats.len();
 
@@ -537,7 +550,7 @@ fn parse_shape(
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
-            mats.push(mat);
+            push_material(mats, mat_maps, mat, map);
             world.add_sphere(Sphere { c: center, r: radius, mat_id });
             return;
         }
@@ -575,8 +588,17 @@ fn parse_shape(
         .child_tag("transform")
         .map(parse_transform)
         .unwrap_or_else(Transform::identity);
-    mats.push(mat);
+    push_material(mats, mat_maps, mat, map);
     world.add_mesh_data_instance(mesh, xform, None);
+}
+
+/// 材質を `mats` に積む**唯一の入口**。`mat_maps` は常に `mats` と同じ長さに保つ
+/// （ずれると別の材質にマップが掛かる）。返り値は `mat_id`。
+fn push_material(mats: &mut Vec<Material>, mat_maps: &mut Vec<Option<MapId>>, mat: Material, map: Option<MapId>) -> usize {
+    debug_assert_eq!(mats.len(), mat_maps.len(), "mats and mat_maps out of sync");
+    mats.push(mat);
+    mat_maps.push(map);
+    mats.len() - 1
 }
 
 /// MTL 読み込みの状態（シーン読み込み 1 回ぶん）。
@@ -599,6 +621,7 @@ fn parse_obj_with_mtl(
     base_dir: &Path,
     world: &mut World,
     mats: &mut Vec<Material>,
+    mat_maps: &mut Vec<Option<MapId>>,
     textures: &mut Vec<Texture>,
     state: &mut MtlState,
 ) {
@@ -660,7 +683,7 @@ fn parse_obj_with_mtl(
                 Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }
             }
         };
-        mats.push(mat);
+        push_material(mats, mat_maps, mat, None);
     }
     for t in mesh.tris.iter_mut() {
         t.mat_id += base;
@@ -945,6 +968,24 @@ fn parse_emitter(el: &Element) -> Material {
 /// および Mitsuba の `raw`（true でリニア、既定の false なら sRGB デコード）。
 /// 読み込みに失敗したら警告して `None`（呼び出し側が定数色にフォールバックする）。
 fn parse_texture(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> Option<TexId> {
+    let (resolved, wrap) = bitmap_source(el, base_dir)?;
+    // 色テクスチャは sRGB。`raw=true` はデータテクスチャ（リニア）
+    let srgb = !el.boolean_or("raw", false);
+    match Texture::load(resolved.to_string_lossy().as_ref(), srgb, wrap) {
+        Ok(t) => {
+            textures.push(t);
+            Some((textures.len() - 1) as TexId)
+        }
+        Err(e) => {
+            warn(&format!("failed to load texture '{}': {}; ignored", resolved.display(), e));
+            None
+        }
+    }
+}
+
+/// `<texture type="bitmap">` の `filename`（XML からの相対）と `wrap_mode` を読む。
+/// 型が違う・`filename` が無いときは警告して `None`。
+fn bitmap_source(el: &Element, base_dir: &Path) -> Option<(PathBuf, Wrap)> {
     if el.typ() != "bitmap" {
         warn(&format!("unsupported texture type '{}', ignored", el.typ()));
         return None;
@@ -967,28 +1008,88 @@ fn parse_texture(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> 
         },
         None => Wrap::Repeat,
     };
-    // 色テクスチャは sRGB。`raw=true` はデータテクスチャ（リニア）
-    let srgb = !el.boolean_or("raw", false);
-    match Texture::load(resolved.to_string_lossy().as_ref(), srgb, wrap) {
-        Ok(t) => {
-            textures.push(t);
-            Some((textures.len() - 1) as TexId)
+    Some((resolved, wrap))
+}
+
+/// `normalmap` / `bumpmap` ラッパーの子テクスチャ（`name="normalmap"` / `name="bumpmap"`、無名でも可）。
+fn wrapper_texture<'a>(el: &'a Element, name: &str) -> Option<&'a Element> {
+    el.prop("texture", name)
+        .or_else(|| el.children.iter().find(|c| c.tag == "texture" && c.attr("name").is_none()))
+}
+
+/// `bsdf` をマテリアルにマップする。法線マップ／バンプマップのラッパーなら、内側の材質と一緒に
+/// `normal_maps` に登録したマップの添字も返す（材質は `Copy` のままなので、マップは側テーブルで持つ）。
+fn parse_bsdf(
+    el: &Element,
+    base_dir: &Path,
+    textures: &mut Vec<Texture>,
+    normal_maps: &mut Vec<NormalMap>,
+) -> (Material, Option<MapId>) {
+    let default_mat = || Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None };
+    match el.typ() {
+        // 両面 BSDF はラッパーなので内側を展開（内側にマップのラッパーがあればそのまま素通し）
+        "twosided" => el
+            .child_tag("bsdf")
+            .map(|c| parse_bsdf(c, base_dir, textures, normal_maps))
+            .unwrap_or((default_mat(), None)),
+        // Mitsuba 準拠: `<bsdf type="normalmap">` は子のテクスチャ（タンジェント空間ノーマルマップ）を
+        // 内側の `<bsdf>` に適用する。テクスチャは**リニア（raw）固定**で読む
+        "normalmap" | "bumpmap" => {
+            let is_normal = el.typ() == "normalmap";
+            let (mat, inner_map) = match el.child_tag("bsdf") {
+                Some(inner) => parse_bsdf(inner, base_dir, textures, normal_maps),
+                None => {
+                    warn(&format!("{} without an inner <bsdf>; defaulting to diffuse", el.typ()));
+                    (default_mat(), None)
+                }
+            };
+            if inner_map.is_some() {
+                // 1 材質スロットに 1 マップ: 外側を採用し、内側のマップは捨てる（登録済みの分は参照されないまま残る）
+                warn(&format!("nested {} inside {}; the outer map is used", el.typ(), el.typ()));
+            }
+            let tex_el = wrapper_texture(el, if is_normal { "normalmap" } else { "bumpmap" });
+            let map = tex_el.and_then(|t| {
+                let (path, wrap) = bitmap_source(t, base_dir)?;
+                let path_s = path.to_string_lossy();
+                if is_normal {
+                    if !t.boolean_or("raw", true) {
+                        warn("normalmap texture with raw=false: ignoring it and reading the map as linear (raw)");
+                    }
+                    match Texture::load(path_s.as_ref(), false, wrap) {
+                        Ok(tex) => Some(NormalMap::Tangent { tex, scale: 1.0 }),
+                        Err(e) => {
+                            warn(&format!("failed to load normal map '{}': {}; ignored", path.display(), e));
+                            None
+                        }
+                    }
+                } else {
+                    match HeightMap::load(path_s.as_ref(), wrap) {
+                        Ok(map) => Some(NormalMap::Height { map, strength: el.float("scale").unwrap_or(1.0) }),
+                        Err(e) => {
+                            warn(&format!("failed to load height map '{}': {}; ignored", path.display(), e));
+                            None
+                        }
+                    }
+                }
+            });
+            if tex_el.is_none() {
+                warn(&format!("{} without a <texture>; map ignored", el.typ()));
+            }
+            match map {
+                Some(m) => {
+                    normal_maps.push(m);
+                    (mat, Some((normal_maps.len() - 1) as MapId))
+                }
+                None => (mat, inner_map),
+            }
         }
-        Err(e) => {
-            warn(&format!("failed to load texture '{}': {}; ignored", resolved.display(), e));
-            None
-        }
+        _ => (parse_leaf_bsdf(el, base_dir, textures), None),
     }
 }
 
-/// `bsdf` をマテリアルにマップする。
-fn parse_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> Material {
+/// マップのラッパーではない通常の `bsdf` をマテリアルにマップする。
+fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> Material {
     match el.typ() {
-        // 両面 BSDF はラッパーなので内側を展開
-        "twosided" => el
-            .child_tag("bsdf")
-            .map(|c| parse_bsdf(c, base_dir, textures))
-            .unwrap_or(Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }),
         "diffuse" => {
             // `reflectance` はテクスチャか定数色。テクスチャがある場合、定数色は色の倍率になる
             // （両方あれば掛け合わせる。片方だけなら他方は白 = 1 倍）。
@@ -1736,6 +1837,100 @@ mod tests {
             std::fs::write(dir.join("m.mtl"), "newmtl A\n\tKd 1 1 1\nnewmtl B\n\tKd 1 1 1\n").unwrap();
             let scene = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
             assert!(!scene.world.meshes()[0].has_alpha());
+        });
+    }
+
+    // ---- 法線マップ / バンプマップのラッパー（NM S4） ----
+
+    fn map_scene<T>(body: &str, f: impl FnOnce(Scene, Vec<String>) -> T) -> T {
+        with_png(1, 1, &[[128, 128, 255]], |dir, name| {
+            let xml = format!(r#"<scene version="3.0.0">{}</scene>"#, body.replace("MAP.png", name));
+            let (scene, warnings) = capture_warnings(|| load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0);
+            f(scene, warnings)
+        })
+    }
+
+    const NMAP: &str = r#"<texture type="bitmap" name="normalmap"><string name="filename" value="MAP.png"/></texture>"#;
+    const DIFF: &str = r#"<bsdf type="diffuse"/>"#;
+
+    /// 材質表とマップ表が全 shape 経路（球・メッシュ・MTL 混在）で同じ長さに保たれ、マップの添字が正しい材質に付く。
+    #[test]
+    fn mat_maps_stay_in_sync_with_mats_across_shapes() {
+        let body = format!(
+            r#"<shape type="sphere"><bsdf type="diffuse"/></shape>
+               <shape type="rectangle"><bsdf type="normalmap">{n}{d}</bsdf></shape>
+               <shape type="cube"><bsdf type="twosided"><bsdf type="normalmap">{n}{d}</bsdf></bsdf></shape>
+               <shape type="rectangle"><bsdf type="bumpmap"><float name="scale" value="2"/><texture type="bitmap" name="bumpmap"><string name="filename" value="MAP.png"/></texture>{d}</bsdf></shape>
+               <shape type="disk"><bsdf type="diffuse"/></shape>"#,
+            n = NMAP, d = DIFF
+        );
+        map_scene(&body, |s, w| {
+            assert_eq!(s.mats.len(), 5);
+            assert_eq!(s.mat_maps.len(), s.mats.len());
+            let some: Vec<bool> = s.mat_maps.iter().map(|m| m.is_some()).collect();
+            assert_eq!(some, vec![false, true, true, true, false]);
+            assert_eq!(s.normal_maps.len(), 3);
+            assert!(matches!(s.normal_maps[0], NormalMap::Tangent { .. }));
+            assert!(matches!(s.normal_maps[2], NormalMap::Height { strength, .. } if strength == 2.0));
+            assert!(w.iter().all(|m| m.contains("sensor")), "{:?}", w);
+        });
+    }
+
+    /// マップが 1 つも無ければ `mat_maps` は空（積分器は何も引かない）。
+    #[test]
+    fn scenes_without_maps_have_empty_tables() {
+        let s = load(r#"<scene version="3.0.0"><shape type="sphere"><bsdf type="diffuse"/></shape></scene>"#);
+        assert!(s.mat_maps.is_empty() && s.normal_maps.is_empty());
+    }
+
+    /// MTL 経路（マップ無し）と混在しても表がずれない。
+    #[test]
+    fn mat_maps_stay_in_sync_with_mtl_materials() {
+        with_mtl_dir(|dir| {
+            let xml = r#"<scene version="3.0.0">
+                <shape type="obj"><string name="filename" value="m.obj"/></shape>
+                <shape type="rectangle"><bsdf type="normalmap"><texture type="bitmap"><string name="filename" value="textures/a.png"/></texture><bsdf type="diffuse"/></bsdf></shape>
+              </scene>"#;
+            let s = load_scene_from_str(xml, dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(s.mat_maps.len(), s.mats.len());
+            assert_eq!(s.mat_maps.iter().filter(|m| m.is_some()).count(), 1);
+            assert!(s.mat_maps.last().unwrap().is_some());
+        });
+    }
+
+    /// ノーマルマップのテクスチャは raw（リニア）固定。`raw="false"` は警告して無視。
+    /// 内側の `<bsdf>` が無ければ diffuse + 警告。二重ラップは外側を採用して警告。
+    #[test]
+    fn wrapper_warnings_and_raw_reading() {
+        let raw_false = format!(
+            r#"<shape type="rectangle"><bsdf type="normalmap"><texture type="bitmap" name="normalmap"><string name="filename" value="MAP.png"/><boolean name="raw" value="false"/></texture>{}</bsdf></shape>"#,
+            DIFF
+        );
+        map_scene(&raw_false, |s, w| {
+            assert!(w.iter().any(|m| m.contains("raw=false")), "{:?}", w);
+            // (128,128,255) をリニアで読んだ値（sRGB デコードされていない）
+            match &s.normal_maps[0] {
+                NormalMap::Tangent { tex, .. } => {
+                    let c = tex.sample((0.5, 0.5));
+                    assert!((c.r() - 128.0 / 255.0).abs() < 1e-12, "sRGB で読まれている: {}", c.r());
+                }
+                _ => panic!(),
+            }
+        });
+        let no_inner = format!(r#"<shape type="rectangle"><bsdf type="normalmap">{}</bsdf></shape>"#, NMAP);
+        map_scene(&no_inner, |s, w| {
+            assert!(w.iter().any(|m| m.contains("without an inner")), "{:?}", w);
+            assert!(matches!(s.mats[0], Material::Lambert { .. }));
+        });
+        let nested = format!(
+            r#"<shape type="rectangle"><bsdf type="normalmap">{n}<bsdf type="normalmap">{n}{d}</bsdf></bsdf></shape>"#,
+            n = NMAP, d = DIFF
+        );
+        map_scene(&nested, |s, w| {
+            assert!(w.iter().any(|m| m.contains("nested")), "{:?}", w);
+            assert_eq!(s.mat_maps.len(), 1);
+            // 外側のマップ（2 番目に登録されたもの）が使われる
+            assert_eq!(s.mat_maps[0], Some(1));
         });
     }
 }

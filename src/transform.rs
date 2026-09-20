@@ -145,6 +145,12 @@ impl Transform {
         self.a_inv.mul_vec(v_world)
     }
 
+    /// オブジェクト空間の方向ベクトル（接ベクトルなど）をワールドへ: `v' = A·v`（正規化しない）。
+    /// 法線ではないので逆転置は**使わない**（せん断・非一様スケールで向きがずれる）。
+    pub fn apply_vec(self, v_obj: Vec3) -> Vec3 {
+        self.a.mul_vec(v_obj)
+    }
+
     /// オブジェクト空間の法線をワールド空間へ（逆転置行列で変換し正規化）。
     pub fn apply_normal(self, n_obj: Vec3) -> Vec3 {
         self.normal_mat.mul_vec(n_obj).norm()

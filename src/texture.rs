@@ -14,6 +14,8 @@
 //! バイリニア補間（テクセル**中心**を基準）。範囲外の UV は [`Wrap`] で決める
 //! （既定は Mitsuba と同じ `repeat`）。
 
+use std::sync::OnceLock;
+
 use crate::math::{srgb_to_linear, Color};
 
 /// テクスチャ座標が [0, 1] の外に出たときの扱い。
@@ -42,17 +44,36 @@ pub struct Texture {
     width: usize,
     /// 高さ（テクセル）
     height: usize,
-    /// リニア色のテクセル（行優先、1 行目が画像の上端）
-    texels: Vec<Color>,
+    /// 8bit の RGB テクセル（行優先、stride 3、1 行目が画像の上端）。1 テクセル 3 バイト
+    /// （リニア色の `Color` = f64×3 = 24 バイトで持つ場合の 1/8）
+    texels: Vec<u8>,
+    /// 8bit 値 → リニア値の表（sRGB デコード、またはデータ用の恒等 `i / 255`）
+    lut: &'static [f64; 256],
     /// 範囲外 UV の扱い
     wrap: Wrap,
 }
 
+/// 8bit の変換表を 1 度だけ作る（`srgb` なら sRGB デコード、でなければ恒等）。
+fn lut(srgb: bool) -> &'static [f64; 256] {
+    static SRGB: OnceLock<[f64; 256]> = OnceLock::new();
+    static LINEAR: OnceLock<[f64; 256]> = OnceLock::new();
+    let cell = if srgb { &SRGB } else { &LINEAR };
+    cell.get_or_init(|| {
+        let mut t = [0.0; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            let x = i as f64 / 255.0;
+            *v = if srgb { srgb_to_linear(x) } else { x };
+        }
+        t
+    })
+}
+
 impl Texture {
-    /// リニア色のテクセル列から作る（テスト・合成テクスチャ用）。
-    pub fn from_linear(width: usize, height: usize, texels: Vec<Color>, wrap: Wrap) -> Self {
-        assert_eq!(texels.len(), width * height, "texel count must be width * height");
-        Self { width, height, texels, wrap }
+    /// 8bit RGB のテクセル列（行優先、`width * height * 3` 個）から作る（テスト・合成テクスチャ用）。
+    /// `srgb` が true なら sRGB としてデコードし、false ならそのまま `i / 255`（データ用）。
+    pub fn from_texels_u8(width: usize, height: usize, texels: Vec<u8>, srgb: bool, wrap: Wrap) -> Self {
+        assert_eq!(texels.len(), width * height * 3, "texel bytes must be width * height * 3");
+        Self { width, height, texels, lut: lut(srgb), wrap }
     }
 
     /// 画像ファイル（PNG / JPEG など `image` crate が読める形式）から読み込む。
@@ -66,18 +87,9 @@ impl Texture {
         if w == 0 || h == 0 {
             return Err(format!("{}: empty image", path));
         }
-        // 8bit は取りうる値が 256 通りしかないので、変換表を 1 度だけ作る
-        let lut: Vec<f64> = (0..256)
-            .map(|i| {
-                let x = i as f64 / 255.0;
-                if srgb { srgb_to_linear(x) } else { x }
-            })
-            .collect();
-        let texels = rgb
-            .pixels()
-            .map(|p| Color::new(lut[p.0[0] as usize], lut[p.0[1] as usize], lut[p.0[2] as usize]))
-            .collect();
-        Ok(Self { width: w, height: h, texels, wrap })
+        // 変換は読み出し時に表で行う。読み込みは画素列をそのまま持つだけ
+        let texels = rgb.into_raw();
+        Ok(Self { width: w, height: h, texels, lut: lut(srgb), wrap })
     }
 
     /// 幅・高さ（テクセル）。
@@ -97,7 +109,9 @@ impl Texture {
             Wrap::Repeat => (x.rem_euclid(w), y.rem_euclid(h)),
             Wrap::Clamp => (x.clamp(0, w - 1), y.clamp(0, h - 1)),
         };
-        self.texels[(y as usize) * self.width + (x as usize)]
+        let i = ((y as usize) * self.width + (x as usize)) * 3;
+        let t = &self.texels[i..i + 3];
+        Color::new(self.lut[t[0] as usize], self.lut[t[1] as usize], self.lut[t[2] as usize])
     }
 
     /// UV でバイリニア補間した色を返す。
@@ -204,13 +218,11 @@ mod tests {
     /// 2x2 のテクスチャ。左下が赤・右下が緑・左上が青・右上が白。
     fn checker() -> Texture {
         // 行優先で上の行から: 左上(青) 右上(白) / 左下(赤) 右下(緑)
-        Texture::from_linear(
+        Texture::from_texels_u8(
             2,
             2,
-            vec![
-                Color::new(0.0, 0.0, 1.0), Color::new(1.0, 1.0, 1.0),
-                Color::new(1.0, 0.0, 0.0), Color::new(0.0, 1.0, 0.0),
-            ],
+            vec![0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0],
+            false,
             Wrap::Clamp,
         )
     }
@@ -242,9 +254,9 @@ mod tests {
     /// `repeat` は 1 を超える UV を巻き戻す。`clamp` は端で止める。
     #[test]
     fn wrap_modes_behave_differently_outside_the_unit_square() {
-        let texels = vec![Color::new(1.0, 0.0, 0.0), Color::new(0.0, 0.0, 1.0)]; // 左:赤 右:青
-        let rep = Texture::from_linear(2, 1, texels.iter().copied().collect(), Wrap::Repeat);
-        let cla = Texture::from_linear(2, 1, texels, Wrap::Clamp);
+        let texels = vec![255, 0, 0, 0, 0, 255]; // 左:赤 右:青
+        let rep = Texture::from_texels_u8(2, 1, texels.clone(), false, Wrap::Repeat);
+        let cla = Texture::from_texels_u8(2, 1, texels, false, Wrap::Clamp);
         // u = 1.25 は repeat では u = 0.25（左のテクセル中心 = 赤）に戻る
         let c = rep.sample((1.25, 0.5));
         assert!((c.r() - 1.0).abs() < 1e-12 && c.b().abs() < 1e-12, "repeat: {:?}", (c.r(), c.b()));

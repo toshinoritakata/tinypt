@@ -14,6 +14,7 @@
 //!
 //! パストレーシングではこの積分をモンテカルロ推定で近似する。
 
+use crate::constants::normal_map::NS_NG_MIN;
 use crate::constants::path::FIREFLY_CLAMP;
 use crate::constants::RAY_T_MAX;
 use crate::env::EnvMap;
@@ -21,6 +22,7 @@ use crate::material::{BsdfSample, Material};
 use crate::math::{Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::normal_map::{orthonormalize, MapId, NormalMap};
 use crate::texture::Texture;
 use crate::world::World;
 
@@ -66,7 +68,7 @@ pub struct PathLimits {
 pub fn radiance(
     world: &World,
     mats: &[Material],
-    textures: &[Texture],
+    surfaces: &Surfaces,
     env: Option<&EnvMap>,
     ray: Ray,
     rng: &mut Rng,
@@ -102,7 +104,16 @@ pub fn radiance(
         };
 
         // テクスチャはここで 1 度だけ交差点の UV で評価し、以降の BSDF はテクスチャを知らない
-        let mat = mats[hit.mat_id].resolve_textures(textures, hit.uv);
+        let mat = mats[hit.mat_id].resolve_textures(surfaces.textures, hit.uv);
+
+        // 法線マップ／バンプマップ: シェーディング法線 `ns` だけを摂動する（1 か所。NEE も `Material::sample` も
+        // この後の `hit.ns` を見るので、両方が同じ摂動後の法線になる）。`ng` / `p` / `p_error` には触れない
+        // （原点ずらし・表裏判定・光源の面積と pdf は幾何法線基準のまま）。
+        let mut hit = hit;
+        if let Some(map_id) = surfaces.map_for(hit.mat_id) {
+            perturb_shading_normal(world, surfaces, map_id, &mut hit, ray.time);
+        }
+        let hit = hit;
 
         // 発光体に命中: 放射輝度を蓄積しパス終了
         if let Some(emit) = mat.emitted() {
@@ -190,6 +201,50 @@ pub fn radiance(
     }
 
     accumulated_radiance
+}
+
+/// 材質ごとのサーフェス属性（色テクスチャと法線マップ）への参照の束。
+pub struct Surfaces<'a> {
+    pub textures: &'a [Texture],
+    pub normal_maps: &'a [NormalMap],
+    /// `mat_id` → `normal_maps` の添字。空ならマップ無し（[`Scene::mat_maps`](crate::scene::Scene::mat_maps) の不変条件）
+    pub mat_maps: &'a [Option<MapId>],
+}
+
+impl<'a> Surfaces<'a> {
+    /// マップ無し・テクスチャ無し（テスト用）。
+    pub const fn none() -> Surfaces<'static> {
+        Surfaces { textures: &[], normal_maps: &[], mat_maps: &[] }
+    }
+
+    /// 色テクスチャだけ（法線マップ無し）。
+    pub const fn textures_only(textures: &'a [Texture]) -> Surfaces<'a> {
+        Surfaces { textures, normal_maps: &[], mat_maps: &[] }
+    }
+
+    /// 材質 `mat_id` の法線マップ。テーブルが空なら即 `None`（マップを使わないシーンのコストは分岐 1 つ）。
+    #[inline]
+    fn map_for(&self, mat_id: usize) -> Option<MapId> {
+        if self.mat_maps.is_empty() {
+            return None;
+        }
+        self.mat_maps.get(mat_id).copied().flatten()
+    }
+}
+
+/// `hit.ns` を材質のマップで摂動する（`ng` などは不変）。接空間を作れない（球・UV 無し・UV 縮退・退化）、
+/// または摂動後が幾何法線の地平線を割る場合は何もしない（元の `ns` のまま）。
+fn perturb_shading_normal(world: &World, surfaces: &Surfaces, map_id: MapId, hit: &mut Hit, time: f64) {
+    let Some(map) = surfaces.normal_maps.get(map_id as usize) else { return };
+    let Some((dpdu, dpdv)) = world.surface_tangents(hit, time) else { return };
+    let Some((t, b)) = orthonormalize(dpdu, dpdv, hit.ns) else { return };
+    let n_pert = map.perturb(hit.uv, t, b, hit.ns, dpdu.len(), dpdv.len());
+    // 摂動結果を幾何法線と同じ側へ揃える。それでも地平線すれすれなら採用しない
+    // （裏返すと `ns·ng > 0` が壊れ、原点ずらしが反対側へ出て自己交差する）
+    let n_pert = face_forward(n_pert, hit.ng);
+    if n_pert.dot(hit.ng) > NS_NG_MIN {
+        hit.ns = n_pert;
+    }
 }
 
 /// Russian Roulette の生存確率: `max(throughput)·η²` を [0.05, 0.95] にクランプする。
@@ -471,7 +526,7 @@ mod tests {
         let mut rng = Rng::new(seed);
         let (mut s, mut s2) = (0.0, 0.0);
         for _ in 0..n {
-            let x = radiance(world, mats, &[], Some(env), ray, &mut rng, limits).r();
+            let x = radiance(world, mats, &Surfaces::none(), Some(env), ray, &mut rng, limits).r();
             s += x;
             s2 += x * x;
         }
@@ -490,9 +545,9 @@ mod tests {
         let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
 
         let mut rng = Rng::new(1);
-        assert_eq!(radiance(&world, &mats, &[], Some(&env), to_light, &mut rng, limits(0)).r(), 0.0);
-        assert_eq!(radiance(&world, &mats, &[], Some(&env), to_light, &mut rng, limits(1)).r(), 4.0);
-        assert_eq!(radiance(&world, &mats, &[], Some(&env), to_floor, &mut rng, limits(1)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(0)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(1)).r(), 4.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_floor, &mut rng, limits(1)).r(), 0.0);
 
         let exact = 0.5 * 4.0 / 9.0;
         for max_depth in [2usize, 3, 8, usize::MAX] {
@@ -875,8 +930,8 @@ mod tests {
                 Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: Some(0) },
                 Material::DiffuseLight { emit: Color::new(60.0, 60.0, 60.0) },
             ];
-            let textures = vec![Texture::from_linear(
-                1, 1, vec![Color::new(reflectance, reflectance, reflectance)], Wrap::Repeat)];
+            let v = (reflectance * 255.0).round() as u8;
+            let textures = vec![Texture::from_texels_u8(1, 1, vec![v, v, v], false, Wrap::Repeat)];
             let mut world = World::new();
             world.add_mesh_data_instance(
                 tilted_quad(8.0, Vec3::new(0.0, 0.0, 1.0), 0), Transform::identity(), None);
@@ -885,7 +940,7 @@ mod tests {
             let mut rng = Rng::new(3);
             let (mut sum, n) = (0.0, 20_000);
             for _ in 0..n {
-                sum += radiance(&world, &mats, &textures, Some(&env), ray, &mut rng,
+                sum += radiance(&world, &mats, &Surfaces::textures_only(&textures), Some(&env), ray, &mut rng,
                                 PathLimits { max_depth: 2, rr_depth: 8 }).r();
             }
             sum / n as f64
@@ -997,5 +1052,240 @@ mod tests {
         assert!(is_black(Color::new(0.0, 0.0, 0.0)));
         assert!(!is_black(Color::new(0.0, 1e-300, 0.0)));
         assert!(!is_black(Color::new(-0.1, 0.0, 0.0)));
+    }
+}
+
+/// 法線マップ／バンプマップの配線テスト（Mitsuba のラッパー構文で作ったシーンを積分器に通す）。
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+    use crate::config::RenderConfig;
+    use crate::mitsuba::load_scene_from_str;
+    use crate::scene::Scene;
+    use std::path::PathBuf;
+
+    fn tmpdir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!("tinypt_maps_{}_{}", std::process::id(), C.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_png(dir: &std::path::Path, name: &str, w: u32, h: u32, px: &[[u8; 3]]) {
+        let mut img = image::RgbImage::new(w, h);
+        for (i, p) in px.iter().enumerate() {
+            img.put_pixel((i as u32) % w, (i as u32) / w, image::Rgb(*p));
+        }
+        img.save(dir.join(name)).unwrap();
+    }
+
+    fn scene(xml: &str, dir: &std::path::Path) -> Scene {
+        load_scene_from_str(xml, dir, &RenderConfig::default(), (None, None)).unwrap().0
+    }
+
+    fn surfaces(s: &Scene) -> Surfaces<'_> {
+        Surfaces { textures: &s.textures, normal_maps: &s.normal_maps, mat_maps: &s.mat_maps }
+    }
+
+    /// `tf`（`<transform>` の中身）を付けた 1 枚の板（法線 +z、UV = (x+1)/2, (y+1)/2）に、`bsdf` を貼る。
+    fn plate_xml(tf: &str, bsdf: &str, extra: &str) -> String {
+        format!(
+            r#"<scene version="3.0.0"><shape type="rectangle"><transform name="to_world">{}</transform>{}</shape>{}</scene>"#,
+            tf, bsdf, extra
+        )
+    }
+
+    fn normalmap_bsdf(file: &str) -> String {
+        format!(
+            r#"<bsdf type="normalmap"><texture type="bitmap" name="normalmap"><string name="filename" value="{}"/></texture><bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf></bsdf>"#,
+            file
+        )
+    }
+
+    fn down_ray(x: f64, y: f64) -> Ray {
+        Ray { o: Vec3::new(x, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }
+    }
+
+    /// 摂動は `ns` だけを変える: `ng` / `p` / `p_error` はビット単位で不変で、`ns · ng > 0`、`ns` は単位。
+    ///
+    /// ミューテーション検出: 摂動結果を `hit.ng` に書くと（`ng` が変わるので）落ちる。
+    #[test]
+    fn perturbation_changes_only_ns() {
+        let dir = tmpdir();
+        write_png(&dir, "n.png", 1, 1, &[[230, 128, 190]]);
+        let s = scene(&plate_xml("", &normalmap_bsdf("n.png"), ""), &dir);
+        let sf = surfaces(&s);
+        let orig = s.world.hit(down_ray(0.3, 0.2), 0.0, 1e30).unwrap();
+        let mut h = orig;
+        let id = sf.map_for(h.mat_id).expect("材質にマップが付いていない");
+        perturb_shading_normal(&s.world, &sf, id, &mut h, 0.0);
+        let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+        assert_eq!(bits(h.ng), bits(orig.ng), "ng が変わった");
+        assert_eq!(bits(h.p), bits(orig.p), "p が変わった");
+        assert_eq!(h.p_error.x.to_bits(), orig.p_error.x.to_bits());
+        assert!((h.ns - orig.ns).len() > 0.1, "ns が摂動されていない");
+        assert!(h.ns.dot(h.ng) > 0.0 && (h.ns.len() - 1.0).abs() < 1e-12);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 強い（z 成分が負の）マップと鏡像インスタンスでも、全ヒットで摂動が効き（`ns` が変わる）、`ns · ng > 0`。
+    ///
+    /// ミューテーション検出: `face_forward(n_pert, hit.ng)` を外すと、`n_pert · ng < 0` になった摂動が
+    /// 地平線判定で捨てられて `ns` が変わらない（`ns` が元のまま）ので落ちる。判定まで外すと `ns · ng < 0` で落ちる。
+    #[test]
+    fn strong_map_on_mirrored_instance_keeps_ns_on_the_geometric_side() {
+        let dir = tmpdir();
+        write_png(&dir, "n.png", 1, 1, &[[255, 128, 60]]);
+        for tf in [r#"<scale x="-5" y="5" z="1"/>"#, r#"<scale x="5" y="-5" z="1"/>"#, r#"<scale x="5" y="5" z="-1"/>"#] {
+            let s = scene(&plate_xml(tf, &normalmap_bsdf("n.png"), ""), &dir);
+            let sf = surfaces(&s);
+            for &(x, y) in &[(0.3, 0.2), (-1.0, 0.7), (2.0, -1.5)] {
+                for &zs in &[3.0, -3.0] {
+                    let r = Ray { o: Vec3::new(x, y, zs), d: Vec3::new(0.0, 0.0, -zs.signum()), time: 0.0 };
+                    let orig = s.world.hit(r, 0.0, 1e30).unwrap();
+                    let mut h = orig;
+                    perturb_shading_normal(&s.world, &sf, sf.map_for(h.mat_id).unwrap(), &mut h, 0.0);
+                    assert!(h.ns.dot(h.ng) > 0.0, "{}: ns·ng = {}", tf, h.ns.dot(h.ng));
+                    assert!((h.ns - orig.ns).len() > 0.1, "{}: 摂動が捨てられた", tf);
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 一様な環境光 L=1 の下で、摂動した法線での「幾何法線の地平線でクリップした」放射照度と一致する。
+    /// NEE と BSDF サンプリングの**両方**が同じ摂動後の `ns` を見ている証拠: 片方だけを摂動すると、
+    /// 2 つの戦略が別の積分を推定するので MIS の混合が参照値から数 % ずれる。
+    ///
+    /// ミューテーション検出: 摂動を NEE 側にだけ／BSDF 側にだけ適用すると落ちる。
+    #[test]
+    fn nee_and_bsdf_strategies_see_the_same_perturbed_normal() {
+        let dir = tmpdir();
+        let rgb = [200u8, 128, 200]; // 約 45° 傾く
+        write_png(&dir, "n.png", 1, 1, &[rgb]);
+        let env = r#"<emitter type="constant"><rgb name="radiance" value="1,1,1"/></emitter>"#;
+        let s = scene(&plate_xml("", &normalmap_bsdf("n.png"), env), &dir);
+        let sf = surfaces(&s);
+        let limits = PathLimits { max_depth: 2, rr_depth: 8 };
+        let mut rng = Rng::new(11);
+        let n = 60_000;
+        let mut sum = 0.0;
+        for _ in 0..n {
+            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits).g();
+        }
+        let got = sum / n as f64;
+
+        // 参照: L_o = ρ/π · ∫_{w·z>0} max(0, n'·w) dw（一様半球サンプリングの数値積分）
+        let dec = |v: u8| 2.0 * v as f64 / 255.0 - 1.0;
+        let np = Vec3::new(dec(rgb[0]), dec(rgb[1]), dec(rgb[2])).norm();
+        let mut rr = Rng::new(5);
+        let m = 2_000_000;
+        let mut acc = 0.0;
+        for _ in 0..m {
+            let mut w = crate::rng::uniform_sphere_dir(&mut rr);
+            if w.z < 0.0 {
+                w = -w;
+            }
+            acc += np.dot(w).max(0.0);
+        }
+        let want = 0.5 / std::f64::consts::PI * (2.0 * std::f64::consts::PI * acc / m as f64);
+        assert!((got - want).abs() / want < 0.02, "got {:.4}, want {:.4}", got, want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// バンプが効く: 傾いたハイトマップは出力を有意に変え、`scale = 0` は**ビット単位で**マップ無しと同じ。
+    #[test]
+    fn bump_map_changes_output_and_zero_strength_is_bit_identical() {
+        let dir = tmpdir();
+        let ramp: Vec<[u8; 3]> = (0..8u8).map(|i| [i * 36; 3]).collect();
+        write_png(&dir, "h.png", 8, 1, &ramp);
+        let env = r#"<emitter type="constant"><rgb name="radiance" value="1,1,1"/></emitter>"#;
+        let bump = |scale: f64| {
+            format!(
+                r#"<bsdf type="bumpmap"><float name="scale" value="{}"/><texture type="bitmap" name="bumpmap"><string name="filename" value="h.png"/><string name="wrap_mode" value="clamp"/></texture><bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf></bsdf>"#,
+                scale
+            )
+        };
+        let plain = r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf>"#;
+        let limits = PathLimits { max_depth: 2, rr_depth: 8 };
+        let run = |xml: &str| {
+            let s = scene(xml, &dir);
+            let sf = surfaces(&s);
+            let mut rng = Rng::new(3);
+            let mut sum = 0.0;
+            for _ in 0..4000 {
+                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits).g();
+            }
+            sum
+        };
+        let base = run(&plate_xml("", plain, env));
+        let zero = run(&plate_xml("", &bump(0.0), env));
+        let strong = run(&plate_xml("", &bump(5.0), env));
+        assert_eq!(zero.to_bits(), base.to_bits(), "scale=0 がマップ無しとビット一致しない");
+        assert!((strong - base).abs() / base > 0.03, "バンプが効いていない: {} vs {}", strong, base);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 球状の法線を焼いた 8x8 マップを板に貼ると、各テクセル中心で摂動後の `ns` が
+    /// 焼いたバイト値から復号した解析解（t = +x, b = +y, n = +z の接空間）と 1e-6 以内で一致する。
+    #[test]
+    fn baked_sphere_normal_map_matches_the_analytic_solution() {
+        let dir = tmpdir();
+        let n = 8usize;
+        let (mut px, mut want) = (vec![[0u8; 3]; n * n], vec![Vec3::new(0.0, 0.0, 0.0); n * n]);
+        let enc = |c: f64| ((c * 0.5 + 0.5) * 255.0).round() as u8;
+        for row in 0..n {
+            for col in 0..n {
+                let (u, v) = ((col as f64 + 0.5) / n as f64, 1.0 - (row as f64 + 0.5) / n as f64);
+                let (a, b) = ((2.0 * u - 1.0) * 0.6, (2.0 * v - 1.0) * 0.6);
+                let nz = (1.0f64 - a * a - b * b).sqrt();
+                let bytes = [enc(a), enc(b), enc(nz)];
+                px[row * n + col] = bytes;
+                let dec = |x: u8| 2.0 * x as f64 / 255.0 - 1.0;
+                want[row * n + col] = Vec3::new(dec(bytes[0]), dec(bytes[1]), dec(bytes[2])).norm();
+            }
+        }
+        write_png(&dir, "n.png", n as u32, n as u32, &px);
+        let s = scene(&plate_xml("", &normalmap_bsdf("n.png"), ""), &dir);
+        let sf = surfaces(&s);
+        for row in 0..n {
+            for col in 0..n {
+                let (u, v) = ((col as f64 + 0.5) / n as f64, 1.0 - (row as f64 + 0.5) / n as f64);
+                let mut h = s.world.hit(down_ray(2.0 * u - 1.0, 2.0 * v - 1.0), 0.0, 1e30).unwrap();
+                perturb_shading_normal(&s.world, &sf, sf.map_for(h.mat_id).unwrap(), &mut h, 0.0);
+                let w = want[row * n + col];
+                assert!((h.ns - w).len() < 1e-6, "({},{}): {:?} vs {:?}", row, col, (h.ns.x, h.ns.y, h.ns.z), (w.x, w.y, w.z));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 法線マップを貼った閉じたメッシュ（立方体）の内側からは、外の光源が見えない（自己交差・光漏れなし）。
+    ///
+    /// ミューテーション検出: 摂動を `ng` に書くと、原点ずらしが摂動した向きになり内側のレイが外へ漏れうる。
+    #[test]
+    fn closed_mesh_with_a_normal_map_does_not_leak_light() {
+        let dir = tmpdir();
+        // 強く傾いた法線を市松に並べる
+        write_png(&dir, "n.png", 2, 2, &[[240, 128, 150], [20, 200, 150], [128, 20, 150], [240, 240, 100]]);
+        let xml = format!(
+            r#"<scene version="3.0.0">
+                 <shape type="cube">{}</shape>
+                 <shape type="rectangle"><transform name="to_world"><translate x="0" y="0" z="3"/><rotate x="1" angle="180"/><scale x="2" y="2" z="1"/></transform>
+                   <emitter type="area"><rgb name="radiance" value="30,30,30"/></emitter></shape>
+               </scene>"#,
+            normalmap_bsdf("n.png")
+        );
+        let s = scene(&xml, &dir);
+        let sf = surfaces(&s);
+        let mut rng = Rng::new(9);
+        let limits = PathLimits { max_depth: 6, rr_depth: 8 };
+        for _ in 0..20_000 {
+            let d = crate::rng::uniform_sphere_dir(&mut rng);
+            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits);
+            assert_eq!(c.r(), 0.0, "立方体の内側に光が漏れた");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

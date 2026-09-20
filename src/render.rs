@@ -22,13 +22,12 @@ use crate::checkpoint::{load_checkpoint, save_checkpoint};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
 use crate::env::EnvMap;
-use crate::integrator::{radiance, PathLimits};
+use crate::integrator::{radiance, PathLimits, Surfaces};
 use crate::material::Material;
 use crate::math::Color;
 use crate::ray::Camera;
 use crate::rng::{seed_for, Rng};
 use crate::scene::Scene;
-use crate::texture::Texture;
 use crate::task::{idx, Task, TileResult};
 use crate::world::World;
 
@@ -106,7 +105,7 @@ fn sample_pixel(
     t: &Task,
     world: &World,
     mats: &[Material],
-    textures: &[Texture],
+    surfaces: &Surfaces,
     env: Option<&EnvMap>,
     cam: &Camera,
     limits: PathLimits,
@@ -121,7 +120,7 @@ fn sample_pixel(
         let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
         let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
         let ray = cam.ray(sx, sy, rng);
-        radiance(world, mats, textures, env, ray, rng, limits)
+        radiance(world, mats, surfaces, env, ray, rng, limits)
     };
 
     if config.adaptive_enabled {
@@ -242,10 +241,16 @@ fn render_with_threads(
 
     let limits = PathLimits { max_depth: config.max_depth, rr_depth: config.rr_depth };
 
+    let surfaces_val = Surfaces {
+        textures: &scene.textures,
+        normal_maps: &scene.normal_maps,
+        mat_maps: &scene.mat_maps,
+    };
+    let surfaces_ref = &surfaces_val;
+
     scope(|sp| {
         let world_ref = &scene.world;
         let mats_ref = &scene.mats;
-        let tex_ref = &scene.textures;
         let cam_ref = &scene.cam;
         let env_ref = scene.env.as_ref();
 
@@ -254,7 +259,7 @@ fn render_with_threads(
             let rtx = rtx.clone();
             let world = world_ref;
             let mats = mats_ref;
-            let textures = tex_ref;
+            let surfaces = surfaces_ref;
             let cam = cam_ref;
             let env = env_ref;
             sp.spawn(move |_| {
@@ -268,7 +273,7 @@ fn render_with_threads(
                     for y in t.y0..t.y1 {
                         for x in t.x0..t.x1 {
                             let local_idx = (y - t.y0) * tile_w + (x - t.x0);
-                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, textures, env, cam, limits, config);
+                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, surfaces, env, cam, limits, config);
                             sum[local_idx] = c;
                             wsum[local_idx] = n;
                         }
@@ -390,6 +395,8 @@ mod tests {
             world: World::new(),
             mats: Vec::new(),
             textures: Vec::new(),
+            normal_maps: Vec::new(),
+            mat_maps: Vec::new(),
             env: None,
         }
     }

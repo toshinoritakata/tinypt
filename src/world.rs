@@ -163,6 +163,43 @@ impl Mesh {
         Some(h)
     }
 
+    /// 三角形 `tri_id` の ∂p/∂u, ∂p/∂v（オブジェクト空間、正規化しない）。`time` は交差判定と同じく
+    /// シャッター時刻で、辺 `e1`/`e2` を `time` で補間して使う（交差点と接空間が別時刻の幾何にならない）。
+    ///
+    /// UV が無い三角形、および UV 三角形が縮退している（行列式が丸めの範囲でゼロ）三角形は `None`。
+    /// 任意基底へのフォールバックはしない（隣接三角形で接空間が飛んで縞になるより、摂動しない方が安全）。
+    /// 縮退の判定は相対: `|det| <= (|a| + |b|)·γ(2)`（`det = a − b`、桁落ちの上界）。
+    pub(crate) fn uv_derivatives(&self, tri_id: usize, time: f64) -> Option<(Vec3, Vec3)> {
+        let idx = *self.tri_uv.get(tri_id)?;
+        if idx[0] == NO_UV {
+            return None;
+        }
+        let (a, b, c) = (self.uv[idx[0] as usize], self.uv[idx[1] as usize], self.uv[idx[2] as usize]);
+        // bary = (v1 の重み, v2 の重み) に合わせて uv0 からの差を取る
+        let (du1, dv1) = (b[0] - a[0], b[1] - a[1]);
+        let (du2, dv2) = (c[0] - a[0], c[1] - a[1]);
+        let (p, q) = (du1 * dv2, du2 * dv1);
+        let det = p - q;
+        if !det.is_finite() || det.abs() <= (p.abs() + q.abs()) * gamma(2) {
+            return None;
+        }
+        let tri = self.tris.get(tri_id)?;
+        let e1 = tri.e1_0 * (1.0 - time) + tri.e1_1 * time;
+        let e2 = tri.e2_0 * (1.0 - time) + tri.e2_1 * time;
+        let dpdu = (e1 * dv2 - e2 * dv1) / det;
+        let dpdv = (e2 * du1 - e1 * du2) / det;
+        Some((dpdu, dpdv))
+    }
+
+    /// UV を持つのに接空間を作れない（UV 三角形が縮退した）三角形の数。
+    /// 呼び出し側（マップを持つ材質を使うとき）がシーンごとに 1 回だけ警告するために使う。
+    /// 全三角形を走査するので、マップを使わないシーンでは呼ばない（読み込み時間を増やさない）。
+    pub fn degenerate_uv_count(&self) -> usize {
+        (0..self.tri_uv.len())
+            .filter(|&i| self.tri_uv[i][0] != NO_UV && self.uv_derivatives(i, 0.0).is_none())
+            .count()
+    }
+
     /// 三角形 `tri_id` の重心座標 `(b1, b2)` での補間 UV。UV を持たない三角形は `None`。
     fn texture_coords(&self, tri_id: usize, bary: (f64, f64)) -> Option<(f64, f64)> {
         let idx = *self.tri_uv.get(tri_id)?;
@@ -457,6 +494,18 @@ impl World {
         }
 
         best
+    }
+
+    /// ヒット点のワールド空間の接ベクトル対 (∂p/∂u, ∂p/∂v)（長さを保つ = 正規化しない）。
+    /// 法線マップ／バンプマップを持つ材質のときだけ呼ぶ想定（`Hit` は接ベクトルを持たず、
+    /// `inst_id` / `prim_id` から必要な点でだけ導出する）。球・UV 無し・UV 縮退は `None`。
+    ///
+    /// 接ベクトルは法線ではないので、インスタンス変換は逆転置ではなく順方向の線形部 `A` で行う。
+    pub fn surface_tangents(&self, hit: &Hit, time: f64) -> Option<(Vec3, Vec3)> {
+        let inst = self.instances.get(hit.inst_id?)?;
+        let mesh = self.meshes.get(inst.mesh_id)?;
+        let (dpdu, dpdv) = mesh.uv_derivatives(hit.prim_id, time)?;
+        Some((inst.xform.apply_vec(dpdu), inst.xform.apply_vec(dpdv)))
     }
 
     /// 発光マテリアルからライトサンプリング構造（CDF）を構築する。
@@ -2087,6 +2136,129 @@ mod tests {
     }
 
     // ---- スムーズシェーディング: ng / ns の取り違えを検出するテスト ----
+
+    /// UV = (x, y) を張った直角三角形（2 枚で正方形）: ∂p/∂u = +x、∂p/∂v = +y。
+    fn uv_plane_world(xform: Transform) -> World {
+        let mut world = World::new();
+        let (a, b, c, d) = (
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let tris = vec![Triangle::new_static(a, b, c, 0), Triangle::new_static(a, c, d, 0)];
+        let uv = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        world.add_mesh_data_instance(MeshData::with_uv(tris, uv, vec![[0, 1, 2], [0, 2, 3]]), xform, None);
+        world
+    }
+
+    fn hit_plane_at(world: &World, x: f64, y: f64, from: Vec3) -> Hit {
+        let target = Vec3::new(x, y, 0.0);
+        let world_target = {
+            // 変換後の板の位置へ撃つため、インスタンスの変換を通した点へ向ける
+            let inst = &world.instances[0];
+            inst.xform.apply_point_with_error(target, Vec3::new(0.0, 0.0, 0.0)).0
+        };
+        let d = (world_target - from).norm();
+        world.hit(Ray { o: from, d, time: 0.0 }, 0.0, 1e30).expect("plane not hit")
+    }
+
+    #[test]
+    fn uv_derivatives_of_an_axis_aligned_uv_plane() {
+        let world = uv_plane_world(Transform::identity());
+        let h = hit_plane_at(&world, 0.7, 0.2, Vec3::new(0.7, 0.2, 3.0));
+        let (dpdu, dpdv) = world.surface_tangents(&h, 0.0).unwrap();
+        assert!((dpdu - Vec3::new(1.0, 0.0, 0.0)).len() < 1e-12, "{:?}", (dpdu.x, dpdu.y, dpdu.z));
+        assert!((dpdv - Vec3::new(0.0, 1.0, 0.0)).len() < 1e-12, "{:?}", (dpdv.x, dpdv.y, dpdv.z));
+    }
+
+    /// 接空間は共有辺をまたいでも連続（同じ平面の 2 三角形で向きが一致）。
+    #[test]
+    fn tangents_are_continuous_across_a_shared_edge() {
+        let world = uv_plane_world(Transform::identity());
+        // 対角線 (0,0)-(1,1) をまたぐ 2 点
+        let h1 = hit_plane_at(&world, 0.6, 0.4, Vec3::new(0.6, 0.4, 3.0));
+        let h2 = hit_plane_at(&world, 0.4, 0.6, Vec3::new(0.4, 0.6, 3.0));
+        assert_ne!(h1.prim_id, h2.prim_id);
+        let (a, _) = world.surface_tangents(&h1, 0.0).unwrap();
+        let (b, _) = world.surface_tangents(&h2, 0.0).unwrap();
+        assert!(a.norm().dot(b.norm()) > 1.0 - 1e-9);
+    }
+
+    /// インスタンス変換: 接ベクトルは順方向の `A·t`。せん断・鏡像・非一様スケールでも、
+    /// 変換後の 2 点の差（板の上の実際の方向）と一致する。
+    ///
+    /// ミューテーション検出: `surface_tangents` の `apply_vec` を `apply_normal`（逆転置 + 正規化）に
+    /// 差し替えると、せん断変換で dpdu が実際の面上の方向からずれてこのテストが落ちる。
+    #[test]
+    fn tangents_follow_the_instance_transform_including_shear() {
+        for (name, xform) in tricky_transforms() {
+            let world = uv_plane_world(xform);
+            let (u0, v0) = (0.3, 0.2);
+            let du = 1e-3;
+            let (pu0, pu1) = (Vec3::new(u0, v0, 0.0), Vec3::new(u0 + du, v0, 0.0));
+            let (pv1, w) = (Vec3::new(u0, v0 + du, 0.0), Vec3::new(0.0, 0.0, 0.0));
+            let map = |p: Vec3| xform.apply_point_with_error(p, w).0;
+            let expect_u = (map(pu1) - map(pu0)) / du;
+            let expect_v = (map(pv1) - map(pu0)) / du;
+            // 板を撃つ点はワールド側の任意の位置から（変換後の板に向けて）
+            let from = map(Vec3::new(u0, v0, 0.0)) + xform.apply_normal(Vec3::new(0.0, 0.0, 1.0)) * 3.0;
+            let h = hit_plane_at(&world, u0, v0, from);
+            let (dpdu, dpdv) = world.surface_tangents(&h, 0.0).unwrap();
+            assert!((dpdu - expect_u).len() < 1e-9 * (1.0 + expect_u.len()), "{}: dpdu {:?} != {:?}", name, (dpdu.x, dpdu.y, dpdu.z), (expect_u.x, expect_u.y, expect_u.z));
+            assert!((dpdv - expect_v).len() < 1e-9 * (1.0 + expect_v.len()), "{}: dpdv", name);
+        }
+    }
+
+    /// UV 三角形が縮退（3 頂点とも同じ UV、または一直線）なら `None`。UV の無い三角形・球も `None`。
+    #[test]
+    fn degenerate_uv_and_uvless_hits_have_no_tangents() {
+        for uv in [vec![[0.5, 0.5]; 3], vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]] {
+            let mut world = World::new();
+            let tris = vec![Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+            let data = MeshData::with_uv(tris, uv, vec![[0, 1, 2]]);
+            world.add_mesh_data_instance(data, Transform::identity(), None);
+            let h = world.hit(Ray { o: Vec3::new(0.2, 0.2, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+            assert!(world.surface_tangents(&h, 0.0).is_none());
+            assert_eq!(world.meshes()[0].degenerate_uv_count(), 1);
+        }
+        // UV 無しのメッシュ
+        let mut world = World::new();
+        world.add_mesh_instance(
+            vec![Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)],
+            Transform::identity(),
+            None,
+        );
+        let h = world.hit(Ray { o: Vec3::new(0.2, 0.2, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+        assert!(world.surface_tangents(&h, 0.0).is_none());
+        // 球
+        let mut world = World::new();
+        world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 0 });
+        let h = world.hit(Ray { o: Vec3::new(0.0, 0.0, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+        assert!(world.surface_tangents(&h, 0.0).is_none());
+    }
+
+    /// モーションブラー: `time` で辺を補間した接ベクトルは、その時刻の頂点から直接求めたものと一致する。
+    #[test]
+    fn tangents_interpolate_with_shutter_time() {
+        let (a0, b0, c0) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        // 閉時刻では x 方向に 3 倍に伸ばす
+        let s = |v: Vec3| Vec3::new(v.x * 3.0, v.y, v.z);
+        let tri = Triangle {
+            v0_0: a0, v1_0: b0, v2_0: c0,
+            v0_1: s(a0), v1_1: s(b0), v2_1: s(c0),
+            e1_0: b0 - a0, e2_0: c0 - a0, e1_1: s(b0) - s(a0), e2_1: s(c0) - s(a0),
+            mat_id: 0,
+        };
+        let data = MeshData::with_uv(vec![tri], vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![[0, 1, 2]]);
+        let mesh = Mesh::with_normals_from(data);
+        for &t in &[0.0, 0.25, 1.0] {
+            let (dpdu, dpdv) = mesh.uv_derivatives(0, t).unwrap();
+            let (v0, v1, v2) = mesh.tris[0].vertices_at(t);
+            assert!((dpdu - (v1 - v0)).len() < 1e-12, "t={}", t);
+            assert!((dpdv - (v2 - v0)).len() < 1e-12, "t={}", t);
+        }
+    }
 
     /// せん断・鏡像を含む「意地悪な」変換の一覧（法線の逆転置がもっとも効く形）。
     fn tricky_transforms() -> Vec<(&'static str, Transform)> {

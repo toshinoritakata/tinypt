@@ -6,6 +6,7 @@ use crate::config::RenderConfig;
 use crate::env::EnvMap;
 use crate::geometry::Sphere;
 use crate::material::Material;
+use crate::normal_map::{MapId, NormalMap};
 use crate::texture::Texture;
 use crate::math::{Color, Vec3};
 use crate::ray::Camera;
@@ -22,6 +23,12 @@ pub struct Scene {
     /// テクスチャ置き場（`Material` が `TexId` で参照する）。
     /// マテリアルを `Copy` のまま保つため、本体はここに集約して添字で引く。
     pub textures: Vec<Texture>,
+    /// 法線を摂動するマップ（ハイトマップ／タンジェント空間ノーマルマップ）。色テクスチャとは別に持つ
+    /// （sRGB の誤適用を型で防ぐ）。`Material` を `Copy` のまま保つため、材質側ではなく `mat_maps` から引く。
+    pub normal_maps: Vec<NormalMap>,
+    /// `mat_id` → `normal_maps` の添字。**空か、さもなくば `mats` と同じ長さ**（不変条件。空ならマップ無しで、
+    /// 積分器は何も引かない）。
+    pub mat_maps: Vec<Option<MapId>>,
     /// 環境マップ（None でデフォルトの空色を使用）
     pub env: Option<EnvMap>,
 }
@@ -97,7 +104,7 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
         None => None,
     };
 
-    Scene { cam, world, mats, textures: Vec::new(), env }
+    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), env }
 }
 
 fn push(mats: &mut Vec<Material>, m: Material) -> usize {

@@ -69,6 +69,24 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
 | `Subsurface` | `albedo` | 簡易サブサーフェス（現状は Lambert と同一の拡散反射）。シーンファイル・組み込みシーンからは指定不可 |
 | `DiffuseLight` | `emit` | 拡散面光源 |
 
+### 法線マップ / バンプマップ
+
+Mitsuba 準拠のラッパー `bsdf` で、内側の `<bsdf>` に法線の摂動を掛ける (シェーディング法線だけを変える。幾何法線・影・光源には影響しない)。
+
+```xml
+<bsdf type="normalmap">   <!-- タンジェント空間ノーマルマップ (リニア固定で読む) -->
+  <texture type="bitmap" name="normalmap"><string name="filename" value="n.png"/></texture>
+  <bsdf type="diffuse"/>
+</bsdf>
+<bsdf type="bumpmap">     <!-- ハイトマップ (輝度)。scale は 1 テクセルあたりの傾きの倍率 (既定 1) -->
+  <float name="scale" value="8"/>
+  <texture type="bitmap" name="bumpmap"><string name="filename" value="h.png"/></texture>
+  <bsdf type="diffuse"/>
+</bsdf>
+```
+
+`twosided` の内側にも置ける。UV を持つメッシュ (OBJ・`rectangle`・`cube`・`disk`) にだけ効く (球や UV 無しは摂動しない)。バンプの強さは無次元で、モデルを一様に拡大縮小しても見た目が変わらない。Sponza の煉瓦のハイトマップでは `scale` 4〜16 で明瞭な凹凸になる。MTL の `map_bump` はまだ未対応 (警告のみ)。
+
 ### GGX マイクロファセット
 
 物理ベースの光沢反射マテリアル。`Metal` の完全鏡面と異なり、表面の微細な凹凸（マイクロファセット）による粗さを表現する。
