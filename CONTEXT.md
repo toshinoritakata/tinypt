@@ -62,6 +62,10 @@ _Avoid_: texture space, st coordinates.
 
 **Texture** (`texture::Texture`, `Material::resolve_textures`):
 A bitmap sampled bilinearly at `Hit.uv`, held in the scene's `textures` arena and referenced from a material by a `TexId` index — the index keeps `Material` `Copy`, which matters because it is copied at every intersection. Colour textures are decoded from **sRGB** on load, the exact inverse of the PPM encode, while `raw` textures stay linear; out-of-range UVs follow the texture's `Wrap` (`repeat` by default, as in Mitsuba). The integrator evaluates textures exactly once per intersection, folding the result into a texture-free copy of the material, so `sample` and `eval` never see a UV or a texture.
+
+**usemtl group / MTL material** (`obj_loader::load_obj_groups`, `mitsuba::parse_obj_with_mtl`):
+An OBJ stays one mesh with one BVH; each triangle carries its own `mat_id`, taken from the `usemtl` in force when its face was read (faces before any `usemtl`, or naming a material the MTL lacks, get a grey diffuse). Only names actually used by a face become materials. `Instance.mat_override` keeps its meaning: a `<bsdf>` child overrides everything and the MTL is never read; without one (and without `use_mtl=false`) the MTL decides. MTL maps to `Lambert` (with the `map_Kd` texture) or, for a bright `Ks` with `Ns` > 1, to `Ggx`; alpha (`d`/`map_d`), bump and emission are not yet supported and warn once per material (alpha: once per scene).
+_Avoid_: material group as a separate mesh.
 _Avoid_: material map, shader parameter.
 
 **Ray origin offset** (`Hit.p_error`, `offset_ray_origin`):

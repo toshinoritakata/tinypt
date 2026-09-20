@@ -125,6 +125,78 @@ impl Texture {
     }
 }
 
+/// アルファマスク（`map_d`）。1 テクセル 1 バイトで持つ（色テクスチャの 1/24）。
+///
+/// 値はデータ（リニア）として読む。RGBA 画像でアルファチャンネルに 1 つでも不透明でない値があれば
+/// アルファチャンネルを、そうでなければ RGB の輝度（Rec.709 係数、MTL の既定 `-imfchan l`）を使う。
+/// 判定は [`AlphaMask::opaque`]（`alpha >= ALPHA_CUTOFF` で不透明）。
+pub struct AlphaMask {
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
+    wrap: Wrap,
+}
+
+impl AlphaMask {
+    /// 0..255 の値列（行優先、1 行目が上端）から作る。
+    pub fn from_u8(width: usize, height: usize, data: Vec<u8>, wrap: Wrap) -> Self {
+        assert_eq!(data.len(), width * height, "texel count must be width * height");
+        Self { width, height, data, wrap }
+    }
+
+    /// 画像ファイルから読む。
+    pub fn load(path: &str, wrap: Wrap) -> Result<Self, String> {
+        let img = image::open(path).map_err(|e| format!("{}: {}", path, e))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        if w == 0 || h == 0 {
+            return Err(format!("{}: empty image", path));
+        }
+        let use_alpha = img.color().has_alpha() && rgba.pixels().any(|p| p.0[3] != 255);
+        let data = rgba
+            .pixels()
+            .map(|p| {
+                if use_alpha {
+                    p.0[3]
+                } else {
+                    (0.2126 * p.0[0] as f64 + 0.7152 * p.0[1] as f64 + 0.0722 * p.0[2] as f64).round() as u8
+                }
+            })
+            .collect();
+        Ok(Self { width: w, height: h, data, wrap })
+    }
+
+    fn texel(&self, x: i64, y: i64) -> f64 {
+        let (w, h) = (self.width as i64, self.height as i64);
+        let (x, y) = match self.wrap {
+            Wrap::Repeat => (x.rem_euclid(w), y.rem_euclid(h)),
+            Wrap::Clamp => (x.clamp(0, w - 1), y.clamp(0, h - 1)),
+        };
+        self.data[(y as usize) * self.width + (x as usize)] as f64 / 255.0
+    }
+
+    /// UV でバイリニア補間した alpha（0..1）。座標の規約は [`Texture::sample`] と同じ。
+    pub fn sample(&self, uv: (f64, f64)) -> f64 {
+        let (u, v) = uv;
+        if !u.is_finite() || !v.is_finite() {
+            return 1.0; // 壊れた UV は不透明（見えない穴より板が見える方が原因に気づける）
+        }
+        let x = u * self.width as f64 - 0.5;
+        let y = (1.0 - v) * self.height as f64 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let top = self.texel(x0, y0) * (1.0 - fx) + self.texel(x0 + 1, y0) * fx;
+        let bottom = self.texel(x0, y0 + 1) * (1.0 - fx) + self.texel(x0 + 1, y0 + 1) * fx;
+        top * (1.0 - fy) + bottom * fy
+    }
+
+    /// `scale`（`d`）を掛けた alpha が不透明の側か。境界は `>=` で決定的。
+    pub fn opaque(&self, uv: (f64, f64), scale: f64) -> bool {
+        self.sample(uv) * scale >= crate::constants::alpha::ALPHA_CUTOFF
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +293,20 @@ mod tests {
     #[test]
     fn missing_file_is_an_error() {
         assert!(Texture::load("/definitely/not/here.png", true, Wrap::Repeat).is_err());
+    }
+
+    #[test]
+    fn alpha_mask_threshold_is_deterministic_and_v_points_up() {
+        // 1x1: 127 → 透明、128 → 不透明（0.5 ちょうどは 127.5 で 8bit には存在しない）
+        let m = |v| AlphaMask::from_u8(1, 1, vec![v], Wrap::Repeat);
+        assert!(!m(127).opaque((0.5, 0.5), 1.0));
+        assert!(m(128).opaque((0.5, 0.5), 1.0));
+        // 合成値がちょうど 0.5: 255 * 0.5 の d 倍率で 0.5 になる組（1.0 * 0.5）
+        assert!(AlphaMask::from_u8(1, 1, vec![255], Wrap::Repeat).opaque((0.5, 0.5), 0.5));
+        assert!(!AlphaMask::from_u8(1, 1, vec![255], Wrap::Repeat).opaque((0.5, 0.5), 0.4999));
+        // 2x1（上: 不透明、下: 透明）: v が大きい（上）ほど上の行
+        let t = AlphaMask::from_u8(1, 2, vec![255, 0], Wrap::Clamp);
+        assert!(t.sample((0.5, 0.99)) > 0.9);
+        assert!(t.sample((0.5, 0.01)) < 0.1);
     }
 }

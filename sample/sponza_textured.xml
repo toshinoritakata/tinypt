@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Crytek Sponza（アトリウム内部）。外部モデルを使う高ポリゴン検証シーン。
+
+     モデルはリポジトリに入っていない。先に取得すること:
+         tools/fetch_models.sh sponza
+     展開先は assets/models/sponza/（.gitignore 済み）。262,267 三角形。
+
+     出典: Morgan McGuire, Computer Graphics Archive, July 2017
+           (https://casual-effects.com/data)
+     Sponza Atrium: CC BY 3.0, (c) 2010 Frank Meinl, Crytek
+     （原型は 2002 年 Marko Dabrovic 作）
+
+     モデルは cm 単位（横 37m 相当）なので to_world で 0.01 倍して m 単位にしている。
+     このシーンは sponza.mtl とテクスチャ（assets/models/sponza/textures/）を使う本来の見た目版。
+     obj の <shape> に <bsdf> を書かない = MTL から材質を作る（<bsdf> を書くと全体を上書き = sponza.xml）。
+     MTL の d / map_d / map_bump / map_Ka は未対応（警告が出る）。BSDF の違いは床置きの球 3 個で見る。
+
+     照明: 開いた屋根の上の面光源（太陽相当）+ 弱い constant 環境光。両方 NEE が効く。
+
+     使い方: tinypt --scene sample/sponza_textured.xml --spp 64 -o renders/sponza_textured.ppm -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="16"/>
+    <integer name="rr_depth" value="5"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="64"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="960"/>
+    <integer name="height" value="540"/>
+  </film>
+
+  <!-- アトリウム西端の床上 2.2m から東を見る -->
+  <sensor type="perspective">
+    <float name="fov" value="60"/>
+    <string name="fov_axis" value="x"/>
+    <transform name="to_world">
+      <lookat origin="-13.0, 2.2, -0.6" target="8.0, 3.4, -0.6" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- モデル本体（cm → m） -->
+  <shape type="obj">
+    <string name="filename" value="../assets/models/sponza/sponza.obj"/>
+    <transform name="to_world"><scale value="0.01"/></transform>
+  </shape>
+
+  <!-- BSDF 確認用の球（アトリウムの床に置く） -->
+  <shape type="sphere">
+    <point name="center" x="-1.6" y="0.55" z="-1.8"/><float name="radius" value="0.55"/>
+    <bsdf type="conductor"><srgb name="specular_reflectance" value="0.95, 0.95, 0.95"/></bsdf>
+  </shape>
+  <shape type="sphere">
+    <point name="center" x="0.6" y="0.55" z="-0.2"/><float name="radius" value="0.55"/>
+    <bsdf type="roughconductor">
+      <string name="distribution" value="ggx"/>
+      <float name="alpha" value="0.15"/>
+      <srgb name="specular_reflectance" value="0.95, 0.78, 0.35"/>
+    </bsdf>
+  </shape>
+  <shape type="sphere">
+    <point name="center" x="2.6" y="0.55" z="1.4"/><float name="radius" value="0.55"/>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+
+  <!-- 太陽相当の面光源（屋根の開口の上、下向き） -->
+  <shape type="rectangle">
+    <transform name="to_world">
+      <translate x="0" y="18.0" z="0"/><rotate x="1" angle="90"/><scale x="9" y="7" z="1"/>
+    </transform>
+    <emitter type="area"><rgb name="radiance" value="9.0, 8.2, 6.8"/></emitter>
+  </shape>
+
+  <!-- 空（弱い青） -->
+  <emitter type="constant"><rgb name="radiance" value="0.60, 0.80, 1.10"/></emitter>
+</scene>

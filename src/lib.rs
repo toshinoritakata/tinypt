@@ -36,6 +36,7 @@ pub mod hdr;         // Radiance HDR (.hdr) 読み書き
 pub mod exr;         // OpenEXR (.exr) 読み書き
 pub mod env;         // 環境マップの読み込みと重点的サンプリング
 pub mod texture;     // ビットマップテクスチャ（UV サンプリング）
+pub mod mtl;         // Wavefront MTL パーサ
 
 pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash};
 pub use config::{RenderConfig, Tonemap};

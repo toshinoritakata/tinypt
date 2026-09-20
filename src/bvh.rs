@@ -230,7 +230,25 @@ impl Bvh {
     ///
     /// スタックベースの反復トラバーサルを使用。
     /// 子ノードの AABB 交差距離を比較し、近い方を先に処理して早期枝刈りを最大化する。
-    pub fn hit(&self, tris: &[Triangle], r: Ray, tmin: f64, mut tmax: f64) -> Option<Hit> {
+    pub fn hit(&self, tris: &[Triangle], r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        self.hit_filtered(tris, r, tmin, tmax, |_, _, _| true)
+    }
+
+    /// [`Bvh::hit`] に候補の採否判定を足したもの。`accept(三角形番号, u, v)` が false の交差は
+    /// **無かったことにして**探索を続ける（アルファマスクの透明部分）。
+    ///
+    /// 棄却した候補では `tmax` を縮めず、区間 `(tmin, tmax)` もそのまま。だから棄却した面の
+    /// 先も同じ区間で探し続けるだけで、再開位置の取り方による自己交差は起きない（水密交差と
+    /// 誤差上界はそのまま）。`hit` は常に true を返す判定で呼ぶ（単相化されて従来と同じコード）。
+    #[inline(always)]
+    pub fn hit_filtered<F: Fn(usize, f64, f64) -> bool>(
+        &self,
+        tris: &[Triangle],
+        r: Ray,
+        tmin: f64,
+        mut tmax: f64,
+        accept: F,
+    ) -> Option<Hit> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -285,6 +303,9 @@ impl Bvh {
                 let end = start + n.count as usize;
                 for &ti in &self.indices[start..end] {
                     if let Some((t, u, v)) = tris[ti].intersect(r, tmin, tmax) {
+                        if !accept(ti, u, v) {
+                            continue;
+                        }
                         tmax = t;
                         best = Some((ti, t, u, v));
                     }
@@ -425,5 +446,25 @@ mod tests {
         let r = bvh.nodes[root.right as usize].bbox;
         assert!(l.max.x < r.min.x || r.max.x < l.min.x, "children overlap on the split axis: {:?} {:?}", l, r);
     }
-}
 
+    /// 採否判定つき探索は「棄却した三角形を最初から無いものとした総当たり」と一致する。
+    /// 常に true の判定は従来の `hit` と完全に同じ結果。
+    #[test]
+    fn hit_filtered_matches_brute_force_over_accepted_triangles() {
+        let mut rng = Rng::new(77);
+        for &n in &[1usize, 12, 40, 500] {
+            let tris = random_tris(n, &mut rng);
+            let bvh = Bvh::build(&tris);
+            let kept: Vec<Triangle> = tris.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, t)| *t).collect();
+            for _ in 0..400 {
+                let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
+                let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
+                let r = Ray { o, d: (target - o).norm(), time: 0.0 };
+                let a = bvh.hit_filtered(&tris, r, 1e-4, 1e30, |ti, _, _| ti % 3 != 0).map(|h| h.t);
+                assert_eq!(a, brute_force(&kept, r, 1e-4, 1e30), "n={}", n);
+                let all = bvh.hit_filtered(&tris, r, 1e-4, 1e30, |_, _, _| true).map(|h| h.t);
+                assert_eq!(all, bvh.hit(&tris, r, 1e-4, 1e30).map(|h| h.t));
+            }
+        }
+    }
+}

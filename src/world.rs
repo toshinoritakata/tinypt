@@ -10,6 +10,8 @@
 //! サンプリングし（参照点が球の内部か表面から丸め誤差の距離以内なら表面積一様）、三角形光源は表面積一様。
 //! PDF は `Light::pdf_omega` に一本化され、`sample_light` と `light_pdf` が共有する。
 
+use std::sync::Arc;
+
 use crate::bvh::Bvh;
 use crate::geometry::{face_forward, Aabb, Hit, Sphere, Triangle};
 use crate::material::Material;
@@ -17,6 +19,7 @@ use crate::obj_loader::{MeshData, NO_NORMAL, NO_UV};
 use crate::math::{cdf_search, gamma, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::texture::AlphaMask;
 use crate::transform::Transform;
 
 
@@ -36,6 +39,12 @@ pub struct Mesh {
     uv: Vec<[f64; 2]>,
     /// 三角形ごとの `vt` の添字。空ならメッシュ全体が UV 無し
     tri_uv: Vec<[u32; 3]>,
+    /// アルファマスク（`map_d`）の表。三角形が持つのは `tri_alpha` 経由の添字だけ。
+    /// マスクを持たないメッシュでは空（交差判定は従来の経路で、コストはゼロ）
+    masks: Vec<Arc<AlphaMask>>,
+    /// 三角形ごとのマスク添字 + 1（0 = マスク無し）と、その材質の不透明度 `d`。
+    /// `masks` が空なら空
+    tri_alpha: Vec<(u16, f32)>,
     /// メッシュ内の BVH（高速交差判定用）
     bvh: Bvh,
 }
@@ -44,7 +53,7 @@ impl Mesh {
     /// 三角形リストからメッシュと BVH を構築する（面法線のみ）。
     pub fn new(tris: Vec<Triangle>) -> Self {
         let bvh = Bvh::build(&tris);
-        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new(), bvh }
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new(), masks: Vec::new(), tri_alpha: Vec::new(), bvh }
     }
 
     /// 頂点法線付きでメッシュを構築する。`tri_vn` の長さが三角形数と合わない場合は
@@ -74,12 +83,41 @@ impl Mesh {
             (uv, tri_uv)
         };
         let bvh = Bvh::build(&tris);
-        Self { tris, vn, tri_vn, uv, tri_uv, bvh }
+        Self { tris, vn, tri_vn, uv, tri_uv, masks: Vec::new(), tri_alpha: Vec::new(), bvh }
     }
 
     /// [`MeshData`] からメッシュを構築する。
     pub fn with_normals_from(data: MeshData) -> Self {
         Self::build(data.tris, data.vn, data.tri_vn, data.uv, data.tri_uv)
+    }
+
+    /// アルファマスクを付ける。`masks[i]` を三角形が `tri_alpha[t] = (i + 1, d)` で参照する
+    /// （`(0, _)` はマスク無し）。UV を持たないメッシュや三角形数の合わない入力では何もしない。
+    /// 交差判定の形は変わるが BVH は作り直さない（採否だけを変える）。
+    pub fn with_alpha(mut self, masks: Vec<Arc<AlphaMask>>, tri_alpha: Vec<(u16, f32)>) -> Self {
+        if !masks.is_empty() && tri_alpha.len() == self.tris.len() && self.has_uv() {
+            self.masks = masks;
+            self.tri_alpha = tri_alpha;
+        }
+        self
+    }
+
+    /// アルファマスクを持つか。
+    pub fn has_alpha(&self) -> bool {
+        !self.masks.is_empty()
+    }
+
+    /// 三角形 `ti` の重心座標 `(u, v)` の位置が不透明か（マスクの無い三角形・UV の無い三角形は常に不透明）。
+    #[inline]
+    fn alpha_opaque(&self, ti: usize, u: f64, v: f64) -> bool {
+        let (k, d) = self.tri_alpha[ti];
+        if k == 0 {
+            return true;
+        }
+        match self.texture_coords(ti, (u, v)) {
+            Some(uv) => self.masks[k as usize - 1].opaque(uv, d as f64),
+            None => true,
+        }
     }
 
     /// このメッシュがスムーズシェーディング（頂点法線の補間）を行うか。
@@ -105,7 +143,13 @@ impl Mesh {
     /// メッシュ内三角形に対するレイ交差判定（オブジェクト空間）。
     /// 頂点法線を持つ三角形なら、重心座標で補間したシェーディング法線を `Hit::ns` に入れる。
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
-        let mut h = self.bvh.hit(&self.tris, r, tmin, tmax)?;
+        // アルファマスクを持つメッシュだけ、採否判定つきの探索にする（他は従来の経路のまま）。
+        // 透明な交差は無かったことにして探索を続けるので、シャドウレイでも穴を光が抜ける
+        let mut h = if self.masks.is_empty() {
+            self.bvh.hit(&self.tris, r, tmin, tmax)?
+        } else {
+            self.bvh.hit_filtered(&self.tris, r, tmin, tmax, |ti, u, v| self.alpha_opaque(ti, u, v))?
+        };
         if !self.tri_vn.is_empty() {
             if let Some(ns) = self.shading_normal(h.prim_id, h.bary, h.ng) {
                 h.ns = ns;
@@ -280,6 +324,17 @@ impl World {
     }
 
     /// 構築済みのメッシュを登録してインスタンスを追加する（上の 2 つの共通部分）。
+    /// アルファマスク付きでメッシュ（`MeshData`）をインスタンス配置する（[`Mesh::with_alpha`] 参照）。
+    pub fn add_mesh_data_instance_with_alpha(
+        &mut self,
+        data: MeshData,
+        masks: Vec<Arc<AlphaMask>>,
+        tri_alpha: Vec<(u16, f32)>,
+        xform: Transform,
+    ) -> usize {
+        self.add_mesh(Mesh::with_normals_from(data).with_alpha(masks, tri_alpha), xform, None)
+    }
+
     fn add_mesh(&mut self, mesh: Mesh, xform: Transform, mat_override: Option<usize>) -> usize {
         let mesh_id = self.meshes.len();
         self.meshes.push(mesh);
@@ -851,6 +906,84 @@ mod tests {
     use super::*;
     use crate::rng::uniform_sphere_dir;
     use crate::geometry::Sphere;
+
+    /// z=0 の [0,1]² の板（UV = xy）に、左半分が不透明・右半分が透明の 2x1 マスクを貼ったワールド。
+    /// 板の奥 z=-1 に不透明の床（マスク無し）を置く。
+    fn masked_plate_world(mask_values: [u8; 2]) -> World {
+        let mut world = World::new();
+        let (a, b, c, d) = (
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let tris = vec![Triangle::new_static(a, b, c, 0), Triangle::new_static(a, c, d, 0)];
+        let uv = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let tri_uv = vec![[0, 1, 2], [0, 2, 3]];
+        let mask = Arc::new(AlphaMask::from_u8(2, 1, mask_values.to_vec(), crate::texture::Wrap::Clamp));
+        let data = MeshData::with_uv(tris, uv, tri_uv);
+        world.add_mesh_data_instance_with_alpha(data, vec![mask], vec![(1, 1.0); 2], Transform::identity());
+        // 奥の床（マスク無し）
+        let f = |x: f64, y: f64| Vec3::new(x, y, -1.0);
+        world.add_mesh_instance(
+            vec![
+                Triangle::new_static(f(-5.0, -5.0), f(5.0, -5.0), f(5.0, 5.0), 1),
+                Triangle::new_static(f(-5.0, -5.0), f(5.0, 5.0), f(-5.0, 5.0), 1),
+            ],
+            Transform::identity(),
+            None,
+        );
+        world
+    }
+
+    /// 不透明部分ではレイが止まり、透明部分は素通りして奥の面に当たる（シャドウレイも同じ経路）。
+    #[test]
+    fn alpha_mask_transparent_texels_are_passed_through() {
+        // マスク: 左 255（不透明）、右 0（透明）。クランプなので 2 テクセルの境界は u=0.5 付近で補間される
+        let world = masked_plate_world([255, 0]);
+        let down = |x: f64, y: f64| Ray { o: Vec3::new(x, y, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        let opaque = world.hit(down(0.1, 0.5), 0.0, 1e30).unwrap();
+        assert_eq!(opaque.mat_id, 0, "不透明部分で板に当たるはず");
+        assert!((opaque.t - 2.0).abs() < 1e-9);
+        let through = world.hit(down(0.9, 0.5), 0.0, 1e30).unwrap();
+        assert_eq!(through.mat_id, 1, "透明部分は素通りして床に当たるはず");
+        assert!((through.t - 3.0).abs() < 1e-9);
+        // シャドウレイ: 板の手前から奥の点へ。不透明側は遮られ、穴側は抜ける
+        let occluded = |x: f64| {
+            let r = Ray { o: Vec3::new(x, 0.5, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+            world.hit(r, 0.0, 2.9).is_some() // 床（t=3）の手前まで
+        };
+        assert!(occluded(0.1));
+        assert!(!occluded(0.9), "穴を通る光が遮られている");
+    }
+
+    /// 透明部分を捨てた後の探索で、同じ板（および裏面側から）を再び拾わない = 自己交差しない。
+    /// 板の透明部分の上に原点を置き、板を貫いて上下どちらへ撃っても板自身には当たらない。
+    #[test]
+    fn alpha_mask_rejected_surface_is_not_hit_again() {
+        let world = masked_plate_world([255, 0]);
+        for &dz in &[-1.0, 1.0] {
+            // 原点は板の面上（透明部分）
+            let r = Ray { o: Vec3::new(0.9, 0.5, 0.0), d: Vec3::new(0.0, 0.0, dz), time: 0.0 };
+            let h = world.hit(r, 0.0, 1e30);
+            match (dz < 0.0, h) {
+                (true, Some(h)) => assert_eq!(h.mat_id, 1),
+                (false, None) => {}
+                (_, h) => panic!("板に自己交差した: {:?}", h.map(|h| (h.mat_id, h.t))),
+            }
+        }
+    }
+
+    /// しきい値ちょうどの扱いは決定的（`alpha >= 0.5` が不透明）。8bit で 127 は透明、128 は不透明。
+    #[test]
+    fn alpha_mask_threshold_is_inclusive_and_deterministic() {
+        for (v, expect_plate) in [(127u8, false), (128u8, true)] {
+            let world = masked_plate_world([v, v]);
+            let r = Ray { o: Vec3::new(0.5, 0.5, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+            let h = world.hit(r, 0.0, 1e30).unwrap();
+            assert_eq!(h.mat_id == 0, expect_plate, "mask={}", v);
+        }
+    }
 
     fn emissive_sphere_world(c: Vec3, r: f64) -> World {
         let mut world = World::new();

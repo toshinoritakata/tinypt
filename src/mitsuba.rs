@@ -33,8 +33,10 @@ use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
 use crate::material::TexId;
-use crate::obj_loader::{load_obj_mesh, MeshData};
-use crate::texture::{Texture, Wrap};
+use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
+use crate::obj_loader::{load_obj_groups, load_obj_mesh, MeshData, ObjGroups};
+use crate::texture::{AlphaMask, Texture, Wrap};
+use std::sync::Arc;
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
@@ -286,6 +288,7 @@ pub fn load_scene_from_str(
     let mut world = World::new();
     let mut mats: Vec<Material> = Vec::new();
     let mut textures: Vec<Texture> = Vec::new();
+    let mut mtl_state = MtlState::default();
     let mut cam: Option<Camera> = None;
     let mut env: Option<EnvMap> = None;
 
@@ -298,7 +301,7 @@ pub fn load_scene_from_str(
                     warn(&format!("unsupported sensor type '{}', ignored", child.typ()));
                 }
             }
-            "shape" => parse_shape(child, base_dir, &mut world, &mut mats, &mut textures),
+            "shape" => parse_shape(child, base_dir, &mut world, &mut mats, &mut textures, &mut mtl_state),
             // シーン直下の emitter は環境マップ（envmap / constant）
             "emitter" => {
                 if let Some(e) = parse_scene_emitter(child, base_dir) {
@@ -502,7 +505,18 @@ fn parse_shape(
     world: &mut World,
     mats: &mut Vec<Material>,
     textures: &mut Vec<Texture>,
+    mtl_state: &mut MtlState,
 ) {
+    // OBJ で `<bsdf>` も `<emitter>` も無く、`use_mtl` が false でなければ MTL から材質を作る。
+    // `<bsdf>` 指定があれば従来どおり全体を上書きする（既存シーンの見た目・出力を保つ）。
+    if el.typ() == "obj"
+        && el.child_tag("bsdf").is_none()
+        && el.child_tag("emitter").is_none()
+        && el.boolean_or("use_mtl", true)
+    {
+        parse_obj_with_mtl(el, base_dir, world, mats, textures, mtl_state);
+        return;
+    }
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
     let mat = if let Some(em) = el.child_tag("emitter") {
         parse_emitter(em)
@@ -563,6 +577,200 @@ fn parse_shape(
         .unwrap_or_else(Transform::identity);
     mats.push(mat);
     world.add_mesh_data_instance(mesh, xform, None);
+}
+
+/// MTL 読み込みの状態（シーン読み込み 1 回ぶん）。
+#[derive(Default)]
+struct MtlState {
+    /// 解決済み絶対パス → テクスチャ添字。同じ画像を 2 度読まない（失敗も覚えて再試行しない）
+    tex_cache: std::collections::HashMap<PathBuf, Option<TexId>>,
+    /// 解決済み絶対パス → アルファマスク（`map_d`）。テクスチャと同じく同じ画像を 2 度読まない
+    mask_cache: std::collections::HashMap<PathBuf, Option<Arc<AlphaMask>>>,
+    /// 定数の `d < 1`（マスク無し）を無視する警告を出したか（シーンで 1 回だけ）
+    warned_alpha: bool,
+}
+
+/// `usemtl` の材質を `mat_id` に振り直しつつ、OBJ を 1 メッシュのままインスタンス配置する。
+///
+/// 材質は「面に実際に使われた名前」だけを `mats` に積む（三角形ごとの `mat_id` で引く）。
+/// `Instance.mat_override` は使わない（None のまま = 三角形の `mat_id` が効く）。
+fn parse_obj_with_mtl(
+    el: &Element,
+    base_dir: &Path,
+    world: &mut World,
+    mats: &mut Vec<Material>,
+    textures: &mut Vec<Texture>,
+    state: &mut MtlState,
+) {
+    let filename = match el.string("filename") {
+        Some(f) => f,
+        None => {
+            warn("obj shape without filename; skipped");
+            return;
+        }
+    };
+    let resolved = resolve_path(base_dir, filename);
+    let ObjGroups { mut mesh, mat_names, mtllibs } = match load_obj_groups(resolved.to_string_lossy().as_ref()) {
+        Ok(g) => g,
+        Err(e) => {
+            warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
+            return;
+        }
+    };
+    if el.boolean_or("face_normals", false) {
+        mesh = mesh.into_flat();
+    }
+
+    // MTL は OBJ からの相対。MTL 内のテクスチャパスは MTL からの相対
+    let obj_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut libs: Vec<(PathBuf, MtlFile)> = Vec::new();
+    for lib in &mtllibs {
+        let path = obj_dir.join(lib.replace('\\', "/"));
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let f = parse_mtl(&text);
+                for d in &f.dup_names {
+                    warn(&format!("{}: duplicate newmtl '{}'; keeping the first definition", path.display(), d));
+                }
+                libs.push((path.parent().map(Path::to_path_buf).unwrap_or_default(), f));
+            }
+            Err(e) => warn(&format!("failed to read mtl '{}': {}; using default materials", path.display(), e)),
+        }
+    }
+    if mtllibs.is_empty() {
+        warn(&format!("obj '{}' has no mtllib and the shape has no bsdf; defaulting to diffuse", resolved.display()));
+    }
+
+    let base = mats.len();
+    // 材質ごとのアルファ（マスク, d）。`mat_names` と同じ添字
+    let mut alphas: Vec<Option<(Arc<AlphaMask>, f32)>> = Vec::with_capacity(mat_names.len());
+    for name in &mat_names {
+        let found = libs.iter().find_map(|(dir, f)| f.get(name).map(|m| (dir, m)));
+        let mat = match found {
+            Some((dir, m)) => {
+                let (mat, alpha) = mtl_to_material(m, dir, textures, state);
+                alphas.push(alpha);
+                mat
+            }
+            None => {
+                alphas.push(None);
+                if !name.is_empty() && !mtllibs.is_empty() {
+                    warn(&format!("material '{}' not found in mtl; defaulting to diffuse", name));
+                }
+                Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }
+            }
+        };
+        mats.push(mat);
+    }
+    for t in mesh.tris.iter_mut() {
+        t.mat_id += base;
+    }
+
+    let xform = el
+        .child_tag("transform")
+        .map(parse_transform)
+        .unwrap_or_else(Transform::identity);
+    // アルファを持つ材質があれば、三角形ごとにマスク添字を振る（メッシュ内で同じ Arc は 1 つに畳む）
+    if alphas.iter().any(|a| a.is_some()) {
+        let mut masks: Vec<Arc<AlphaMask>> = Vec::new();
+        let mut mat_slot: Vec<(u16, f32)> = Vec::with_capacity(alphas.len());
+        for a in &alphas {
+            mat_slot.push(match a {
+                None => (0, 1.0),
+                Some((m, d)) => {
+                    let i = masks.iter().position(|x| Arc::ptr_eq(x, m)).unwrap_or_else(|| {
+                        masks.push(m.clone());
+                        masks.len() - 1
+                    });
+                    (i as u16 + 1, *d)
+                }
+            });
+        }
+        let tri_alpha: Vec<(u16, f32)> = mesh.tris.iter().map(|t| mat_slot[t.mat_id - base]).collect();
+        world.add_mesh_data_instance_with_alpha(mesh, masks, tri_alpha, xform);
+    } else {
+        world.add_mesh_data_instance(mesh, xform, None);
+    }
+}
+
+/// MTL のテクスチャを（キャッシュ経由で）読む。色テクスチャなので sRGB デコード。
+fn load_mtl_texture(dir: &Path, rel: &str, textures: &mut Vec<Texture>, state: &mut MtlState) -> Option<TexId> {
+    let joined = dir.join(rel);
+    let key = std::fs::canonicalize(&joined).unwrap_or(joined);
+    if let Some(&cached) = state.tex_cache.get(&key) {
+        return cached;
+    }
+    let id = match Texture::load(key.to_string_lossy().as_ref(), true, Wrap::Repeat) {
+        Ok(t) => {
+            textures.push(t);
+            Some((textures.len() - 1) as TexId)
+        }
+        Err(e) => {
+            warn(&format!("failed to load texture '{}': {}; ignored", key.display(), e));
+            None
+        }
+    };
+    state.tex_cache.insert(key, id);
+    id
+}
+
+/// MTL の `map_d` をアルファマスクとして（キャッシュ経由で）読む。リニア（データ）扱い。
+fn load_mtl_mask(dir: &Path, rel: &str, state: &mut MtlState) -> Option<Arc<AlphaMask>> {
+    let joined = dir.join(rel);
+    let key = std::fs::canonicalize(&joined).unwrap_or(joined);
+    if let Some(cached) = state.mask_cache.get(&key) {
+        return cached.clone();
+    }
+    let m = match AlphaMask::load(key.to_string_lossy().as_ref(), Wrap::Repeat) {
+        Ok(m) => Some(Arc::new(m)),
+        Err(e) => {
+            warn(&format!("failed to load alpha mask '{}': {}; ignored", key.display(), e));
+            None
+        }
+    };
+    state.mask_cache.insert(key, m.clone());
+    m
+}
+
+/// MTL 材質 → BSDF（README「MTL → BSDF のマッピング」）。
+/// 未対応キーの警告は**材質ごとに 1 回**（面ごとには出さない）。
+fn mtl_to_material(
+    m: &MtlMaterial,
+    dir: &Path,
+    textures: &mut Vec<Texture>,
+    state: &mut MtlState,
+) -> (Material, Option<(Arc<AlphaMask>, f32)>) {
+    let mut unsupported: Vec<&str> = Vec::new();
+    if m.map_bump.is_some() { unsupported.push("map_bump"); }
+    if m.map_ka.is_some() { unsupported.push("map_Ka"); }
+    if m.ke.iter().any(|&c| c != 0.0) { unsupported.push("Ke (emission)"); }
+    if !unsupported.is_empty() {
+        warn(&format!("mtl material '{}': unsupported {} ignored", m.name, unsupported.join(", ")));
+    }
+    // アルファ: `map_d` のマスク × `d`。マスクの無い定数 `d < 1` は半透明（確率的な透過）が要るので未対応
+    let alpha = match m.map_d.as_deref() {
+        Some(p) => load_mtl_mask(dir, p, state).map(|mask| (mask, m.d.clamp(0.0, 1.0) as f32)),
+        None => {
+            if m.d < 1.0 && !state.warned_alpha {
+                state.warned_alpha = true;
+                warn(&format!(
+                    "mtl material '{}': constant d < 1 without map_d ignored (translucency is not supported; further materials are not reported)",
+                    m.name
+                ));
+            }
+            None
+        }
+    };
+
+    let kd = Color::new(m.kd[0], m.kd[1], m.kd[2]);
+    let ks = Color::new(m.ks[0], m.ks[1], m.ks[2]);
+    if ks.luminance() > 0.05 && m.ns > 1.0 {
+        // Blinn-Phong 指数 → GGX の粗さ: alpha = sqrt(2 / (Ns + 2))
+        let rough = (2.0 / (m.ns + 2.0)).sqrt().clamp(1e-3, 1.0);
+        return (Material::Ggx { albedo: ks, alpha: rough }, alpha);
+    }
+    let tex = m.map_kd.as_deref().and_then(|p| load_mtl_texture(dir, p, textures, state));
+    (Material::Lambert { albedo: kd, albedo_tex: tex }, alpha)
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -1371,4 +1579,164 @@ mod tests {
         assert_eq!(scene.mats.len(), 1);
         assert!(matches!(scene.mats[0], Material::Lambert { .. }));
     }
+
+    // ---- MTL / usemtl（T2） ----
+
+    /// 一時ディレクトリに OBJ + MTL + テクスチャ 1 枚を作る（MTL はタブ字下げ・`\` パス・実データ風）。
+    /// 面は 8 枚（A×4, B×3, 未定義 C×1、先頭 1 枚は `usemtl` 前）で、警告が面ごとに出ないことも見られる。
+    fn with_mtl_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("tinypt_mtl_{}_{}", std::process::id(), C.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(dir.join("textures")).unwrap();
+        let mut img = image::RgbImage::new(1, 1);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        img.save(dir.join("textures/a.png")).unwrap();
+        let mut obj = String::from("mtllib m.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+        for (name, n) in [("A", 4), ("B", 3), ("C", 1)] {
+            obj.push_str(&format!("usemtl {}\n", name));
+            for _ in 0..n {
+                obj.push_str("f 1 2 3\n");
+            }
+        }
+        std::fs::write(dir.join("m.obj"), obj).unwrap();
+        std::fs::write(
+            dir.join("m.mtl"),
+            "newmtl A\n\tKd 1 1 1\n\tKs 0 0 0\n\tmap_Kd textures\\a.png\n\tmap_Ka textures\\a.png\n\tmap_d textures\\a.png\n\
+             newmtl B\n\tKd 0.5 0.5 0.5\n\tKs 0.9 0.9 0.9\n\tNs 100\n\tmap_Kd textures\\a.png\n\td 0.5\n",
+        )
+        .unwrap();
+        let out = f(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    fn obj_scene_xml(extra: &str) -> String {
+        format!(
+            r#"<scene version="3.0.0"><shape type="obj"><string name="filename" value="m.obj"/>{}</shape></scene>"#,
+            extra
+        )
+    }
+
+    /// `usemtl` ごとに材質が作られ、1 メッシュのまま三角形ごとの `mat_id` で引く。
+    /// `usemtl` 前の面は既定、MTL に無い名前も既定。同じ画像は 1 度しか読まない。
+    #[test]
+    fn mtl_materials_resolve_per_triangle_and_textures_are_cached() {
+        with_mtl_dir(|dir| {
+            let ((scene, _), warnings) = capture_warnings(|| {
+                load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap()
+            });
+            // 面に使われた名前だけ: 既定("")・A・B・C
+            assert_eq!(scene.mats.len(), 4);
+            assert_eq!(scene.world.meshes().len(), 1, "usemtl でメッシュを割ってはいけない");
+            let ids: Vec<usize> = scene.world.meshes()[0].tris.iter().map(|t| t.mat_id).collect();
+            assert_eq!(ids, vec![0, 1, 1, 1, 1, 2, 2, 2, 3]);
+            assert!(scene.world.instances()[0].mat_override.is_none());
+            // A: テクスチャ付き Lambert、B: 明るい Ks かつ Ns>1 → Ggx（alpha = sqrt(2/102)）、C・既定: 灰色 Lambert
+            assert!(matches!(scene.mats[1], Material::Lambert { albedo_tex: Some(_), .. }));
+            match scene.mats[2] {
+                Material::Ggx { alpha, .. } => assert!((alpha - (2.0f64 / 102.0).sqrt()).abs() < 1e-12),
+                _ => panic!("B は Ggx のはず"),
+            }
+            assert!(matches!(scene.mats[3], Material::Lambert { albedo_tex: None, .. }));
+            // 同じ a.png を A の map_Kd / map_Ka / map_d と B の map_Kd が指しているが、読むのは 1 回
+            // （B は Ggx になるので map_Kd は使われない → 実際に積まれるのは A の 1 枚）
+            assert_eq!(scene.textures.len(), 1);
+            // 警告: map_Ka はマテリアル A に 1 回だけ。定数 d<1 はシーンで 1 回だけ。面ごとには出ない
+            let n = |pat: &str| warnings.iter().filter(|w| w.contains(pat)).count();
+            assert_eq!(n("map_Ka"), 1, "{:?}", warnings);
+            assert_eq!(n("constant d < 1"), 1, "{:?}", warnings);
+            assert_eq!(n("failed to load alpha mask"), 0, "{:?}", warnings);
+            assert_eq!(n("'C' not found"), 1, "{:?}", warnings);
+            // 発光マテリアルを含まない → ライト CDF は空
+            assert!(scene.world.lights().is_empty());
+        });
+    }
+
+    /// 2 つの材質が同じ画像を指しても 1 回しか読まない（キャッシュ）。
+    #[test]
+    fn same_texture_path_in_two_materials_is_loaded_once() {
+        with_mtl_dir(|dir| {
+            std::fs::write(
+                dir.join("m.mtl"),
+                "newmtl A\n\tKd 1 1 1\n\tmap_Kd textures\\a.png\nnewmtl B\n\tKd 1 1 1\n\tmap_Kd textures/a.png\n",
+            )
+            .unwrap();
+            let scene = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(scene.textures.len(), 1);
+            match (&scene.mats[1], &scene.mats[2]) {
+                (
+                    Material::Lambert { albedo_tex: Some(a), .. },
+                    Material::Lambert { albedo_tex: Some(b), .. },
+                ) => assert_eq!(a, b),
+                _ => panic!("A / B ともテクスチャ付き Lambert のはず"),
+            }
+        });
+    }
+
+    /// `<bsdf>` 指定があれば MTL は読まず、従来どおり 1 材質で全体を覆う。
+    #[test]
+    fn bsdf_child_overrides_mtl() {
+        with_mtl_dir(|dir| {
+            let xml = obj_scene_xml(r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.2,0.3,0.4"/></bsdf>"#);
+            let scene = load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(scene.mats.len(), 1);
+            assert!(scene.textures.is_empty(), "MTL のテクスチャを読んではいけない");
+            assert!(scene.world.meshes()[0].tris.iter().all(|t| t.mat_id == 0));
+        });
+    }
+
+    /// `use_mtl=false` で MTL を無視し（`<bsdf>` 無しなら従来の既定拡散 + 警告）。
+    #[test]
+    fn use_mtl_false_ignores_mtl() {
+        with_mtl_dir(|dir| {
+            let xml = obj_scene_xml(r#"<boolean name="use_mtl" value="false"/>"#);
+            let (scene, warnings) = capture_warnings(|| load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0);
+            assert_eq!(scene.mats.len(), 1);
+            assert!(scene.textures.is_empty());
+            assert!(warnings.iter().any(|w| w.contains("without bsdf")), "{:?}", warnings);
+        });
+    }
+
+    /// MTL ファイルが無い / 空でも落ちず、既定の灰色拡散になる。
+    #[test]
+    fn missing_or_empty_mtl_falls_back_to_default() {
+        with_mtl_dir(|dir| {
+            std::fs::remove_file(dir.join("m.mtl")).unwrap();
+            let (scene, warnings) = capture_warnings(|| {
+                load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0
+            });
+            assert_eq!(scene.mats.len(), 4);
+            assert!(scene.mats.iter().all(|m| matches!(m, Material::Lambert { albedo_tex: None, .. })));
+            assert!(warnings.iter().any(|w| w.contains("failed to read mtl")), "{:?}", warnings);
+
+            std::fs::write(dir.join("m.mtl"), "").unwrap();
+            let scene = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert_eq!(scene.mats.len(), 4);
+        });
+    }
+
+    /// `map_d` を持つ材質の三角形だけがアルファ付きになり、`<bsdf>` 上書きや map_d 無しでは付かない。
+    /// 同じマスク画像は 1 度しか読まない（Arc を共有）。
+    #[test]
+    fn map_d_attaches_alpha_only_to_masked_material_triangles() {
+        with_mtl_dir(|dir| {
+            // UV を持つ OBJ にする
+            let mut obj = String::from("mtllib m.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n");
+            obj.push_str("usemtl A\nf 1/1 2/2 3/3\nusemtl B\nf 1/1 2/2 3/3\n");
+            std::fs::write(dir.join("m.obj"), obj).unwrap();
+            std::fs::write(dir.join("m.mtl"), "newmtl A\n\tKd 1 1 1\n\tmap_d textures\\a.png\nnewmtl B\n\tKd 1 1 1\n").unwrap();
+            let (scene, warnings) = capture_warnings(|| load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0);
+            assert!(scene.world.meshes()[0].has_alpha());
+            assert!(!warnings.iter().any(|w| w.contains("alpha")), "{:?}", warnings);
+            let over = obj_scene_xml(r#"<bsdf type="diffuse"/>"#);
+            let scene = load_scene_from_str(&over, dir, &cfg(), (None, None)).unwrap().0;
+            assert!(!scene.world.meshes()[0].has_alpha());
+            // map_d 無しの材質だけなら付かない
+            std::fs::write(dir.join("m.mtl"), "newmtl A\n\tKd 1 1 1\nnewmtl B\n\tKd 1 1 1\n").unwrap();
+            let scene = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert!(!scene.world.meshes()[0].has_alpha());
+        });
+    }
 }
+

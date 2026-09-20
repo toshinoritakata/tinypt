@@ -631,7 +631,7 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 12;
+    const GOLDEN_REVISION: u32 = 13;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
@@ -642,6 +642,7 @@ mod tests {
     /// 値が変わっていないこと自体が「頂点法線の無いシーンの出力は不変」の回帰テストになっている。
     /// テクスチャ導入（RENDER_REVISION 12）でも同じく不変: rectangle / cube に UV は付いたが、
     /// テクスチャを参照しないマテリアルでは UV を一度も読まないため。
+    /// アルファマスク導入（RENDER_REVISION 13）でも不変: マスクを持たないメッシュは従来の交差経路のまま。
     const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0x7c6a_81d0_9dd4_74a2);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。

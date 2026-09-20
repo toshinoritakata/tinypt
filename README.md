@@ -49,7 +49,11 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
 - **UV の向き**: OBJ/Mitsuba の `vt` は左下が原点 (v が上向き)。画像は上の行から並ぶので、テクセル行は `(1 − v)` 側から数える。
 - **定数色との併用**: `<rgb name="reflectance">` も書くと、その色は**倍率**としてテクスチャに掛かる。片方だけなら他方は白 (1 倍)。
 - **パラメトリック形状の UV**: Mitsuba 準拠。`rectangle` = `((x+1)/2, (y+1)/2)`、`cube` = 面ごとに `[0,1]²`、`disk` = `(r, φ/2π)`、`sphere` = `(φ/2π, θ/π)` (極は ±z)。
-- **現状の制限** (T1 の範囲): テクスチャを指定できるのは `diffuse` の `reflectance` のみ。OBJ の `usemtl` / MTL はまだ読まないので、1 つの OBJ 全体に 1 枚のテクスチャが掛かる (Sponza を本来の見た目にするのは次段階)。アルファマスクとミップマップも未対応。
+- **現状の制限**: XML でテクスチャを指定できるのは `diffuse` の `reflectance` のみ。アルファマスクとミップマップは未対応。
+- **OBJ の `usemtl` / MTL**: OBJ の `<shape>` に `<bsdf>` も `<emitter>` も書かないと、`mtllib` の MTL から材質を作る (1 メッシュのまま、`usemtl` ごとに三角形の材質が変わる。BVH は割らない)。`<bsdf>` があれば従来どおり**全体を上書き**し MTL は読まない (`sample/sponza.xml` はこちら)。`<boolean name="use_mtl" value="false"/>` でも MTL を無視できる。例: `sample/sponza_textured.xml`。
+  - MTL → BSDF: `map_Kd` があれば `Lambert { albedo: Kd, albedo_tex }` (sRGB デコード。`Kd` は倍率として掛かる)、無ければ `Lambert { albedo: Kd }`。`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
+  - 未対応: `d` / `map_d` (アルファ。シーンで 1 回だけ警告)、`map_bump` / `map_Ka` / 非ゼロの `Ke` (材質ごとに 1 回警告)。
+  - MTL の癖に対応: タブ字下げ、テクスチャパスの `\` (→ `/`)、未知キー、`newmtl` の重複 (最初の定義を残す)。テクスチャは解決済み絶対パスでキャッシュし、同じ画像を 2 度読まない。
 - 読み込みに失敗したテクスチャは警告して定数色にフォールバックする (描画は続く)。
 
 ## マテリアル
@@ -258,7 +262,8 @@ tools/fetch_models.sh sponza         # 片方だけ
 
 | シーン | 三角形 | 内容 |
 |---|---:|---|
-| `sample/sponza.xml` | 262,267 | Crytek Sponza のアトリウム内部。モデルは cm 単位なので `to_world` で 0.01 倍している。MTL/テクスチャは未対応なので全体を 1 つの diffuse にし、BSDF の違いは床置きの球 3 個 (conductor / roughconductor / dielectric) で見る |
+| `sample/sponza.xml` | 262,267 | Crytek Sponza のアトリウム内部。モデルは cm 単位なので `to_world` で 0.01 倍している。`<bsdf>` で全体を 1 つの diffuse にし (MTL は使わない)、BSDF の違いは床置きの球 3 個 (conductor / roughconductor / dielectric) で見る |
+| `sample/sponza_textured.xml` | 262,267 | 上と同じ構図で、`sponza.mtl` とテクスチャ (`assets/models/sponza/textures/`) を使う本来の見た目版 |
 | `sample/rungholt.xml` | 6,704,264 | Minecraft の街 "Neu Rungholt" を俯瞰。単位は m でスケール変換不要。全体を 1 つの diffuse に割り当て |
 
 どちらも「高所の面光源 (太陽相当) + `constant` の空」で照らしていて、面光源 NEE と環境 NEE の両方が効く。

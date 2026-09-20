@@ -8,7 +8,7 @@ pub const RAY_T_MAX: f64 = 1e30;
 /// 同じシーン・設定でも蓄積バッファの中身が変わる変更（積分器・BSDF・サンプリング・
 /// 乱数列など）を入れたら 1 つ上げる。チェックポイントのシーンハッシュに混ぜ、
 /// 挙動の異なるビルドが書いたチェックポイントから再開しないようにする。
-pub const RENDER_REVISION: u32 = 12;
+pub const RENDER_REVISION: u32 = 13;
 
 /// パストレーシングの定数。
 pub mod path {
@@ -34,4 +34,12 @@ pub mod bvh {
 pub mod ui {
     /// 進捗更新の間隔（ミリ秒）。
     pub const PROGRESS_INTERVAL_MS: u128 = 250;
+}
+
+/// アルファマスク（`map_d`）の定数。
+pub mod alpha {
+    /// この値**未満**の alpha は透明（交差を無かったことにする）、**以上**は不透明。
+    /// 0.5 はカットアウト（葉・鎖・柵）で標準的な値で、8bit マスクを 2 値化したとき
+    /// 中間調の縁がどちらにも偏らない。境界は `alpha >= ALPHA_CUTOFF` で決定的（128/255 は不透明、127/255 は透明）。
+    pub const ALPHA_CUTOFF: f64 = 0.5;
 }

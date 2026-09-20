@@ -105,6 +105,22 @@ struct ParsedObj {
     tris: Vec<[usize; 3]>,
     tri_vn: Vec<[u32; 3]>,
     tri_uv: Vec<[u32; 3]>,
+    /// `usemtl` のラン（三角形列の開始位置, `mat_names` の添字）。三角形数に比例しない
+    mat_runs: Vec<(usize, usize)>,
+    /// 実際に面に使われた材質名（初出順）。空文字列は「`usemtl` 前の面」= 既定材質
+    mat_names: Vec<String>,
+    /// `mtllib` で指定された MTL ファイル名（出現順）
+    mtllibs: Vec<String>,
+}
+
+/// `usemtl` でグループ分けした OBJ（1 メッシュのまま、三角形ごとに材質を持つ）。
+pub struct ObjGroups {
+    /// 三角形の `mat_id` は `mat_names` の添字（呼び出し側が実際の材質 ID に振り直す）
+    pub mesh: MeshData,
+    /// 面に使われた材質名（初出順）。空文字列は `usemtl` 前の面（既定材質）
+    pub mat_names: Vec<String>,
+    /// `mtllib` のファイル名（OBJ からの相対、出現順）
+    pub mtllibs: Vec<String>,
 }
 
 /// OBJ ファイルから頂点座標・頂点法線・UV・三角形（各添字）を解析する。
@@ -118,6 +134,12 @@ fn parse_obj(path: &str) -> std::io::Result<ParsedObj> {
     let mut tri_uv: Vec<[u32; 3]> = Vec::new();
     // フェースごとの一時バッファはループの外で使い回す（数百万フェースで確保が効いてくる）
     let mut face: Vec<(usize, u32, u32)> = Vec::new();
+    let mut mat_runs: Vec<(usize, usize)> = Vec::new();
+    let mut mat_names: Vec<String> = Vec::new();
+    let mut mtllibs: Vec<String> = Vec::new();
+    // 現在の `usemtl` 名と、その `mat_names` 添字（最初の面が来るまで作らない）
+    let mut cur_name = String::new();
+    let mut cur_idx: Option<usize> = None;
 
     for line in text.lines() {
         let line = line.trim();
@@ -145,6 +167,12 @@ fn parse_obj(path: &str) -> std::io::Result<ParsedObj> {
             // 参照側（補間）で長さを見て落とす
             let len = n.len();
             normals.push(if len > 0.0 { n / len } else { n });
+        } else if let Some(rest) = line.strip_prefix("usemtl ") {
+            cur_name = rest.trim().to_string();
+            cur_idx = None;
+        } else if let Some(rest) = line.strip_prefix("mtllib ") {
+            // 複数ファイルを空白区切りで並べる書式もあるが、空白入りのファイル名の方が現実的
+            mtllibs.push(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("f ") {
             face.clear();
             for tok in rest.split_whitespace() {
@@ -158,6 +186,20 @@ fn parse_obj(path: &str) -> std::io::Result<ParsedObj> {
                 }
             }
             if face.len() >= 3 {
+                let mi = match cur_idx {
+                    Some(i) => i,
+                    None => {
+                        let i = mat_names.iter().position(|n| *n == cur_name).unwrap_or_else(|| {
+                            mat_names.push(cur_name.clone());
+                            mat_names.len() - 1
+                        });
+                        cur_idx = Some(i);
+                        i
+                    }
+                };
+                if mat_runs.last().map(|r| r.1) != Some(mi) {
+                    mat_runs.push((tris.len(), mi));
+                }
                 // ファン三角形化。法線と UV の添字も同じ並びで割り当てる
                 let (i0, t0, n0) = face[0];
                 for k in 1..(face.len() - 1) {
@@ -171,7 +213,7 @@ fn parse_obj(path: &str) -> std::io::Result<ParsedObj> {
         }
     }
 
-    Ok(ParsedObj { positions, normals, uvs, tris, tri_vn, tri_uv })
+    Ok(ParsedObj { positions, normals, uvs, tris, tri_vn, tri_uv, mat_runs, mat_names, mtllibs })
 }
 
 /// 三角形ごとの法線添字を**その場で**整理する。3 つ揃っていない三角形は面法線扱い
@@ -276,18 +318,38 @@ pub fn load_obj_mesh_mb(path0: &str, path1: &str, mat_id: usize) -> std::io::Res
 
 /// 単一の OBJ ファイルを静的三角形メッシュとして読み込む。
 /// シャッター開 = シャッター閉に同一頂点を設定（モーションブラーなし）。
+/// `usemtl` は無視し、全三角形が `mat_id` になる。
 pub fn load_obj_mesh(path: &str, mat_id: usize) -> std::io::Result<MeshData> {
+    Ok(static_mesh(parse_obj(path)?, |_| mat_id).0)
+}
+
+/// [`load_obj_mesh`] の `usemtl` 対応版。1 メッシュのまま、三角形ごとに材質（`mat_names` の添字）を持つ。
+pub fn load_obj_groups(path: &str) -> std::io::Result<ObjGroups> {
     let parsed = parse_obj(path)?;
+    // ラン表から三角形 → 材質添字を引く（ランは三角形の並び順なので単調に進める）
+    let runs = parsed.mat_runs.clone();
+    let mut r = 0usize;
+    let (mesh, mat_names, mtllibs) = static_mesh(parsed, |ti| {
+        while r + 1 < runs.len() && runs[r + 1].0 <= ti {
+            r += 1;
+        }
+        runs.get(r).map(|x| x.1).unwrap_or(0)
+    });
+    Ok(ObjGroups { mesh, mat_names, mtllibs })
+}
+
+/// 解析結果から静的メッシュを作る。`mat_of(三角形番号)`（昇順に呼ばれる）が各三角形の `mat_id`。
+fn static_mesh(parsed: ParsedObj, mut mat_of: impl FnMut(usize) -> usize) -> (MeshData, Vec<String>, Vec<String>) {
     let p0 = parsed.positions;
     let mut tris: Vec<Triangle> = Vec::with_capacity(parsed.tris.len());
-    for [i0, i1, i2] in parsed.tris {
-        tris.push(Triangle::new_static(p0[i0], p0[i1], p0[i2], mat_id));
+    for (ti, [i0, i1, i2]) in parsed.tris.into_iter().enumerate() {
+        tris.push(Triangle::new_static(p0[i0], p0[i1], p0[i2], mat_of(ti)));
     }
     let (mut vn, mut tri_vn) = (parsed.normals, parsed.tri_vn);
     normalize_tri_vn(&mut vn, &mut tri_vn);
     let (mut uv, mut tri_uv) = (parsed.uvs, parsed.tri_uv);
     normalize_tri_uv(&mut uv, &mut tri_uv);
-    Ok(MeshData { tris, vn, tri_vn, uv, tri_uv })
+    (MeshData { tris, vn, tri_vn, uv, tri_uv }, parsed.mat_names, parsed.mtllibs)
 }
 
 /// 単一の OBJ を三角形リストだけ読み込む（頂点法線は捨てる）。
@@ -504,5 +566,28 @@ mod tests {
         let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap()).into_flat();
         assert!(!m.has_normals());
         assert_eq!(m.tris.len(), 1);
+    }
+
+    /// `usemtl` ごとに三角形の材質添字が付く。`usemtl` 前の面は既定（空文字列）、
+    /// 同じ名前に戻ると同じ添字、四角形のファン分割も同じ材質。
+    #[test]
+    fn usemtl_groups_assign_per_triangle_material() {
+        let obj = "mtllib a.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\n\
+                   f 1 2 3\nusemtl Red\nf 1 2 3\nf 1 2 4 3\nusemtl Blue\nf 1 2 3\nusemtl Red\nf 2 3 4\n";
+        let g = with_obj(obj, |p| load_obj_groups(p).unwrap());
+        assert_eq!(g.mat_names, vec!["".to_string(), "Red".to_string(), "Blue".to_string()]);
+        assert_eq!(g.mtllibs, vec!["a.mtl".to_string()]);
+        let ids: Vec<usize> = g.mesh.tris.iter().map(|t| t.mat_id).collect();
+        assert_eq!(ids, vec![0, 1, 1, 1, 2, 1]);
+    }
+
+    /// `usemtl` の無い OBJ は既定 1 つだけ。`load_obj_mesh` は `usemtl` を無視して `mat_id` を使う。
+    #[test]
+    fn no_usemtl_is_single_default_and_plain_loader_ignores_usemtl() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl X\nf 1 2 3\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 7).unwrap());
+        assert_eq!(m.tris[0].mat_id, 7);
+        let g = with_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", |p| load_obj_groups(p).unwrap());
+        assert_eq!(g.mat_names, vec!["".to_string()]);
     }
 }
