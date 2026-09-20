@@ -28,6 +28,7 @@ use crate::math::Color;
 use crate::ray::Camera;
 use crate::rng::{seed_for, Rng};
 use crate::scene::Scene;
+use crate::texture::Texture;
 use crate::task::{idx, Task, TileResult};
 use crate::world::World;
 
@@ -105,6 +106,7 @@ fn sample_pixel(
     t: &Task,
     world: &World,
     mats: &[Material],
+    textures: &[Texture],
     env: Option<&EnvMap>,
     cam: &Camera,
     limits: PathLimits,
@@ -119,7 +121,7 @@ fn sample_pixel(
         let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
         let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
         let ray = cam.ray(sx, sy, rng);
-        radiance(world, mats, env, ray, rng, limits)
+        radiance(world, mats, textures, env, ray, rng, limits)
     };
 
     if config.adaptive_enabled {
@@ -243,6 +245,7 @@ fn render_with_threads(
     scope(|sp| {
         let world_ref = &scene.world;
         let mats_ref = &scene.mats;
+        let tex_ref = &scene.textures;
         let cam_ref = &scene.cam;
         let env_ref = scene.env.as_ref();
 
@@ -251,6 +254,7 @@ fn render_with_threads(
             let rtx = rtx.clone();
             let world = world_ref;
             let mats = mats_ref;
+            let textures = tex_ref;
             let cam = cam_ref;
             let env = env_ref;
             sp.spawn(move |_| {
@@ -264,7 +268,7 @@ fn render_with_threads(
                     for y in t.y0..t.y1 {
                         for x in t.x0..t.x1 {
                             let local_idx = (y - t.y0) * tile_w + (x - t.x0);
-                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, env, cam, limits, config);
+                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, textures, env, cam, limits, config);
                             sum[local_idx] = c;
                             wsum[local_idx] = n;
                         }
@@ -385,6 +389,7 @@ mod tests {
             cam,
             world: World::new(),
             mats: Vec::new(),
+            textures: Vec::new(),
             env: None,
         }
     }
@@ -626,7 +631,7 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 11;
+    const GOLDEN_REVISION: u32 = 12;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
@@ -635,6 +640,8 @@ mod tests {
     /// スムーズシェーディング導入（RENDER_REVISION 11）でも**値は変わっていない**: このシーンは
     /// rectangle / cube だけで頂点法線を持たず、シェーディング法線 = 幾何法線のままだから。
     /// 値が変わっていないこと自体が「頂点法線の無いシーンの出力は不変」の回帰テストになっている。
+    /// テクスチャ導入（RENDER_REVISION 12）でも同じく不変: rectangle / cube に UV は付いたが、
+    /// テクスチャを参照しないマテリアルでは UV を一度も読まないため。
     const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0x7c6a_81d0_9dd4_74a2);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
@@ -726,7 +733,7 @@ mod tests {
         assert_eq!(scaled.matches(lookat).count(), 1, "cornell.xml camera changed; update this test");
         let scaled = scaled.replace(lookat, &format!(r#"origin="0, {}, {}" target="0, {}, 0""#, k, 3.9 * k, k));
         let mut config = RenderConfig::default();
-        let (scene, settings) = crate::mitsuba::load_scene_from_str(&scaled, std::path::Path::new("sample"), &config).unwrap();
+        let (scene, settings) = crate::mitsuba::load_scene_from_str(&scaled, std::path::Path::new("sample"), &config, (None, None)).unwrap();
         settings.apply(&mut config);
         config.width = width;
         config.height = height;
@@ -785,7 +792,7 @@ mod tests {
     #[test]
     fn golden_cornell_output_is_unchanged() {
         let mut config = RenderConfig::default();
-        let scene = crate::mitsuba::load_scene("sample/cornell.xml", &mut config).expect("load sample/cornell.xml");
+        let scene = crate::mitsuba::load_scene("sample/cornell.xml", &mut config, (None, None)).expect("load sample/cornell.xml");
         golden_config(&mut config, 48, 48);
         check_golden("cornell", &scene, &config, GOLDEN_CORNELL);
     }
@@ -795,7 +802,7 @@ mod tests {
     fn golden_spheres_output_is_unchanged() {
         let mut config = RenderConfig::default();
         golden_config(&mut config, 64, 36);
-        let (scene, settings) = crate::mitsuba::load_scene_from_str(GOLDEN_SPHERES_XML, std::path::Path::new("."), &config)
+        let (scene, settings) = crate::mitsuba::load_scene_from_str(GOLDEN_SPHERES_XML, std::path::Path::new("."), &config, (None, None))
             .expect("parse golden spheres scene");
         settings.apply(&mut config);
         golden_config(&mut config, 64, 36);

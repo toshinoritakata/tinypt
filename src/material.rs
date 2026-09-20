@@ -23,12 +23,19 @@ use crate::geometry::{face_forward, offset_ray_origin, Hit};
 use crate::math::{reflect, refract, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::texture::Texture;
+
+/// テクスチャ配列（[`crate::scene::Scene::textures`]）への添字。
+/// `Material` を `Copy` のまま保つために、テクスチャ本体ではなく添字を持たせている
+/// （マテリアルは交差ごとにコピーされるので、`Vec` を抱えさせたくない）。
+pub type TexId = u32;
 
 #[derive(Clone, Copy)]
 /// 積分器が対応するマテリアルモデル。各 variant が一つの BSDF を表す。
 pub enum Material {
-    /// 完全拡散反射（Lambertian BRDF）
-    Lambert { albedo: Color },
+    /// 完全拡散反射（Lambertian BRDF）。
+    /// `albedo_tex` がある場合、実際の反射率は `albedo`（色の倍率）× テクスチャの値になる。
+    Lambert { albedo: Color, albedo_tex: Option<TexId> },
     /// 完全鏡面反射（デルタ BRDF）
     Metal   { albedo: Color },
     /// 誘電体（屈折 + フレネル反射 + Beer-Lambert 吸収）
@@ -77,6 +84,24 @@ fn reflects_above(ng: Vec3, d: Vec3) -> bool {
 }
 
 impl Material {
+    /// テクスチャを交差点の UV で評価し、テクスチャを持たない等価なマテリアルに畳み込む。
+    ///
+    /// **テクスチャの評価はここ 1 回だけ**にして、`sample` / `eval` はテクスチャを知らないままにする
+    /// （BSDF の実装に UV やテクスチャ配列を持ち込まない）。積分器は交差ごとに 1 度これを呼ぶ。
+    /// 添字が範囲外のときはテクスチャ無しとして扱う（読み込みに失敗したシーンでも落とさない）。
+    pub fn resolve_textures(self, textures: &[Texture], uv: (f64, f64)) -> Self {
+        match self {
+            Material::Lambert { albedo, albedo_tex: Some(id) } => {
+                let tex = match textures.get(id as usize) {
+                    Some(t) => t.sample(uv),
+                    None => return Material::Lambert { albedo, albedo_tex: None },
+                };
+                Material::Lambert { albedo: albedo.hadamard(tex), albedo_tex: None }
+            }
+            other => other,
+        }
+    }
+
     /// 発光体なら放射輝度を返す（`DiffuseLight` のみ `Some`）。
     pub fn emitted(&self) -> Option<Color> {
         match self {
@@ -104,7 +129,7 @@ impl Material {
         // 誤差の箱を抜けられず自己交差する。
 
         match self {
-            Material::Lambert { albedo } => {
+            Material::Lambert { albedo, .. } => {
                 let d = sample_cosine_hemisphere(n, rng);
                 // 補間法線のせいで幾何的な裏側へ飛ぶサンプルは捨てる（下の reflects_above を参照）
                 if !reflects_above(ng, d) {
@@ -250,7 +275,7 @@ impl Material {
     /// デルタ散乱マテリアルは有限の値を持たないため `(0, 0)` を返す。
     pub fn eval(&self, wo: Vec3, wi: Vec3, n: Vec3) -> (Color, f64) {
         match *self {
-            Material::Lambert { albedo } | Material::Subsurface { albedo } => {
+            Material::Lambert { albedo, .. } | Material::Subsurface { albedo } => {
                 let cos = n.dot(wi).max(0.0);
                 if cos <= 0.0 {
                     (Color::new(0.0, 0.0, 0.0), 0.0)
@@ -421,14 +446,14 @@ mod tests {
     /// 下向きレイが床（法線 +Y）に当たる状況の Hit を作る。
     fn floor_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0), uv: (0.0, 0.0) };
         (ray, hit)
     }
 
     /// sample() が報告する PDF は、同じ方向に対する eval() の PDF と一致する（Lambert）。
     #[test]
     fn lambert_sample_pdf_matches_eval() {
-        let mat = Material::Lambert { albedo: Color::new(0.6, 0.4, 0.2) };
+        let mat = Material::Lambert { albedo: Color::new(0.6, 0.4, 0.2), albedo_tex: None };
         let (ray, hit) = floor_hit();
         let mut rng = Rng::new(1);
         let n = hit.ng; // 入射なので向き付き法線 = 幾何法線
@@ -444,7 +469,7 @@ mod tests {
     fn oblique_hit(theta_o: f64) -> (Ray, Hit, Vec3) {
         let wo = Vec3::new(theta_o.sin(), theta_o.cos(), 0.0);
         let ray = Ray { o: wo * 2.0, d: -wo, time: 0.0 };
-        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
+        let hit = Hit { t: 2.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0), uv: (0.0, 0.0) };
         (ray, hit, wo)
     }
 
@@ -601,7 +626,7 @@ mod tests {
     #[test]
     fn lambert_weight_is_albedo() {
         let albedo = Color::new(0.5, 0.7, 0.3);
-        let mat = Material::Lambert { albedo };
+        let mat = Material::Lambert { albedo, albedo_tex: None };
         let (ray, hit) = floor_hit();
         let mut rng = Rng::new(3);
         let s = mat.sample(&ray, &hit, &mut rng).unwrap();
@@ -628,7 +653,7 @@ mod tests {
     /// 一様半球サンプリングによるモンテカルロ推定（pdf_uniform = 1/2π）。
     #[test]
     fn lambert_pdf_integrates_to_one() {
-        let mat = Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) };
+        let mat = Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: None };
         let n = Vec3::new(0.0, 1.0, 0.0);
         let wo = Vec3::new(0.0, 1.0, 0.0);
         let mut rng = Rng::new(99);
@@ -651,7 +676,7 @@ mod tests {
     /// 下から上向きのレイが床（幾何法線 +Y）の裏面に当たる状況の Hit を作る。
     fn floor_backface_hit() -> (Ray, Hit) {
         let ray = Ray { o: Vec3::new(0.0, -1.0, 0.0), d: Vec3::new(0.0, 1.0, 0.0), time: 0.0 };
-        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
+        let hit = Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0), uv: (0.0, 0.0) };
         (ray, hit)
     }
 
@@ -788,12 +813,12 @@ mod tests {
     fn classification_is_correct() {
         assert!(Material::Metal { albedo: Color::new(1.0, 1.0, 1.0) }.is_delta());
         assert!(Material::Dielectric { ior: 1.5, absorption: Color::new(0.0, 0.0, 0.0) }.is_delta());
-        assert!(!Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) }.is_delta());
+        assert!(!Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: None }.is_delta());
         assert!(!Material::Ggx { albedo: Color::new(1.0, 1.0, 1.0), alpha: 0.2 }.is_delta());
 
         let emit = Color::new(3.0, 3.0, 3.0);
         assert!(Material::DiffuseLight { emit }.emitted().is_some());
-        assert!(Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) }.emitted().is_none());
+        assert!(Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: None }.emitted().is_none());
     }
 
     // ---- スムーズシェーディング: 幾何法線とシェーディング法線の分離 ----
@@ -817,9 +842,10 @@ mod tests {
             inst_id: None,
             p_error: Vec3::new(4e-16, 7e-16, 9e-16),
             bary: (0.25, 0.25),
+            uv: (0.0, 0.0),
         };
         let ray = Ray { o: hit.p + Vec3::new(0.3, 1.0, 0.2), d: Vec3::new(-0.3, -1.0, -0.2).norm(), time: 0.0 };
-        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
+        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None };
         let mut rng = Rng::new(5);
         let mut checked = 0;
         for _ in 0..200 {
@@ -860,7 +886,7 @@ mod tests {
             Vec3::new(-0.4, -1.0, 0.3).norm(),
         ];
         let cases: [(&str, Material, bool); 5] = [
-            ("Lambert", Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }, false),
+            ("Lambert", Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }, false),
             ("Metal", Material::Metal { albedo: Color::new(0.9, 0.9, 0.9) }, false),
             ("Ggx", Material::Ggx { albedo: Color::new(0.9, 0.9, 0.9), alpha: 0.35 }, false),
             ("Subsurface", Material::Subsurface { albedo: Color::new(0.7, 0.7, 0.7) }, false),
@@ -872,7 +898,7 @@ mod tests {
             for d in dirs {
                 let hit = Hit {
                     t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng, ns, mat_id: 0, prim_id: 0, inst_id: None,
-                    p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25),
+                    p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25), uv: (0.0, 0.0),
                 };
                 let ray = Ray { o: -d * 2.0, d, time: 0.0 };
                 for _ in 0..4000 {
@@ -912,10 +938,10 @@ mod tests {
         let ns = Vec3::new(0.6, 0.8, 0.0).norm();
         let hit = Hit {
             t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng, ns, mat_id: 0, prim_id: 0, inst_id: None,
-            p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25),
+            p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25), uv: (0.0, 0.0),
         };
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
-        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
+        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None };
         let mut rng = Rng::new(9);
         let (mut kept, mut rejected) = (0, 0);
         let mut mean = Vec3::new(0.0, 0.0, 0.0);

@@ -6,6 +6,7 @@ Rust 製のモンテカルロパストレーサー。
 
 - **BVH 加速構造** (SAH) による高速レイ-ジオメトリ交差判定
 - **スムーズシェーディング**: OBJ の頂点法線を補間 ([詳細](#スムーズシェーディング-法線の補間))
+- **テクスチャ**: ビットマップテクスチャ (UV バイリニア、sRGB デコード) ([詳細](#テクスチャ))
 - **マテリアル**: ランバート拡散・完全鏡面金属・GGX マイクロファセット・誘電体 (ガラス)・面光源 ([詳細](#マテリアル))
 - **Multiple Importance Sampling (MIS)** + **Next Event Estimation (NEE)** による分散低減
 - **Firefly クランプ**: 寄与単位・輝度ベース (閾値 50)。発光体/背景ヒットと NEE のすべての寄与に適用し、MIS の両側で同じ上限になる (バイアスあり)
@@ -29,6 +30,27 @@ OBJ の頂点法線 (`vn`) を重心座標で補間し、BSDF の評価と NEE �
 - GGX の棄却率 (粗さ 0.4 で約 15%) の大半はスムーズシェーディング以前からあるもの (VNDF が地平線下の反射方向を出す既知の性質で約 12.5%)。補間が足すぶんは数ポイント。
 
 頂点法線を持たないシーン (`rectangle` / `cube` / `disk` / `sphere`、`vn` の無い OBJ) の出力は**ビット単位で以前と同じ**。
+
+### テクスチャ
+
+OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance` にビットマップテクスチャを指定できる。
+
+```xml
+<bsdf type="diffuse">
+  <texture type="bitmap" name="reflectance">
+    <string name="filename" value="textures/brick.png"/>
+    <string name="wrap_mode" value="repeat"/>  <!-- repeat (既定) / clamp -->
+  </texture>
+</bsdf>
+```
+
+- **色空間**: 色テクスチャは **sRGB** としてデコードする (PPM 出力のエンコードの正確な逆)。`<boolean name="raw" value="true"/>` を付けるとリニアのまま読む (データテクスチャ用)。
+- **フィルタ**: バイリニア (テクセル中心基準)。ミップマップは未対応。
+- **UV の向き**: OBJ/Mitsuba の `vt` は左下が原点 (v が上向き)。画像は上の行から並ぶので、テクセル行は `(1 − v)` 側から数える。
+- **定数色との併用**: `<rgb name="reflectance">` も書くと、その色は**倍率**としてテクスチャに掛かる。片方だけなら他方は白 (1 倍)。
+- **パラメトリック形状の UV**: Mitsuba 準拠。`rectangle` = `((x+1)/2, (y+1)/2)`、`cube` = 面ごとに `[0,1]²`、`disk` = `(r, φ/2π)`、`sphere` = `(φ/2π, θ/π)` (極は ±z)。
+- **現状の制限** (T1 の範囲): テクスチャを指定できるのは `diffuse` の `reflectance` のみ。OBJ の `usemtl` / MTL はまだ読まないので、1 つの OBJ 全体に 1 枚のテクスチャが掛かる (Sponza を本来の見た目にするのは次段階)。アルファマスクとミップマップも未対応。
+- 読み込みに失敗したテクスチャは警告して定数色にフォールバックする (描画は続く)。
 
 ## マテリアル
 
@@ -177,6 +199,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` + `face_normals` (下記) |
 | `<shape type="rectangle"\|"cube"\|"disk">` | Mitsuba 正準形メッシュ + `to_world` |
 | `<transform>` | `translate` / `rotate` (任意軸) / `scale` (均一・非均一) / `matrix` (4×4) |
+| `<texture type="bitmap">` | `diffuse` の `reflectance` に指定 (`filename` / `wrap_mode` / `raw`) ([詳細](#テクスチャ)) |
 | `<bsdf>` | `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric`・`thindielectric`・`roughdielectric` (いずれも `Dielectric`、独自拡張の `absorption` 対応) / `twosided`。未知の型は警告して `diffuse` にフォールバック |
 | `<emitter type="area">` | `radiance` (shape に付随する面光源) |
 | `<emitter type="envmap"\|"constant">` | 環境マップ (`filename` / `radiance`、`scale` 対応。等距離円筒図法、テクセル中心基準の双線形補間) |

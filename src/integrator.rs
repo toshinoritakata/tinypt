@@ -21,6 +21,7 @@ use crate::material::{BsdfSample, Material};
 use crate::math::{Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::texture::Texture;
 use crate::world::World;
 
 /// デフォルトの空色を返す（環境マップ未使用時のフォールバック）。
@@ -65,6 +66,7 @@ pub struct PathLimits {
 pub fn radiance(
     world: &World,
     mats: &[Material],
+    textures: &[Texture],
     env: Option<&EnvMap>,
     ray: Ray,
     rng: &mut Rng,
@@ -99,7 +101,8 @@ pub fn radiance(
             }
         };
 
-        let mat = mats[hit.mat_id];
+        // テクスチャはここで 1 度だけ交差点の UV で評価し、以降の BSDF はテクスチャを知らない
+        let mat = mats[hit.mat_id].resolve_textures(textures, hit.uv);
 
         // 発光体に命中: 放射輝度を蓄積しパス終了
         if let Some(emit) = mat.emitted() {
@@ -342,11 +345,11 @@ mod tests {
 
     /// 点 `p`・法線 `n` の交差情報（誤差上界は十分小さい値）。NEE の単体テスト用。
     fn test_hit(p: Vec3, n: Vec3) -> crate::geometry::Hit {
-        crate::geometry::Hit { t: 1.0, p, ng: n, ns: n, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) }
+        crate::geometry::Hit { t: 1.0, p, ng: n, ns: n, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0), uv: (0.0, 0.0) }
     }
 
     fn floor_setup() -> (Material, Vec3, Vec3, Ray) {
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
         let p = Vec3::new(0.0, 0.0, 0.0);
         let n = Vec3::new(0.0, 1.0, 0.0);
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
@@ -453,7 +456,7 @@ mod tests {
     fn floor_under_sphere_light() -> (World, Vec<Material>, EnvMap) {
         use crate::geometry::Sphere;
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) },
+            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None },
             Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) },
         ];
         let mut world = World::new();
@@ -468,7 +471,7 @@ mod tests {
         let mut rng = Rng::new(seed);
         let (mut s, mut s2) = (0.0, 0.0);
         for _ in 0..n {
-            let x = radiance(world, mats, Some(env), ray, &mut rng, limits).r();
+            let x = radiance(world, mats, &[], Some(env), ray, &mut rng, limits).r();
             s += x;
             s2 += x * x;
         }
@@ -487,9 +490,9 @@ mod tests {
         let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
 
         let mut rng = Rng::new(1);
-        assert_eq!(radiance(&world, &mats, Some(&env), to_light, &mut rng, limits(0)).r(), 0.0);
-        assert_eq!(radiance(&world, &mats, Some(&env), to_light, &mut rng, limits(1)).r(), 4.0);
-        assert_eq!(radiance(&world, &mats, Some(&env), to_floor, &mut rng, limits(1)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &[], Some(&env), to_light, &mut rng, limits(0)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &[], Some(&env), to_light, &mut rng, limits(1)).r(), 4.0);
+        assert_eq!(radiance(&world, &mats, &[], Some(&env), to_floor, &mut rng, limits(1)).r(), 0.0);
 
         let exact = 0.5 * 4.0 / 9.0;
         for max_depth in [2usize, 3, 8, usize::MAX] {
@@ -531,7 +534,7 @@ mod tests {
     fn dielectric_sample_reports_relative_ior() {
         let ior = 1.5;
         let mat = Material::Dielectric { ior, absorption: Color::new(0.0, 0.0, 0.0) };
-        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0) };
+        let hit = crate::geometry::Hit { t: 1.0, p: Vec3::new(0.0, 0.0, 0.0), ng: Vec3::new(0.0, 1.0, 0.0), ns: Vec3::new(0.0, 1.0, 0.0), mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.0, 0.0), uv: (0.0, 0.0) };
         let enter = Ray { o: Vec3::new(0.3, 1.0, 0.0), d: Vec3::new(-0.3, -1.0, 0.0).norm(), time: 0.0 };
         let exit = Ray { o: Vec3::new(0.1, -1.0, 0.0), d: Vec3::new(-0.1, 1.0, 0.0).norm(), time: 0.0 };
         let mut rng = Rng::new(2);
@@ -583,7 +586,7 @@ mod tests {
         let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
         for (mat, expect) in [
             (Material::Dielectric { ior: 1.5, absorption: Color::new(0.0, 0.0, 0.0) }, 1.0),
-            (Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }, 0.8),
+            (Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }, 0.8),
         ] {
             for (k, offset) in [(1e-3, 0.0), (1e3, 0.0), (1.0, 1e8), (1e-3, 1e8)] {
                 let mats = vec![mat];
@@ -616,6 +619,7 @@ mod tests {
             inst_id: None,
             p_error: Vec3::new(1e-15, 1e-15, 1e-15),
             bary: (0.25, 0.25),
+            uv: (0.0, 0.0),
         };
         let ray = Ray { o: Vec3::new(0.0, 0.0, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
         (hit, ng, ns, ray)
@@ -628,7 +632,7 @@ mod tests {
     #[test]
     fn area_light_nee_shadow_ray_starts_from_the_geometric_offset() {
         let (hit, ng, ns, ray) = tilted_hit();
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
         // ns 側にも ng 側にもある方向（どちらの半球でも表）に光源を置く
         let light_p = Vec3::new(1.0, 0.0, 1.0);
         let ls = LightSample {
@@ -661,7 +665,7 @@ mod tests {
     #[test]
     fn env_nee_shadow_ray_starts_from_the_geometric_offset() {
         let (hit, ng, ns, ray) = tilted_hit();
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
         let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
         let mut rng = Rng::new(4);
         let seen: Cell<Option<(Vec3, Vec3)>> = Cell::new(None);
@@ -693,7 +697,7 @@ mod tests {
     #[test]
     fn nee_contributions_below_the_geometry_are_dropped() {
         let (hit, ng, ns, ray) = tilted_hit();
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
         // ns から見て表（cos > 0）だが ng から見て裏（z < 0）の方向にある光源。
         // 面は 1 枚ポリゴンなので、遮蔽判定（closest_hit）は何も返さない = 遮られない。
         let wedge = Vec3::new(0.9, 0.0, -0.436).norm();
@@ -748,7 +752,7 @@ mod tests {
         use crate::world::test_meshes::tilted_quad;
         let ns = Vec3::new(0.866_025_403_784_438_6, 0.0, 0.5); // 面法線 +z から 60 度
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) },
+            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None },
             Material::DiffuseLight { emit: Color::new(40.0, 40.0, 40.0) },
         ];
         let mut world = World::new();
@@ -780,7 +784,7 @@ mod tests {
         use crate::transform::Transform;
         use crate::world::test_meshes::tilted_quad;
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) },
+            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None },
             Material::DiffuseLight { emit: Color::new(60.0, 60.0, 60.0) },
         ];
         let mut world = World::new();
@@ -848,6 +852,53 @@ mod tests {
         assert!(mean > 0.05, "裏面ヒットで ns が向け直されていない（mean = {} ± {}）", mean, se);
     }
 
+    /// **テクスチャが描画経路で効く**: 同じシーンでテクスチャの値だけを変えると明るさが変わり、
+    /// その比はテクスチャの反射率の比に一致する。
+    ///
+    /// `radiance` が `resolve_textures` を呼ばない（= テクスチャを無視する）ようにすると、
+    /// どちらも定数の倍率（白）のままになって比が 1 になり落ちる。
+    #[test]
+    fn radiance_uses_the_bound_texture() {
+        use crate::geometry::Sphere;
+        use crate::texture::{Texture, Wrap};
+        use crate::transform::Transform;
+        use crate::world::test_meshes::tilted_quad;
+
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+        let light_dir = Vec3::new(0.0, 0.0, 1.0);
+        let d = Vec3::new(0.0, 0.6, -1.0).norm();
+        let ray = Ray { o: -d * 4.0, d, time: 0.0 };
+
+        // 反射率だけが違う 2 つの一様テクスチャ
+        let mean_for = |reflectance: f64| {
+            let mats = vec![
+                Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: Some(0) },
+                Material::DiffuseLight { emit: Color::new(60.0, 60.0, 60.0) },
+            ];
+            let textures = vec![Texture::from_linear(
+                1, 1, vec![Color::new(reflectance, reflectance, reflectance)], Wrap::Repeat)];
+            let mut world = World::new();
+            world.add_mesh_data_instance(
+                tilted_quad(8.0, Vec3::new(0.0, 0.0, 1.0), 0), Transform::identity(), None);
+            world.add_sphere(Sphere { c: light_dir * 6.0, r: 0.3, mat_id: 1 });
+            world.build_lights(&mats);
+            let mut rng = Rng::new(3);
+            let (mut sum, n) = (0.0, 20_000);
+            for _ in 0..n {
+                sum += radiance(&world, &mats, &textures, Some(&env), ray, &mut rng,
+                                PathLimits { max_depth: 2, rr_depth: 8 }).r();
+            }
+            sum / n as f64
+        };
+
+        let bright = mean_for(0.8);
+        let dark = mean_for(0.2);
+        assert!(bright > 0.0, "光が届いていない");
+        // 直接照明だけ（max_depth = 2）なので、明るさは反射率に比例する
+        let ratio = dark / bright;
+        assert!((ratio - 0.25).abs() < 0.02, "テクスチャの反射率が効いていない（比 = {:.4}、期待 0.25）", ratio);
+    }
+
     /// 白炉テスト（スムーズシェーディング）: 頂点法線を付けた Lambert の球メッシュでも、
     /// 一様な環境光 L = 1 の中での見え方はアルベド 0.8 に十分近い。
     ///
@@ -861,7 +912,7 @@ mod tests {
     fn smooth_sphere_mesh_white_furnace_loses_little_energy() {
         use crate::transform::Transform;
         use crate::world::test_meshes::uv_sphere;
-        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }];
         let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
         let mut means = Vec::new();
         for smooth in [true, false] {
@@ -887,7 +938,7 @@ mod tests {
     #[test]
     fn lambert_sphere_white_furnace_is_unbiased_with_russian_roulette() {
         use crate::geometry::Sphere;
-        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }];
         let mut world = World::new();
         world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 0 });
         world.build_lights(&mats);
@@ -919,7 +970,7 @@ mod tests {
         for (k, offset) in [(1.0, 0.0), (1e-3, 0.0), (1.0, 1e8)] {
             let base = Vec3::new(offset, -0.5 * offset, 0.25 * offset);
             let mats = vec![
-                Material::Lambert { albedo: Color::new(albedo, albedo, albedo) },
+                Material::Lambert { albedo: Color::new(albedo, albedo, albedo), albedo_tex: None },
                 Material::DiffuseLight { emit: Color::new(emit, emit, emit) },
             ];
             let mut world = World::new();

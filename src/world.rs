@@ -13,7 +13,7 @@
 use crate::bvh::Bvh;
 use crate::geometry::{face_forward, Aabb, Hit, Sphere, Triangle};
 use crate::material::Material;
-use crate::obj_loader::{MeshData, NO_NORMAL};
+use crate::obj_loader::{MeshData, NO_NORMAL, NO_UV};
 use crate::math::{cdf_search, gamma, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
@@ -32,6 +32,10 @@ pub struct Mesh {
     vn: Vec<Vec3>,
     /// 三角形ごとの `vn` の添字。空ならメッシュ全体が面法線
     tri_vn: Vec<[u32; 3]>,
+    /// テクスチャ座標（OBJ の `vt`）。UV を持たないメッシュでは空
+    uv: Vec<[f64; 2]>,
+    /// 三角形ごとの `vt` の添字。空ならメッシュ全体が UV 無し
+    tri_uv: Vec<[u32; 3]>,
     /// メッシュ内の BVH（高速交差判定用）
     bvh: Bvh,
 }
@@ -40,22 +44,42 @@ impl Mesh {
     /// 三角形リストからメッシュと BVH を構築する（面法線のみ）。
     pub fn new(tris: Vec<Triangle>) -> Self {
         let bvh = Bvh::build(&tris);
-        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), bvh }
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new(), bvh }
     }
 
     /// 頂点法線付きでメッシュを構築する。`tri_vn` の長さが三角形数と合わない場合は
     /// 面法線だけのメッシュとして扱う（壊れた入力で添字がずれるより安全側）。
     pub fn with_normals(tris: Vec<Triangle>, vn: Vec<Vec3>, tri_vn: Vec<[u32; 3]>) -> Self {
-        if vn.is_empty() || tri_vn.len() != tris.len() {
-            return Self::new(tris);
-        }
+        Self::build(tris, vn, tri_vn, Vec::new(), Vec::new())
+    }
+
+    /// 頂点法線と UV（どちらも省略可）を付けてメッシュを構築する。
+    /// 添字配列の長さが三角形数と合わない場合は、その属性だけ無かったことにする
+    /// （壊れた入力で添字がずれるより安全側）。
+    pub fn build(
+        tris: Vec<Triangle>,
+        vn: Vec<Vec3>,
+        tri_vn: Vec<[u32; 3]>,
+        uv: Vec<[f64; 2]>,
+        tri_uv: Vec<[u32; 3]>,
+    ) -> Self {
+        let (vn, tri_vn) = if vn.is_empty() || tri_vn.len() != tris.len() {
+            (Vec::new(), Vec::new())
+        } else {
+            (vn, tri_vn)
+        };
+        let (uv, tri_uv) = if uv.is_empty() || tri_uv.len() != tris.len() {
+            (Vec::new(), Vec::new())
+        } else {
+            (uv, tri_uv)
+        };
         let bvh = Bvh::build(&tris);
-        Self { tris, vn, tri_vn, bvh }
+        Self { tris, vn, tri_vn, uv, tri_uv, bvh }
     }
 
     /// [`MeshData`] からメッシュを構築する。
     pub fn with_normals_from(data: MeshData) -> Self {
-        Self::with_normals(data.tris, data.vn, data.tri_vn)
+        Self::build(data.tris, data.vn, data.tri_vn, data.uv, data.tri_uv)
     }
 
     /// このメッシュがスムーズシェーディング（頂点法線の補間）を行うか。
@@ -68,6 +92,16 @@ impl Mesh {
         self.vn.len()
     }
 
+    /// このメッシュが頂点 UV を持つか。
+    pub fn has_uv(&self) -> bool {
+        !self.tri_uv.is_empty()
+    }
+
+    /// UV の個数（メモリ量の報告用）。
+    pub fn uv_count(&self) -> usize {
+        self.uv.len()
+    }
+
     /// メッシュ内三角形に対するレイ交差判定（オブジェクト空間）。
     /// 頂点法線を持つ三角形なら、重心座標で補間したシェーディング法線を `Hit::ns` に入れる。
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
@@ -77,7 +111,28 @@ impl Mesh {
                 h.ns = ns;
             }
         }
+        if !self.tri_uv.is_empty() {
+            if let Some(uv) = self.texture_coords(h.prim_id, h.bary) {
+                h.uv = uv;
+            }
+        }
         Some(h)
+    }
+
+    /// 三角形 `tri_id` の重心座標 `(b1, b2)` での補間 UV。UV を持たない三角形は `None`。
+    fn texture_coords(&self, tri_id: usize, bary: (f64, f64)) -> Option<(f64, f64)> {
+        let idx = *self.tri_uv.get(tri_id)?;
+        if idx[0] == NO_UV {
+            return None;
+        }
+        let (b1, b2) = bary;
+        let b0 = 1.0 - b1 - b2;
+        let (a, b, c) = (
+            self.uv[idx[0] as usize],
+            self.uv[idx[1] as usize],
+            self.uv[idx[2] as usize],
+        );
+        Some((a[0] * b0 + b[0] * b1 + c[0] * b2, a[1] * b0 + b[1] * b1 + c[1] * b2))
     }
 
     /// 三角形 `tri_id` の重心座標 `(b1, b2)` での補間法線。頂点法線が無い三角形や、
@@ -221,8 +276,7 @@ impl World {
 
     /// OBJ から読んだメッシュ（頂点法線付きでありうる）を `xform` で配置したインスタンスを追加する。
     pub fn add_mesh_data_instance(&mut self, data: MeshData, xform: Transform, mat_override: Option<usize>) -> usize {
-        let MeshData { tris, vn, tri_vn } = data;
-        self.add_mesh(Mesh::with_normals(tris, vn, tri_vn), xform, mat_override)
+        self.add_mesh(Mesh::with_normals_from(data), xform, mat_override)
     }
 
     /// 構築済みのメッシュを登録してインスタンスを追加する（上の 2 つの共通部分）。
@@ -331,6 +385,7 @@ impl World {
                         inst_id: Some(inst_id),
                         p_error,
                         bary: h_obj.bary,
+                        uv: h_obj.uv,
                     });
                 }
                 break;
@@ -753,7 +808,7 @@ pub(crate) mod test_meshes {
             Triangle::new_static(v(-half, -half), v(half, -half), v(half, half), mat_id),
             Triangle::new_static(v(-half, -half), v(half, half), v(-half, half), mat_id),
         ];
-        MeshData { tris, vn: vec![ns.norm()], tri_vn: vec![[0, 0, 0], [0, 0, 0]] }
+        MeshData { tris, vn: vec![ns.norm()], tri_vn: vec![[0, 0, 0], [0, 0, 0]], uv: Vec::new(), tri_uv: Vec::new() }
     }
 
     /// 経度 `nu` × 緯度 `nv` の UV 球。頂点法線は解析的な法線（中心からの単位ベクトル）。
@@ -787,7 +842,7 @@ pub(crate) mod test_meshes {
         }
         // 頂点法線 = 単位球面上の位置（解析的な法線）
         let vn = pos.clone();
-        if smooth { MeshData { tris, vn, tri_vn } } else { MeshData::flat(tris) }
+        if smooth { MeshData { tris, vn, tri_vn, uv: Vec::new(), tri_uv: Vec::new() } } else { MeshData::flat(tris) }
     }
 }
 
@@ -845,6 +900,7 @@ mod tests {
                         inst_id: Some(inst_id),
                         p_error,
                         bary: h_obj.bary,
+                        uv: h_obj.uv,
                     });
                 }
                 break;
@@ -1399,6 +1455,7 @@ mod tests {
                     inst_id: None,
                     p_error: Vec3::new(0.0, 0.0, 0.0),
                     bary: (0.0, 0.0),
+                    uv: (0.0, 0.0),
                 };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() < 1e-9 * ls.pdf.max(1.0), "light_pdf {} != sample_light pdf {}", pdf, ls.pdf);
@@ -1441,7 +1498,7 @@ mod tests {
                     let wi = (ls.position - from).norm();
                     assert!(ls.normal.dot(-wi) > 0.0, "{}: sampled a point not visible from outside", name);
                 }
-                let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0) };
+                let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0), uv: (0.0, 0.0) };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "{}: light_pdf {} != sample pdf {}", name, pdf, ls.pdf);
             }
@@ -1597,7 +1654,7 @@ mod tests {
                     let wi = (ls.position - from).norm();
                     assert!(ls.normal.dot(-wi) > 0.0, "r={} eps={:e}: cone sample on the hidden side", r, eps);
                 }
-                let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0) };
+                let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: 0, inst_id: None, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0), uv: (0.0, 0.0) };
                 let pdf = world.light_pdf(from, 0.0, &hit);
                 assert!((pdf - ls.pdf).abs() <= 1e-9 * ls.pdf, "r={} eps={:e}: light_pdf {} != sample pdf {}", r, eps, pdf, ls.pdf);
             }
@@ -1624,6 +1681,7 @@ mod tests {
             inst_id: None,
             p_error: Vec3::new(0.0, 0.0, 0.0),
             bary: (0.0, 0.0),
+            uv: (0.0, 0.0),
         };
         assert_eq!(world.light_pdf(Vec3::new(5.0, 0.0, 0.0), 0.0, &hit), 0.0);
     }
@@ -1840,7 +1898,7 @@ mod tests {
             Vec3::new(-1.0, 1.0, 1.0),  // 鏡像
             Vec3::new(-2.0, 0.5, 3.0),  // 鏡像 + 非一様
         ] {
-            let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+            let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
             let mut world = World::new();
             let xform = Transform::scale(scale);
             world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 24, 12, 0, true), xform, None);
@@ -1919,7 +1977,7 @@ mod tests {
     /// 大きいほど逆転置による向きの入れ替わりが起きやすいから。
     #[test]
     fn shading_normal_stays_on_the_geometric_side_through_shearing_transforms() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
         for (name, xform) in tricky_transforms() {
             let mut world = World::new();
             world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 8, 4, 0, true), xform, None);
@@ -1953,7 +2011,7 @@ mod tests {
     /// （オブジェクト空間の法線でも両方の条件を満たしてしまうため）。
     #[test]
     fn instance_transform_actually_transforms_the_shading_normal() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
         // 面法線 +z から 50 度傾けた一様な頂点法線。回転・非一様・せん断で「変換しない」と
         // 明確に違う向きになる。
         let ns_obj = Vec3::new(0.766, 0.0, 0.643).norm();
@@ -2006,7 +2064,7 @@ mod tests {
     /// 幾何法線は自己交差回避・表裏判定・光源 pdf の基準なので、ここが補間値に化けると静かに壊れる。
     #[test]
     fn instance_geometric_normal_is_unaffected_by_vertex_normals() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
         for (name, xform) in tricky_transforms() {
             let mut smooth_world = World::new();
             smooth_world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 12, 6, 0, true), xform, None);
@@ -2042,6 +2100,119 @@ mod tests {
         }
     }
 
+    // ---- テクスチャ座標（UV）の配管 ----
+
+    /// 頂点 UV は重心座標で補間される（三角形の各頂点で厳密に頂点 UV になる）。
+    #[test]
+    fn vertex_uv_is_interpolated_by_barycentric_coordinates() {
+        // z=0 平面の直角三角形。v0=(0,0) v1=(1,0) v2=(0,1) に UV [0,0] [1,0] [0,1] を割り当てる
+        let tris = vec![Triangle::new_static(
+            Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+        let mesh = Mesh::build(
+            tris, Vec::new(), Vec::new(),
+            vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![[0, 1, 2]],
+        );
+        assert!(mesh.has_uv());
+        // この割り当てでは UV は (x, y) と一致するので、当てた位置から期待値が直に決まる
+        for (x, y) in [(0.05, 0.05), (0.5, 0.25), (0.25, 0.5), (0.3, 0.3), (0.8, 0.1)] {
+            let h = mesh
+                .hit(Ray { o: Vec3::new(x, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30)
+                .unwrap_or_else(|| panic!("({}, {}) に当たらない", x, y));
+            assert!((h.uv.0 - x).abs() < 1e-12 && (h.uv.1 - y).abs() < 1e-12,
+                    "uv = {:?}, 期待 ({}, {})", h.uv, x, y);
+        }
+    }
+
+    /// UV を持たないメッシュのヒットは uv = (0, 0)（テクスチャを引かない既定値）。
+    #[test]
+    fn mesh_without_uv_reports_zero_uv() {
+        let tris = vec![Triangle::new_static(
+            Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+        let mesh = Mesh::new(tris);
+        assert!(!mesh.has_uv());
+        let h = mesh.hit(Ray { o: Vec3::new(0.0, 0.0, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+        assert_eq!(h.uv, (0.0, 0.0));
+    }
+
+    /// UV 添字の配列長が三角形数と合わない壊れた入力は、UV 無しとして扱う（添字ずれで落ちない）。
+    #[test]
+    fn mismatched_uv_index_array_is_ignored() {
+        let tris = vec![
+            Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0),
+            Triangle::new_static(Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0),
+        ];
+        let mesh = Mesh::build(tris, Vec::new(), Vec::new(), vec![[0.0, 0.0]], vec![[0, 0, 0]]); // 1 個しかない
+        assert!(!mesh.has_uv());
+    }
+
+    /// UV あり／なしが混在するメッシュでも、UV なしの三角形は (0, 0) になる（`NO_UV` の分岐）。
+    #[test]
+    fn mesh_with_mixed_uv_falls_back_per_triangle() {
+        let tris = vec![
+            Triangle::new_static(Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, -0.05, 0.0), 0),
+            Triangle::new_static(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(0.0, 0.05, 0.0), Vec3::new(1.0, 1.0, 0.0), 0),
+        ];
+        let mesh = Mesh::build(
+            tris, Vec::new(), Vec::new(),
+            vec![[0.3, 0.4]], vec![[0, 0, 0], [NO_UV; 3]],
+        );
+        let shoot = |y: f64| mesh.hit(Ray { o: Vec3::new(0.0, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30);
+        let a = shoot(-0.5).expect("UV つきの三角形に当たらない");
+        assert!((a.uv.0 - 0.3).abs() < 1e-12 && (a.uv.1 - 0.4).abs() < 1e-12, "uv = {:?}", a.uv);
+        let b = shoot(0.5).expect("UV なしの三角形に当たらない");
+        assert_eq!(b.uv, (0.0, 0.0));
+    }
+
+    /// インスタンス変換は UV を変えない（UV はオブジェクト空間の属性）。
+    #[test]
+    fn instance_transform_does_not_change_uv() {
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let tris = vec![Triangle::new_static(
+            Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
+        let data = MeshData::with_uv(
+            tris, vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![[0, 1, 2]]);
+        let mut world = World::new();
+        world.add_mesh_data_instance(data, Transform::scale(Vec3::new(4.0, 0.5, 2.0)), None);
+        world.build_lights(&mats);
+        // 変換後の (x, y) = (4·u, 0.5·v) に当たるレイを撃つ
+        for (u, v) in [(0.2, 0.3), (0.5, 0.25), (0.1, 0.8)] {
+            let r = Ray { o: Vec3::new(4.0 * u, 0.5 * v, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+            let h = world.hit(r, 0.0, 1e30).unwrap_or_else(|| panic!("({}, {}) に当たらない", u, v));
+            assert!((h.uv.0 - u).abs() < 1e-12 && (h.uv.1 - v).abs() < 1e-12,
+                    "uv = {:?}, 期待 ({}, {})", h.uv, u, v);
+        }
+    }
+
+    /// 球の UV は Mitsuba の球面座標（u = φ/2π、v = θ/π、極は ±z）。
+    #[test]
+    fn sphere_uv_follows_the_mitsuba_spherical_parameterisation() {
+        let s = Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 0 };
+        let hit_from = |dir: Vec3| {
+            s.hit(Ray { o: dir * 5.0, d: -dir, time: 0.0 }, 0.0, 1e30).expect("球に当たらない")
+        };
+        // +x 方向（φ = 0, θ = π/2）
+        let h = hit_from(Vec3::new(1.0, 0.0, 0.0));
+        assert!(h.uv.0.abs() < 1e-12 && (h.uv.1 - 0.5).abs() < 1e-12, "+x: {:?}", h.uv);
+        // +y 方向（φ = π/2）
+        let h = hit_from(Vec3::new(0.0, 1.0, 0.0));
+        assert!((h.uv.0 - 0.25).abs() < 1e-12 && (h.uv.1 - 0.5).abs() < 1e-12, "+y: {:?}", h.uv);
+        // −x 方向（φ = π）
+        let h = hit_from(Vec3::new(-1.0, 0.0, 0.0));
+        assert!((h.uv.0 - 0.5).abs() < 1e-12, "−x: {:?}", h.uv);
+        // +z（北極、θ = 0）と −z（南極、θ = π）
+        let h = hit_from(Vec3::new(0.0, 0.0, 1.0));
+        assert!(h.uv.1.abs() < 1e-9, "+z 極: {:?}", h.uv);
+        let h = hit_from(Vec3::new(0.0, 0.0, -1.0));
+        assert!((h.uv.1 - 1.0).abs() < 1e-9, "−z 極: {:?}", h.uv);
+        // u は常に [0, 1]
+        let mut rng = Rng::new(5);
+        for _ in 0..200 {
+            let d = uniform_sphere_dir(&mut rng);
+            let h = hit_from(d);
+            assert!((0.0..=1.0).contains(&h.uv.0) && (0.0..=1.0).contains(&h.uv.1), "uv = {:?}", h.uv);
+        }
+    }
+
     /// **法線あり／なしが混在するメッシュ**を交差判定（描画が通る経路）で扱える。
     ///
     /// `f 1//1 2//2 3//3` と `f 1 2 3` が混ざった OBJ は実在する。ローダーは法線を持たない
@@ -2074,13 +2245,15 @@ mod tests {
         assert_eq!(h_flat.ns.z.to_bits(), h_flat.ng.z.to_bits(), "法線なしの三角形は ns == ng");
 
         // インスタンス経由（World::hit）でも同じ。変換つきでも番兵の分岐を踏む
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
         let mut world = World::new();
         world.add_mesh_data_instance(
             MeshData {
                 tris: mesh.tris.clone(),
                 vn: vec![tilted],
                 tri_vn: vec![[0, 0, 0], [NO_NORMAL; 3]],
+                uv: Vec::new(),
+                tri_uv: Vec::new(),
             },
             Transform::scale(Vec3::new(2.0, 0.5, 1.5)),
             None,

@@ -32,7 +32,9 @@ use crate::env::EnvMap;
 use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
+use crate::material::TexId;
 use crate::obj_loader::{load_obj_mesh, MeshData};
+use crate::texture::{Texture, Wrap};
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
@@ -220,7 +222,12 @@ impl SceneSettings {
 /// 一時ファイルを介さず XML 文字列を直接渡せる。`base_dir` は `obj`/環境マップの
 /// 相対パス解決に使う基準ディレクトリ。`base_config` は `<film>` 未指定時の
 /// フォールバック解像度（アスペクト比計算用）——書き換えない。
-pub fn load_scene_from_str(xml: &str, base_dir: &Path, base_config: &RenderConfig) -> io::Result<(Scene, SceneSettings)> {
+pub fn load_scene_from_str(
+    xml: &str,
+    base_dir: &Path,
+    base_config: &RenderConfig,
+    forced_resolution: (Option<usize>, Option<usize>),
+) -> io::Result<(Scene, SceneSettings)> {
     let root = parse_tree(xml)?;
     if root.tag != "scene" {
         return Err(err("root element is not <scene>"));
@@ -265,12 +272,20 @@ pub fn load_scene_from_str(xml: &str, base_dir: &Path, base_config: &RenderConfi
         }
     }
 
-    // アスペクト比は settings（film 指定）があればそれを、無ければ base_config を使う。
-    let width = settings.width.unwrap_or(base_config.width);
-    let height = settings.height.unwrap_or(base_config.height);
+    // アスペクト比は最終的な解像度から決める。CLI で解像度が明示されていればそれが最優先で、
+    // 次に settings（film 指定）、無ければ base_config。センサーはこの aspect で構築されるので、
+    // ここで最終値を使わないと CLI 指定時に画角がずれる。
+    // 片方だけの CLI 指定（`--width` のみ等）では、もう片方はシーンファイルの `<film>`、
+    // それも無ければ base_config を使う。解決した値を settings に書き戻すので、
+    // 呼び出し側は `settings.apply` だけで最終解像度を得られる（優先順位の分岐は 1 か所）。
+    let width = forced_resolution.0.or(settings.width).unwrap_or(base_config.width);
+    let height = forced_resolution.1.or(settings.height).unwrap_or(base_config.height);
+    settings.width = Some(width);
+    settings.height = Some(height);
     let aspect = width as f64 / height as f64;
     let mut world = World::new();
     let mut mats: Vec<Material> = Vec::new();
+    let mut textures: Vec<Texture> = Vec::new();
     let mut cam: Option<Camera> = None;
     let mut env: Option<EnvMap> = None;
 
@@ -283,7 +298,7 @@ pub fn load_scene_from_str(xml: &str, base_dir: &Path, base_config: &RenderConfi
                     warn(&format!("unsupported sensor type '{}', ignored", child.typ()));
                 }
             }
-            "shape" => parse_shape(child, base_dir, &mut world, &mut mats),
+            "shape" => parse_shape(child, base_dir, &mut world, &mut mats, &mut textures),
             // シーン直下の emitter は環境マップ（envmap / constant）
             "emitter" => {
                 if let Some(e) = parse_scene_emitter(child, base_dir) {
@@ -312,17 +327,22 @@ pub fn load_scene_from_str(xml: &str, base_dir: &Path, base_config: &RenderConfi
     let env = Some(env.unwrap_or_else(|| EnvMap::constant(Color::new(0.0, 0.0, 0.0))));
 
     world.build_lights(&mats);
-    Ok((Scene { cam, world, mats, env }, settings))
+    Ok((Scene { cam, world, mats, textures, env }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
 /// アダプタ）。読み取った設定値は `config` に反映する（`None` の項目は現状維持）。
 /// CLI 明示値で上書きしたい場合は呼び出し側で行う（[`crate::load_scene`] の利用側参照）。
-pub fn load_scene(path: &str, config: &mut RenderConfig) -> io::Result<Scene> {
+pub fn load_scene(
+    path: &str,
+    config: &mut RenderConfig,
+    forced_resolution: (Option<usize>, Option<usize>),
+) -> io::Result<Scene> {
     let xml = std::fs::read_to_string(path)?;
     // OBJ パスは XML ファイルのあるディレクトリからの相対で解決する。
     let base_dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
-    let (scene, settings) = load_scene_from_str(&xml, &base_dir, config)?;
+    let (scene, settings) = load_scene_from_str(&xml, &base_dir, config, forced_resolution)?;
+    // settings には CLI 指定を織り込んだ最終解像度が入っている（load_scene_from_str 参照）。
     settings.apply(config);
     Ok(scene)
 }
@@ -476,15 +496,21 @@ fn parse_lookat(el: &Element) -> Option<(Vec3, Vec3, Vec3)> {
 /// `shape` を World へ追加する。
 /// `sphere` は解析的プリミティブ、`obj` / `rectangle` / `cube` / `disk` は
 /// 三角形メッシュ + インスタンス（`to_world` 変換）として配置する。
-fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<Material>) {
+fn parse_shape(
+    el: &Element,
+    base_dir: &Path,
+    world: &mut World,
+    mats: &mut Vec<Material>,
+    textures: &mut Vec<Texture>,
+) {
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
     let mat = if let Some(em) = el.child_tag("emitter") {
         parse_emitter(em)
     } else if let Some(b) = el.child_tag("bsdf") {
-        parse_bsdf(b)
+        parse_bsdf(b, base_dir, textures)
     } else {
         warn(&format!("shape type '{}' without bsdf or emitter; defaulting to diffuse", el.typ()));
-        Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }
+        Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }
     };
     let mat_id = mats.len();
 
@@ -502,11 +528,11 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
             return;
         }
         // Mitsuba 正準形: 中心原点・法線 +Z・[-1,1]² の正方形
-        "rectangle" => MeshData::flat(unit_rectangle_tris(mat_id)),
+        "rectangle" => unit_rectangle_tris(mat_id),
         // Mitsuba 正準形: [-1,1]³ の立方体
-        "cube" => MeshData::flat(unit_cube_tris(mat_id)),
+        "cube" => unit_cube_tris(mat_id),
         // Mitsuba 正準形: z=0 平面の半径 1 の円盤
-        "disk" => MeshData::flat(unit_disk_tris(mat_id)),
+        "disk" => unit_disk_tris(mat_id),
         "obj" => {
             let filename = match el.string("filename") {
                 Some(f) => f,
@@ -540,19 +566,23 @@ fn parse_shape(el: &Element, base_dir: &Path, world: &mut World, mats: &mut Vec<
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
-fn unit_rectangle_tris(mat_id: usize) -> Vec<Triangle> {
+fn unit_rectangle_tris(mat_id: usize) -> MeshData {
     let a = Vec3::new(-1.0, -1.0, 0.0);
     let b = Vec3::new(1.0, -1.0, 0.0);
     let c = Vec3::new(1.0, 1.0, 0.0);
     let d = Vec3::new(-1.0, 1.0, 0.0);
-    vec![
+    let tris = vec![
         Triangle::new_static(a, b, c, mat_id),
         Triangle::new_static(a, c, d, mat_id),
-    ]
+    ];
+    // Mitsuba の rectangle と同じ割り当て: uv = ((x+1)/2, (y+1)/2)
+    // 頂点 a, b, c, d の順に [0,0] [1,0] [1,1] [0,1]
+    let uv = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    MeshData::with_uv(tris, uv, vec![[0, 1, 2], [0, 2, 3]])
 }
 
 /// Mitsuba `cube`: [-1,1]³ の立方体（12 三角形）。
-fn unit_cube_tris(mat_id: usize) -> Vec<Triangle> {
+fn unit_cube_tris(mat_id: usize) -> MeshData {
     let v = [
         Vec3::new(-1.0, -1.0, -1.0),
         Vec3::new(1.0, -1.0, -1.0),
@@ -572,18 +602,29 @@ fn unit_cube_tris(mat_id: usize) -> Vec<Triangle> {
         [3, 7, 4, 0],
     ];
     let mut tris = Vec::with_capacity(12);
+    let mut tri_uv = Vec::with_capacity(12);
     for q in quads {
         tris.push(Triangle::new_static(v[q[0]], v[q[1]], v[q[2]], mat_id));
         tris.push(Triangle::new_static(v[q[0]], v[q[2]], v[q[3]], mat_id));
+        // Mitsuba の cube は面ごとに [0,1]² の UV を張る。四角形の 4 頂点を
+        // [0,0] [1,0] [1,1] [0,1] の順に対応させる（quads の並びがその順）
+        tri_uv.push([0, 1, 2]);
+        tri_uv.push([0, 2, 3]);
     }
-    tris
+    let uv = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    MeshData::with_uv(tris, uv, tri_uv)
 }
 
 /// Mitsuba `disk`: z=0 平面の半径 1 の円盤（ファン三角形化）。
-fn unit_disk_tris(mat_id: usize) -> Vec<Triangle> {
+fn unit_disk_tris(mat_id: usize) -> MeshData {
     let n = 64;
     let center = Vec3::new(0.0, 0.0, 0.0);
     let mut tris = Vec::with_capacity(n);
+    let mut uv: Vec<[f64; 2]> = Vec::with_capacity(2 * n + 1);
+    let mut tri_uv = Vec::with_capacity(n);
+    // Mitsuba の disk は極座標を UV に割り当てる: u = 半径 r、v = 角度 φ/2π。
+    // 中心は r = 0 なので u = 0（v は縮退するので扇の始端の角度に合わせる）。
+    uv.push([0.0, 0.0]); // 中心（扇ごとに v を変えたいので下で差し替える）
     for i in 0..n {
         let a0 = std::f64::consts::TAU * (i as f64) / (n as f64);
         let a1 = std::f64::consts::TAU * ((i + 1) as f64) / (n as f64);
@@ -593,8 +634,15 @@ fn unit_disk_tris(mat_id: usize) -> Vec<Triangle> {
             Vec3::new(a1.cos(), a1.sin(), 0.0),
             mat_id,
         ));
+        let c = uv.len() as u32;
+        uv.push([0.0, (i as f64) / (n as f64)]); // この扇の中心（u=0）
+        let e0 = uv.len() as u32;
+        uv.push([1.0, (i as f64) / (n as f64)]);
+        let e1 = uv.len() as u32;
+        uv.push([1.0, ((i + 1) as f64) / (n as f64)]);
+        tri_uv.push([c, e0, e1]);
     }
-    tris
+    MeshData::with_uv(tris, uv, tri_uv)
 }
 
 /// ファイル名を XML のあるディレクトリ基準で解決する（絶対パスはそのまま）。
@@ -683,17 +731,68 @@ fn parse_emitter(el: &Element) -> Material {
     Material::DiffuseLight { emit }
 }
 
+/// `<texture type="bitmap">` を読み込んで `textures` に積み、その添字を返す。
+///
+/// 対応するのは `filename`（XML からの相対パス）と `wrap_mode`（`repeat` / `clamp`）、
+/// および Mitsuba の `raw`（true でリニア、既定の false なら sRGB デコード）。
+/// 読み込みに失敗したら警告して `None`（呼び出し側が定数色にフォールバックする）。
+fn parse_texture(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> Option<TexId> {
+    if el.typ() != "bitmap" {
+        warn(&format!("unsupported texture type '{}', ignored", el.typ()));
+        return None;
+    }
+    let filename = match el.string("filename") {
+        Some(f) => f,
+        None => {
+            warn("bitmap texture without filename; ignored");
+            return None;
+        }
+    };
+    let resolved = resolve_path(base_dir, filename);
+    let wrap = match el.string("wrap_mode") {
+        Some(w) => match Wrap::from_str(w) {
+            Some(w) => w,
+            None => {
+                warn(&format!("unsupported wrap_mode '{}' (expected repeat or clamp); using repeat", w));
+                Wrap::Repeat
+            }
+        },
+        None => Wrap::Repeat,
+    };
+    // 色テクスチャは sRGB。`raw=true` はデータテクスチャ（リニア）
+    let srgb = !el.boolean_or("raw", false);
+    match Texture::load(resolved.to_string_lossy().as_ref(), srgb, wrap) {
+        Ok(t) => {
+            textures.push(t);
+            Some((textures.len() - 1) as TexId)
+        }
+        Err(e) => {
+            warn(&format!("failed to load texture '{}': {}; ignored", resolved.display(), e));
+            None
+        }
+    }
+}
+
 /// `bsdf` をマテリアルにマップする。
-fn parse_bsdf(el: &Element) -> Material {
+fn parse_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> Material {
     match el.typ() {
         // 両面 BSDF はラッパーなので内側を展開
         "twosided" => el
             .child_tag("bsdf")
-            .map(parse_bsdf)
-            .unwrap_or(Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }),
-        "diffuse" => Material::Lambert {
-            albedo: el.color("reflectance").unwrap_or(Color::new(0.5, 0.5, 0.5)),
-        },
+            .map(|c| parse_bsdf(c, base_dir, textures))
+            .unwrap_or(Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }),
+        "diffuse" => {
+            // `reflectance` はテクスチャか定数色。テクスチャがある場合、定数色は色の倍率になる
+            // （両方あれば掛け合わせる。片方だけなら他方は白 = 1 倍）。
+            let tex = el
+                .prop("texture", "reflectance")
+                .and_then(|t| parse_texture(t, base_dir, textures));
+            let default = if tex.is_some() { Color::new(1.0, 1.0, 1.0) } else { Color::new(0.5, 0.5, 0.5) };
+            Material::Lambert {
+                albedo: el.color("reflectance").unwrap_or(default),
+                albedo_tex: tex,
+            }
+        }
         "conductor" => Material::Metal {
             albedo: el.color("specular_reflectance").unwrap_or(Color::new(1.0, 1.0, 1.0)),
         },
@@ -718,6 +817,7 @@ fn parse_bsdf(el: &Element) -> Material {
             warn(&format!("unsupported bsdf type '{}'; defaulting to diffuse", other));
             Material::Lambert {
                 albedo: el.color("reflectance").unwrap_or(Color::new(0.5, 0.5, 0.5)),
+                albedo_tex: None,
             }
         }
     }
@@ -726,6 +826,8 @@ fn parse_bsdf(el: &Element) -> Material {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ray::Ray;
+    use crate::rng::Rng;
 
     fn cfg() -> RenderConfig {
         let mut c = RenderConfig::default();
@@ -747,7 +849,7 @@ mod tests {
     }
 
     fn load(xml: &str) -> Scene {
-        load_scene_from_str(xml, Path::new("."), &cfg()).unwrap().0
+        load_scene_from_str(xml, Path::new("."), &cfg(), (None, None)).unwrap().0
     }
 
     #[test]
@@ -804,8 +906,8 @@ mod tests {
               </shape>
             </scene>"#,
         );
-        let srgb = match scene.mats[0] { Material::Lambert { albedo } => albedo, _ => panic!() };
-        let lin = match scene.mats[1] { Material::Lambert { albedo } => albedo, _ => panic!() };
+        let srgb = match scene.mats[0] { Material::Lambert { albedo, .. } => albedo, _ => panic!() };
+        let lin = match scene.mats[1] { Material::Lambert { albedo, .. } => albedo, _ => panic!() };
         // srgb 0.8 はガンマ展開で約 0.603、rgb 0.8 はそのまま 0.8
         assert!((srgb.r() - Color::from_srgb(0.8, 0.8, 0.8).r()).abs() < 1e-12);
         assert!((lin.r() - 0.8).abs() < 1e-12);
@@ -829,6 +931,7 @@ mod tests {
             </scene>"#,
             Path::new("."),
             &cfg(),
+            (None, None),
         )
         .unwrap();
         let mut config = cfg();
@@ -849,7 +952,7 @@ mod tests {
                    <shape type="sphere"><bsdf type="diffuse"/></shape></scene>"#,
                 max_depth, rr_depth
             );
-            load_scene_from_str(&xml, Path::new("."), &cfg()).unwrap().1
+            load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().1
         };
         let s = settings_for("-1", "5");
         assert_eq!(s.max_depth, Some(usize::MAX));
@@ -899,7 +1002,7 @@ mod tests {
                 </scene>"#,
                 objname, flag
             );
-            let (r, warnings) = capture_warnings(|| load_scene_from_str(&xml, &dir, &cfg()).unwrap().0);
+            let (r, warnings) = capture_warnings(|| load_scene_from_str(&xml, &dir, &cfg(), (None, None)).unwrap().0);
             (r, warnings)
         };
         for bad in [r#"<boolean name="face_normals" value="1"/>"#,
@@ -919,6 +1022,211 @@ mod tests {
             assert!(!warnings.iter().any(|w| w.contains("face_normals")), "{}: 余計な警告", good);
         }
         std::fs::remove_file(&obj).ok();
+    }
+
+    // ---- テクスチャ（T1） ----
+
+    /// テスト用の PNG を書いて渡す。
+    fn with_png<T>(w: u32, h: u32, px: &[[u8; 3]], f: impl FnOnce(&std::path::Path, &str) -> T) -> T {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let name = format!("tinypt_mtex_{}_{}.png", std::process::id(), n);
+        let path = dir.join(&name);
+        let mut img = image::RgbImage::new(w, h);
+        for (i, p) in px.iter().enumerate() {
+            img.put_pixel((i as u32) % w, (i as u32) / w, image::Rgb(*p));
+        }
+        img.save(&path).unwrap();
+        let out = f(&dir, &name);
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    /// `<texture type="bitmap">` を `diffuse` の `reflectance` に指定でき、
+    /// シーンのテクスチャ置き場に積まれてマテリアルが添字で参照する。
+    #[test]
+    fn parses_bitmap_texture_on_diffuse_reflectance() {
+        let scene = with_png(1, 1, &[[255, 0, 0]], |dir, name| {
+            let xml = format!(
+                r#"<scene version="3.0.0">
+                  <shape type="rectangle">
+                    <bsdf type="diffuse">
+                      <texture type="bitmap" name="reflectance">
+                        <string name="filename" value="{}"/>
+                      </texture>
+                    </bsdf>
+                  </shape>
+                </scene>"#,
+                name
+            );
+            load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
+        });
+        assert_eq!(scene.textures.len(), 1, "テクスチャが積まれていない");
+        match scene.mats[0] {
+            Material::Lambert { albedo, albedo_tex: Some(id) } => {
+                assert_eq!(id, 0);
+                // テクスチャがある場合、定数側は倍率なので白（1 倍）
+                assert!((albedo.r() - 1.0).abs() < 1e-12, "既定の倍率は白のはず: {}", albedo.r());
+                // 赤 255 は sRGB デコードでリニア 1.0
+                let c = scene.textures[0].sample((0.5, 0.5));
+                assert!((c.r() - 1.0).abs() < 1e-9 && c.g().abs() < 1e-12, "{:?}", (c.r(), c.g(), c.b()));
+            }
+            _ => panic!("diffuse がテクスチャ付き Lambert になっていない"),
+        }
+    }
+
+    /// テクスチャと定数色を両方書くと、定数色は**倍率**として掛かる。
+    #[test]
+    fn constant_reflectance_scales_the_texture() {
+        let scene = with_png(1, 1, &[[255, 255, 255]], |dir, name| {
+            let xml = format!(
+                r#"<scene version="3.0.0">
+                  <shape type="rectangle">
+                    <bsdf type="diffuse">
+                      <rgb name="reflectance" value="0.25, 0.5, 1.0"/>
+                      <texture type="bitmap" name="reflectance">
+                        <string name="filename" value="{}"/>
+                      </texture>
+                    </bsdf>
+                  </shape>
+                </scene>"#,
+                name
+            );
+            load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
+        });
+        let mat = scene.mats[0];
+        let resolved = mat.resolve_textures(&scene.textures, (0.5, 0.5));
+        match resolved {
+            Material::Lambert { albedo, albedo_tex: None } => {
+                assert!((albedo.r() - 0.25).abs() < 1e-9 && (albedo.b() - 1.0).abs() < 1e-9,
+                        "倍率が掛かっていない: {:?}", (albedo.r(), albedo.g(), albedo.b()));
+            }
+            _ => panic!("resolve_textures がテクスチャを畳み込んでいない"),
+        }
+    }
+
+    /// 読み込めないテクスチャは警告して定数色にフォールバックする（描画は続く）。
+    #[test]
+    fn missing_texture_warns_and_falls_back_to_a_constant() {
+        let dir = std::env::temp_dir();
+        let xml = r#"<scene version="3.0.0">
+              <shape type="rectangle">
+                <bsdf type="diffuse">
+                  <texture type="bitmap" name="reflectance">
+                    <string name="filename" value="definitely_not_here_12345.png"/>
+                  </texture>
+                </bsdf>
+              </shape>
+            </scene>"#;
+        let (scene, warnings) = capture_warnings(|| load_scene_from_str(xml, &dir, &cfg(), (None, None)).unwrap().0);
+        assert!(scene.textures.is_empty());
+        assert!(matches!(scene.mats[0], Material::Lambert { albedo_tex: None, .. }));
+        assert!(warnings.iter().any(|w| w.contains("failed to load texture")), "警告が出ていない: {:?}", warnings);
+    }
+
+    /// 未知のテクスチャ型・`wrap_mode` は警告する。
+    #[test]
+    fn unsupported_texture_type_and_wrap_mode_warn() {
+        let (_, warnings) = with_png(1, 1, &[[10, 20, 30]], |dir, name| {
+            let xml = format!(
+                r#"<scene version="3.0.0">
+                  <shape type="rectangle">
+                    <bsdf type="diffuse">
+                      <texture type="checkerboard" name="reflectance"/>
+                    </bsdf>
+                  </shape>
+                  <shape type="rectangle">
+                    <bsdf type="diffuse">
+                      <texture type="bitmap" name="reflectance">
+                        <string name="filename" value="{}"/>
+                        <string name="wrap_mode" value="mirror"/>
+                      </texture>
+                    </bsdf>
+                  </shape>
+                </scene>"#,
+                name
+            );
+            capture_warnings(|| load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0)
+        });
+        assert!(warnings.iter().any(|w| w.contains("unsupported texture type")), "{:?}", warnings);
+        assert!(warnings.iter().any(|w| w.contains("wrap_mode")), "{:?}", warnings);
+    }
+
+    /// `raw="true"` は sRGB デコードを掛けない（データテクスチャ）。
+    #[test]
+    fn raw_texture_is_linear() {
+        let scene = with_png(1, 1, &[[128, 128, 128]], |dir, name| {
+            let xml = format!(
+                r#"<scene version="3.0.0">
+                  <shape type="rectangle">
+                    <bsdf type="diffuse">
+                      <texture type="bitmap" name="reflectance">
+                        <string name="filename" value="{}"/>
+                        <boolean name="raw" value="true"/>
+                      </texture>
+                    </bsdf>
+                  </shape>
+                </scene>"#,
+                name
+            );
+            load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
+        });
+        let c = scene.textures[0].sample((0.5, 0.5));
+        assert!((c.r() - 128.0 / 255.0).abs() < 1e-12, "raw なのに sRGB デコードされている: {}", c.r());
+    }
+
+    /// パラメトリック形状には Mitsuba 準拠の UV が付く。
+    #[test]
+    fn parametric_shapes_get_uv() {
+        let scene = load(
+            r#"<scene version="3.0.0">
+              <shape type="rectangle"><bsdf type="diffuse"/></shape>
+              <shape type="cube"><bsdf type="diffuse"/></shape>
+              <shape type="disk"><bsdf type="diffuse"/></shape>
+            </scene>"#,
+        );
+        for (i, name) in ["rectangle", "cube", "disk"].iter().enumerate() {
+            assert!(scene.world.meshes()[i].has_uv(), "{} に UV が無い", name);
+        }
+        // 値の確認は形状ごとに単独のシーンで行う（3 つを重ねると手前の立方体に当たってしまう）
+        let only = |shape: &str| {
+            load(&format!(r#"<scene version="3.0.0"><shape type="{}"><bsdf type="diffuse"/></shape></scene>"#, shape))
+        };
+        let shoot = |sc: &crate::scene::Scene, x: f64, y: f64| {
+            sc.world
+                .hit(Ray { o: Vec3::new(x, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30)
+                .expect("当たらない")
+                .uv
+        };
+
+        // rectangle: uv = ((x+1)/2, (y+1)/2)
+        let rect = only("rectangle");
+        let uv = shoot(&rect, 0.0, 0.0);
+        assert!((uv.0 - 0.5).abs() < 1e-12 && (uv.1 - 0.5).abs() < 1e-12, "rectangle 中心: {:?}", uv);
+        let uv = shoot(&rect, 0.5, -0.5);
+        assert!((uv.0 - 0.75).abs() < 1e-12 && (uv.1 - 0.25).abs() < 1e-12, "rectangle (0.5,-0.5): {:?}", uv);
+
+        // cube: 面ごとに [0,1]²。+z 面の中心は (0.5, 0.5)
+        let cube = only("cube");
+        let uv = shoot(&cube, 0.0, 0.0);
+        assert!((uv.0 - 0.5).abs() < 1e-12 && (uv.1 - 0.5).abs() < 1e-12, "cube +z 面の中心: {:?}", uv);
+        let mut rng = Rng::new(3);
+        for _ in 0..200 {
+            let (x, y) = (rng.next_f64() * 1.8 - 0.9, rng.next_f64() * 1.8 - 0.9);
+            let uv = shoot(&cube, x, y);
+            assert!((0.0..=1.0).contains(&uv.0) && (0.0..=1.0).contains(&uv.1), "cube の UV が範囲外: {:?}", uv);
+        }
+
+        // disk: u = 半径 r、v = 角度 φ/2π
+        let disk = only("disk");
+        let uv = shoot(&disk, 0.0, 0.0);
+        assert!(uv.0.abs() < 1e-9, "disk の中心は u = 0（r = 0）: {:?}", uv);
+        for r in [0.25, 0.5, 0.9] {
+            let uv = shoot(&disk, r, 0.0);
+            assert!((uv.0 - r).abs() < 0.02, "disk の u は半径: r = {}, uv = {:?}", r, uv);
+        }
     }
 
     /// OBJ の頂点法線は既定で使われ、`<boolean name="face_normals" value="true"/>` で捨てられる。
@@ -943,7 +1251,7 @@ mod tests {
                 </scene>"#,
                 objname, flag, flag
             );
-            load_scene_from_str(&xml, &dir, &cfg()).unwrap().0
+            load_scene_from_str(&xml, &dir, &cfg(), (None, None)).unwrap().0
         };
         let smooth = scene_of("");
         let flat = scene_of(r#"<boolean name="face_normals" value="true"/>"#);
@@ -979,7 +1287,7 @@ mod tests {
             </scene>"#,
             objname
         );
-        let scene = load_scene_from_str(&xml, &dir, &cfg()).unwrap().0;
+        let scene = load_scene_from_str(&xml, &dir, &cfg(), (None, None)).unwrap().0;
         std::fs::remove_file(&obj).ok();
 
         assert_eq!(scene.world.meshes().len(), 1);

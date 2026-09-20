@@ -8,7 +8,7 @@ pub const RAY_T_MAX: f64 = 1e30;
 /// 同じシーン・設定でも蓄積バッファの中身が変わる変更（積分器・BSDF・サンプリング・
 /// 乱数列など）を入れたら 1 つ上げる。チェックポイントのシーンハッシュに混ぜ、
 /// 挙動の異なるビルドが書いたチェックポイントから再開しないようにする。
-pub const RENDER_REVISION: u32 = 11;
+pub const RENDER_REVISION: u32 = 12;
 
 /// パストレーシングの定数。
 pub mod path {

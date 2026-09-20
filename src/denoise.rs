@@ -26,14 +26,32 @@ pub fn denoise_oidn(pixels: &[Color], w: usize, h: usize) -> Vec<Color> {
         buffer.push(c.b() as f32);
     }
 
-    // Create OIDN device and filter (filter_in_place modifies buffer directly)
-    let device = Device::new();
-    RayTracing::new(&device)
+    // OIDN 2.5 以降、デバイス生成とフィルタ生成は Result を返す。
+    // デノイズは後処理なので、失敗してもレンダー結果を捨てずに警告してそのまま返す。
+    let device = match Device::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Warning: OIDN device unavailable ({:?}); skipping denoise", e);
+            return pixels.to_vec();
+        }
+    };
+    let filter = match RayTracing::try_new(&device) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Warning: OIDN filter unavailable ({:?}); skipping denoise", e);
+            return pixels.to_vec();
+        }
+    };
+    let mut filter = filter;
+    if let Err(e) = filter
         .srgb(false)
         .hdr(true)
         .image_dimensions(w, h)
         .filter_in_place(&mut buffer)
-        .expect("OIDN denoising failed");
+    {
+        eprintln!("Warning: OIDN denoise failed ({:?}); returning the raw render", e);
+        return pixels.to_vec();
+    }
 
     // Convert back to Color
     let mut result = Vec::with_capacity(w * h);

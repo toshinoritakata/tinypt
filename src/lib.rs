@@ -7,6 +7,7 @@
 //! - **integrator**: MIS（Multiple Importance Sampling）付きパストレーサー + NEE（Next Event Estimation）
 //! - **world / scene / transform**: シーングラフ、インスタンシング、ライトサンプリング
 //! - **render / task**: タイルベース・マルチスレッド・レンダリングエンジン
+//! - **texture**: ビットマップテクスチャ（UV バイリニアサンプリング）
 //! - **output / hdr / exr / aces**: PPM / HDR / EXR 出力、ACES カラースペース変換
 //! - **denoise**: Intel OIDN によるモンテカルロノイズ除去
 //! - **checkpoint / config / rng / constants**: チェックポイント永続化、設定、乱数生成
@@ -34,6 +35,7 @@ pub mod denoise;     // Intel OIDN デノイザー
 pub mod hdr;         // Radiance HDR (.hdr) 読み書き
 pub mod exr;         // OpenEXR (.exr) 読み書き
 pub mod env;         // 環境マップの読み込みと重点的サンプリング
+pub mod texture;     // ビットマップテクスチャ（UV サンプリング）
 
 pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash};
 pub use config::{RenderConfig, Tonemap};

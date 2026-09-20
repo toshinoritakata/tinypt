@@ -1,5 +1,4 @@
 //! レンダリング設定とデフォルト値。
-
 #[derive(Clone, Debug)]
 /// レンダリングの各種パラメータ。
 pub struct RenderConfig {

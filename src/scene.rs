@@ -6,6 +6,7 @@ use crate::config::RenderConfig;
 use crate::env::EnvMap;
 use crate::geometry::Sphere;
 use crate::material::Material;
+use crate::texture::Texture;
 use crate::math::{Color, Vec3};
 use crate::ray::Camera;
 use crate::world::World;
@@ -18,6 +19,9 @@ pub struct Scene {
     pub world: World,
     /// マテリアルリスト（インデックスで参照）
     pub mats: Vec<Material>,
+    /// テクスチャ置き場（`Material` が `TexId` で参照する）。
+    /// マテリアルを `Copy` のまま保つため、本体はここに集約して添字で引く。
+    pub textures: Vec<Texture>,
     /// 環境マップ（None でデフォルトの空色を使用）
     pub env: Option<EnvMap>,
 }
@@ -43,12 +47,14 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
     // 地面（大球）
     let id_ground = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.5, 0.5, 0.5),
+        albedo_tex: None,
     });
     world.add_sphere(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: id_ground });
 
     // Lambert（左端）
     let id_lambert = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.8, 0.3, 0.3),
+        albedo_tex: None,
     });
     world.add_sphere(Sphere { c: Vec3::new(-1.8, 0.5, 0.0), r: 0.5, mat_id: id_lambert });
 
@@ -91,7 +97,7 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
         None => None,
     };
 
-    Scene { cam, world, mats, env }
+    Scene { cam, world, mats, textures: Vec::new(), env }
 }
 
 fn push(mats: &mut Vec<Material>, m: Material) -> usize {

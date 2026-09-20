@@ -1,12 +1,13 @@
-//! 最小限の Wavefront OBJ ローダー（三角形化 + 頂点法線 + モーションブラー対応）。
+//! 最小限の Wavefront OBJ ローダー（三角形化 + 頂点法線 + テクスチャ座標 + モーションブラー対応）。
 //!
-//! `v`（頂点）、`vn`（頂点法線）、`f`（フェース）を解析し、テクスチャ座標は無視する。
+//! `v`（頂点）、`vn`（頂点法線）、`vt`（テクスチャ座標）、`f`（フェース）を解析する。
 //! N 角形フェースはファン三角形化で分割される。
 //! モーションブラー用に 2 つの OBJ ファイル（シャッター開/閉）を読み込む機能もある。
 //!
-//! 頂点法線は三角形とは別の配列で持つ（[`MeshData`]）。三角形 1 個あたり法線 3 本を
+//! 頂点法線と UV は三角形とは別の配列で持つ（[`MeshData`]）。三角形 1 個あたり法線 3 本を
 //! 直に持たせると 72 バイト増えるが、OBJ の `vn` を共有して添字（u32×3）で参照すれば
-//! 12 バイトで済む（Rungholt 670 万三角形で 483MB → 80MB）。
+//! 12 バイトで済む（Rungholt 670 万三角形で 483MB → 80MB）。UV も同じ設計
+//! （`vt` を共有 + 三角形ごとに u32×3 = 12 B/三角形。UV の無いメッシュは増加ゼロ）。
 
 use crate::math::Vec3;
 use crate::geometry::Triangle;
@@ -14,7 +15,10 @@ use crate::geometry::Triangle;
 /// 頂点法線を持たない三角形を表す番兵（`MeshData::tri_vn` の要素）。
 pub const NO_NORMAL: u32 = u32::MAX;
 
-/// OBJ から読み込んだメッシュ。三角形と、（あれば）頂点法線。
+/// UV を持たない三角形を表す番兵（`MeshData::tri_uv` の要素）。
+pub const NO_UV: u32 = u32::MAX;
+
+/// OBJ から読み込んだメッシュ。三角形と、（あれば）頂点法線・UV。
 pub struct MeshData {
     /// 三角形リスト
     pub tris: Vec<Triangle>,
@@ -23,15 +27,31 @@ pub struct MeshData {
     /// 三角形ごとの `vn` の添字（v0, v1, v2 の順）。3 つとも [`NO_NORMAL`] なら面法線を使う。
     /// `vn` が空のときはこの配列も空（= メッシュ全体が面法線）
     pub tri_vn: Vec<[u32; 3]>,
+    /// OBJ の `vt`（(u, v)。第 3 成分 w は無視）。UV が無いファイルでは空
+    pub uv: Vec<[f64; 2]>,
+    /// 三角形ごとの `vt` の添字。3 つとも [`NO_UV`] なら UV 無し（テクスチャは (0,0) を引く）。
+    /// `uv` が空のときはこの配列も空
+    pub tri_uv: Vec<[u32; 3]>,
 }
 
 impl MeshData {
-    /// 頂点法線を持たない（面法線だけの）メッシュ。
+    /// 頂点法線も UV も持たないメッシュ。
     pub fn flat(tris: Vec<Triangle>) -> Self {
-        Self { tris, vn: Vec::new(), tri_vn: Vec::new() }
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new() }
+    }
+
+    /// UV だけを持つメッシュ（パラメトリック形状用）。
+    pub fn with_uv(tris: Vec<Triangle>, uv: Vec<[f64; 2]>, tri_uv: Vec<[u32; 3]>) -> Self {
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv, tri_uv }
+    }
+
+    /// 1 つでも UV を持つ三角形があるか。
+    pub fn has_uv(&self) -> bool {
+        !self.uv.is_empty() && !self.tri_uv.is_empty()
     }
 
     /// 頂点法線を捨てて面法線だけにする（シーンファイルの `face_normals=true`）。
+    /// UV は陰影の付け方とは無関係なので**残す**（テクスチャは引き続き効く）。
     pub fn into_flat(mut self) -> Self {
         self.vn.clear();
         self.tri_vn.clear();
@@ -58,31 +78,46 @@ fn parse_obj_index(i: i32, len: usize) -> Option<usize> {
     }
 }
 
-/// `f` の 1 トークン（`v`, `v/vt`, `v//vn`, `v/vt/vn`）から頂点・法線の添字を取り出す。
+/// `f` の 1 トークン（`v`, `v/vt`, `v//vn`, `v/vt/vn`）から頂点・UV・法線の添字を取り出す。
 /// 添字は「そのトークンを読んだ時点の配列長」を基準に解決する（負の相対添字の意味）。
-fn parse_face_token(tok: &str, nv: usize, nn: usize) -> (Option<usize>, Option<usize>) {
+fn parse_face_token(tok: &str, nv: usize, nt: usize, nn: usize) -> (Option<usize>, Option<usize>, Option<usize>) {
     let mut it = tok.split('/');
     let v = it
         .next()
         .and_then(|s| s.parse::<i32>().ok())
         .and_then(|i| parse_obj_index(i, nv));
-    let _vt = it.next();
+    let t = it
+        .next()
+        .and_then(|s| s.parse::<i32>().ok())
+        .and_then(|i| parse_obj_index(i, nt));
     let n = it
         .next()
         .and_then(|s| s.parse::<i32>().ok())
         .and_then(|i| parse_obj_index(i, nn));
-    (v, n)
+    (v, t, n)
 }
 
-/// OBJ ファイルから頂点座標・頂点法線・三角形（頂点添字と法線添字）を解析する。
-fn parse_obj(path: &str) -> std::io::Result<(Vec<Vec3>, Vec<Vec3>, Vec<[usize; 3]>, Vec<[u32; 3]>)> {
+/// `parse_obj` の生の結果（添字はまだ番兵の整理をしていない）。
+struct ParsedObj {
+    positions: Vec<Vec3>,
+    normals: Vec<Vec3>,
+    uvs: Vec<[f64; 2]>,
+    tris: Vec<[usize; 3]>,
+    tri_vn: Vec<[u32; 3]>,
+    tri_uv: Vec<[u32; 3]>,
+}
+
+/// OBJ ファイルから頂点座標・頂点法線・UV・三角形（各添字）を解析する。
+fn parse_obj(path: &str) -> std::io::Result<ParsedObj> {
     let text = std::fs::read_to_string(path)?;
     let mut positions: Vec<Vec3> = Vec::new();
     let mut normals: Vec<Vec3> = Vec::new();
+    let mut uvs: Vec<[f64; 2]> = Vec::new();
     let mut tris: Vec<[usize; 3]> = Vec::new();
     let mut tri_vn: Vec<[u32; 3]> = Vec::new();
+    let mut tri_uv: Vec<[u32; 3]> = Vec::new();
     // フェースごとの一時バッファはループの外で使い回す（数百万フェースで確保が効いてくる）
-    let mut face: Vec<(usize, u32)> = Vec::new();
+    let mut face: Vec<(usize, u32, u32)> = Vec::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -94,6 +129,12 @@ fn parse_obj(path: &str) -> std::io::Result<(Vec<Vec3>, Vec<Vec3>, Vec<[usize; 3
             let y: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
             let z: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
             positions.push(Vec3::new(x, y, z));
+        } else if let Some(rest) = line.strip_prefix("vt ") {
+            let mut it = rest.split_whitespace();
+            let u: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+            let v: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+            // 第 3 成分 w は使わない（Wavefront の仕様上あってもよい）
+            uvs.push([u, v]);
         } else if let Some(rest) = line.strip_prefix("vn ") {
             let mut it = rest.split_whitespace();
             let x: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
@@ -107,25 +148,30 @@ fn parse_obj(path: &str) -> std::io::Result<(Vec<Vec3>, Vec<Vec3>, Vec<[usize; 3
         } else if let Some(rest) = line.strip_prefix("f ") {
             face.clear();
             for tok in rest.split_whitespace() {
-                let (v, n) = parse_face_token(tok, positions.len(), normals.len());
+                let (v, t, n) = parse_face_token(tok, positions.len(), uvs.len(), normals.len());
                 if let Some(vi) = v {
-                    face.push((vi, n.map(|i| i as u32).unwrap_or(NO_NORMAL)));
+                    face.push((
+                        vi,
+                        t.map(|i| i as u32).unwrap_or(NO_UV),
+                        n.map(|i| i as u32).unwrap_or(NO_NORMAL),
+                    ));
                 }
             }
             if face.len() >= 3 {
-                // ファン三角形化。法線の添字も同じ並びで割り当てる
-                let (i0, n0) = face[0];
+                // ファン三角形化。法線と UV の添字も同じ並びで割り当てる
+                let (i0, t0, n0) = face[0];
                 for k in 1..(face.len() - 1) {
-                    let (i1, n1) = face[k];
-                    let (i2, n2) = face[k + 1];
+                    let (i1, t1, n1) = face[k];
+                    let (i2, t2, n2) = face[k + 1];
                     tris.push([i0, i1, i2]);
                     tri_vn.push([n0, n1, n2]);
+                    tri_uv.push([t0, t1, t2]);
                 }
             }
         }
     }
 
-    Ok((positions, normals, tris, tri_vn))
+    Ok(ParsedObj { positions, normals, uvs, tris, tri_vn, tri_uv })
 }
 
 /// 三角形ごとの法線添字を**その場で**整理する。3 つ揃っていない三角形は面法線扱い
@@ -157,12 +203,39 @@ fn normalize_tri_vn(normals: &mut Vec<Vec3>, tri_vn: &mut Vec<[u32; 3]>) {
     }
 }
 
+/// 三角形ごとの UV 添字を**その場で**整理する。3 つ揃っていない三角形は UV 無し
+/// （`NO_UV` 3 つ）にし、1 つも残らなければ両方の配列を空にする（メッシュ全体が UV 無し）。
+/// 法線側（[`normalize_tri_vn`]）と同じ方針。
+fn normalize_tri_uv(uvs: &mut Vec<[f64; 2]>, tri_uv: &mut Vec<[u32; 3]>) {
+    if uvs.is_empty() {
+        tri_uv.clear();
+        tri_uv.shrink_to_fit();
+        return;
+    }
+    let mut any = false;
+    for t in tri_uv.iter_mut() {
+        if t.iter().all(|&i| i != NO_UV) {
+            any = true;
+        } else {
+            *t = [NO_UV; 3];
+        }
+    }
+    if !any {
+        uvs.clear();
+        uvs.shrink_to_fit();
+        tri_uv.clear();
+        tri_uv.shrink_to_fit();
+    }
+}
+
 /// 2 つの OBJ ファイルをモーションブラー付き三角形メッシュとして読み込む。
 /// 両ファイルは同一トポロジ（頂点数・面数・インデックス）である必要がある。
 /// 頂点法線はシャッター開（`path0`）のものを使う（時間で回転する法線は未対応）。
 pub fn load_obj_mesh_mb(path0: &str, path1: &str, mat_id: usize) -> std::io::Result<MeshData> {
-    let (p0, n0, t0, vn0) = parse_obj(path0)?;
-    let (p1, _n1, t1, _vn1) = parse_obj(path1)?;
+    let a = parse_obj(path0)?;
+    let b = parse_obj(path1)?;
+    let (p0, n0, t0, vn0, uv0, tuv0) = (a.positions, a.normals, a.tris, a.tri_vn, a.uvs, a.tri_uv);
+    let (p1, t1) = (b.positions, b.tris);
 
     if p0.len() != p1.len() || t0.len() != t1.len() {
         return Err(std::io::Error::new(
@@ -196,20 +269,25 @@ pub fn load_obj_mesh_mb(path0: &str, path1: &str, mat_id: usize) -> std::io::Res
     }
     let (mut vn, mut tri_vn) = (n0, vn0);
     normalize_tri_vn(&mut vn, &mut tri_vn);
-    Ok(MeshData { tris, vn, tri_vn })
+    let (mut uv, mut tri_uv) = (uv0, tuv0);
+    normalize_tri_uv(&mut uv, &mut tri_uv);
+    Ok(MeshData { tris, vn, tri_vn, uv, tri_uv })
 }
 
 /// 単一の OBJ ファイルを静的三角形メッシュとして読み込む。
 /// シャッター開 = シャッター閉に同一頂点を設定（モーションブラーなし）。
 pub fn load_obj_mesh(path: &str, mat_id: usize) -> std::io::Result<MeshData> {
-    let (p0, n0, t0, vn0) = parse_obj(path)?;
-    let mut tris: Vec<Triangle> = Vec::with_capacity(t0.len());
-    for [i0, i1, i2] in t0 {
+    let parsed = parse_obj(path)?;
+    let p0 = parsed.positions;
+    let mut tris: Vec<Triangle> = Vec::with_capacity(parsed.tris.len());
+    for [i0, i1, i2] in parsed.tris {
         tris.push(Triangle::new_static(p0[i0], p0[i1], p0[i2], mat_id));
     }
-    let (mut vn, mut tri_vn) = (n0, vn0);
+    let (mut vn, mut tri_vn) = (parsed.normals, parsed.tri_vn);
     normalize_tri_vn(&mut vn, &mut tri_vn);
-    Ok(MeshData { tris, vn, tri_vn })
+    let (mut uv, mut tri_uv) = (parsed.uvs, parsed.tri_uv);
+    normalize_tri_uv(&mut uv, &mut tri_uv);
+    Ok(MeshData { tris, vn, tri_vn, uv, tri_uv })
 }
 
 /// 単一の OBJ を三角形リストだけ読み込む（頂点法線は捨てる）。
@@ -318,6 +396,95 @@ mod tests {
         let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 7\nvn 0 0 7\nvn 0 0 7\nf 1//1 2//2 3//3\n";
         let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
         assert!((m.vn[0].len() - 1.0).abs() < 1e-12);
+    }
+
+    /// `f v/vt` 形式（法線なし）の UV 添字を読む。
+    #[test]
+    fn parses_texture_coordinate_indices() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert!(m.has_uv());
+        assert!(!m.has_normals());
+        assert_eq!(m.tri_uv[0], [0, 1, 2]);
+        assert_eq!(m.uv.len(), 3);
+        assert_eq!(m.uv[1], [1.0, 0.0]);
+    }
+
+    /// `f v/vt/vn` では UV と法線の両方を読む。
+    #[test]
+    fn parses_uv_and_normal_indices_together() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0.25 0.5\nvn 0 0 1\nf 1/1/1 2/1/1 3/1/1\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert!(m.has_uv() && m.has_normals());
+        assert_eq!(m.tri_uv[0], [0, 0, 0]);
+        assert_eq!(m.tri_vn[0], [0, 0, 0]);
+        assert_eq!(m.uv[0], [0.25, 0.5]);
+    }
+
+    /// `v//vn`（UV を飛ばす記法）では UV を持たない。
+    #[test]
+    fn double_slash_means_no_uv() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvn 0 0 1\nf 1//1 2//1 3//1\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert!(!m.has_uv(), "v//vn は UV 添字を持たない");
+        assert!(m.has_normals());
+    }
+
+    /// UV の負の相対添字も解決する。
+    #[test]
+    fn parses_negative_uv_indices() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/-3 2/-2 3/-1\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert_eq!(m.tri_uv[0], [0, 1, 2]);
+    }
+
+    /// `vt` の第 3 成分 w は無視する。
+    #[test]
+    fn ignores_the_third_uv_component() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0.3 0.7 0.9\nf 1/1 2/1 3/1\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert_eq!(m.uv[0], [0.3, 0.7]);
+    }
+
+    /// UV が無いファイルでは配列が空（メモリ増加ゼロ）。
+    #[test]
+    fn file_without_uv_has_no_uv_arrays() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert!(!m.has_uv());
+        assert!(m.uv.is_empty() && m.tri_uv.is_empty());
+    }
+
+    /// 一部のフェースだけ UV を持つ場合、持たないフェースは `NO_UV` に落ちる。
+    #[test]
+    fn faces_without_uv_fall_back_to_no_uv() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nvt 0 0\n\
+                   f 1/1 2/1 3/1\nf 2 4 3\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert!(m.has_uv());
+        assert_eq!(m.tri_uv[0], [0, 0, 0]);
+        assert_eq!(m.tri_uv[1], [NO_UV; 3]);
+    }
+
+    /// 四角形のファン三角形化で UV 添字も同じ並びに割り当てられる。
+    #[test]
+    fn fan_triangulation_assigns_matching_uv_indices() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n\
+                   vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+                   f 1/1 2/2 3/3 4/4\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap());
+        assert_eq!(m.tris.len(), 2);
+        assert_eq!(m.tri_uv[0], [0, 1, 2]);
+        assert_eq!(m.tri_uv[1], [0, 2, 3]);
+    }
+
+    /// `into_flat`（face_normals=true）は法線だけを捨てて **UV は残す**。
+    #[test]
+    fn into_flat_keeps_uv() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvn 0 0 1\nf 1/1/1 2/1/1 3/1/1\n";
+        let m = with_obj(obj, |p| load_obj_mesh(p, 0).unwrap()).into_flat();
+        assert!(!m.has_normals(), "法線は捨てる");
+        assert!(m.has_uv(), "UV は陰影と無関係なので残す");
     }
 
     /// モーションブラー版もシャッター開の頂点法線を保持する。

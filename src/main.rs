@@ -10,8 +10,61 @@ use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, remove_stale_t
 struct CliOverrides {
     /// `--spp` が指定された場合のサンプル数
     spp: Option<usize>,
+    /// `--width` / `--res` が指定された場合の幅
+    width: Option<usize>,
+    /// `--height` / `--res` が指定された場合の高さ
+    height: Option<usize>,
     /// `-h` / `--help` が指定された（使い方を表示してレンダーせずに終了する）
     help: bool,
+}
+
+impl CliOverrides {
+    /// CLI で解像度が明示されたなら、シーンファイルの `<film>` より優先する最終解像度。
+    /// 片方だけの指定でも、もう片方は `config`（= 既定値かシーンファイルの値）を使えるよう
+    /// 呼び出し側が埋める。
+    fn resolution(&self) -> (Option<usize>, Option<usize>) {
+        (self.width, self.height)
+    }
+}
+
+/// 解像度の 1 辺の上限。これを超える値は打ち間違い（`--width 19201080` など）とみなして警告し無視する。
+/// 実在のフィルムサイズを十分に超える値を選んである。
+const MAX_DIMENSION: usize = 65536;
+
+/// この画素数を超えたら「重い」と警告する（拒否はしない。RAM があるなら通す）。
+/// 画素あたり約 60 B（蓄積 Color 24 B + 重み 8 B + 解決後の Color 24 B + 8bit 出力 3 B）。
+const LARGE_PIXEL_COUNT: usize = 64 << 20; // 64M 画素 ≒ 3.8 GB
+
+/// `--width` / `--height` の値を検証する。0・上限超えは警告して `None`（無視）。
+fn valid_dimension(n: usize, flag: &str, warnings: &mut Vec<String>) -> Option<usize> {
+    if n == 0 {
+        warnings.push(format!("{} 0 is not valid; ignored", flag));
+        None
+    } else if n > MAX_DIMENSION {
+        warnings.push(format!("{} {} exceeds the maximum of {}; ignored", flag, n, MAX_DIMENSION));
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// `--res WxH`（`1920x1080`）を解析する。`x` は小文字・大文字のどちらでもよい。
+fn parse_resolution(v: &str, warnings: &mut Vec<String>) -> Option<(usize, usize)> {
+    let mut it = v.split(['x', 'X']);
+    let (a, b, rest) = (it.next(), it.next(), it.next());
+    let bad = |warnings: &mut Vec<String>| {
+        warnings.push(format!("invalid value '{}' for --res (expected WxH, e.g. 1920x1080); ignored", v));
+        None
+    };
+    let (Some(a), Some(b), None) = (a, b, rest) else { return bad(warnings) };
+    let (Ok(w), Ok(h)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
+        return bad(warnings);
+    };
+    // 幅・高さのどちらかが不正なら --res 全体を無視する（片側だけ効くと分かりにくいため）
+    let (Some(w), Some(h)) = (valid_dimension(w, "--res width", warnings), valid_dimension(h, "--res height", warnings)) else {
+        return None;
+    };
+    Some((w, h))
 }
 
 /// `-h` / `--help` で表示する使い方。
@@ -20,6 +73,8 @@ Usage: tinypt [OPTIONS]
 
 Scene / output:
   --scene PATH               Mitsuba XML scene file (default: built-in scene, 1920x1080)
+  --width N / --height N     Image size in pixels, 1..=65536 (overrides the scene file's <film>)
+  --res WxH                  Both at once, e.g. --res 1920x1080 (same precedence; last flag wins)
   -o, --out PATH             Output file; format from extension: .ppm .hdr .exr (default: out.ppm)
   --env PATH                 HDR/EXR environment map (built-in scene only)
   --no-env                   Cancel an earlier --env
@@ -101,6 +156,32 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
                     }
                     config.spp = n.max(1);
                     overrides.spp = Some(n.max(1));
+                }
+            }
+            "--width" => {
+                if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
+                    if let Some(n) = valid_dimension(n, &arg, w) {
+                        config.width = n;
+                        overrides.width = Some(n);
+                    }
+                }
+            }
+            "--height" => {
+                if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
+                    if let Some(n) = valid_dimension(n, &arg, w) {
+                        config.height = n;
+                        overrides.height = Some(n);
+                    }
+                }
+            }
+            "--res" => {
+                if let Some(v) = next_value(&mut args, &arg, w) {
+                    if let Some((rw, rh)) = parse_resolution(&v, w) {
+                        config.width = rw;
+                        config.height = rh;
+                        overrides.width = Some(rw);
+                        overrides.height = Some(rh);
+                    }
                 }
             }
             "--out" | "-o" => {
@@ -216,14 +297,28 @@ fn main() -> std::io::Result<()> {
 
     // 2. シーン構築（カメラ・ジオメトリ・マテリアル・環境マップ）
     //    --scene 指定時は Mitsuba XML サブセットから解像度・spp・integrator 設定も読み込む。
+    //    CLI の解像度はローダーに渡す: センサーのアスペクト比が解像度から決まるので、
+    //    読み込んだ後に width/height だけ差し替えると画角がずれる。
+    let forced_resolution = overrides.resolution();
     let scene = if let Some(path) = config.scene_path.clone() {
-        load_scene(&path, &mut config)?
+        load_scene(&path, &mut config, forced_resolution)?
     } else {
+        // 組み込みシーンには `<film>` が無いので、parse_args が設定した config の解像度がそのまま最終値。
         build_default_scene(&config)
     };
     // シーンファイルの設定より CLI 明示値を優先する（唯一の優先順位解決ポイント）。
+    // 解像度は load_scene の中で同じ規則で解決済み（組み込みシーンは上書き不要）。
     if let Some(spp) = overrides.spp {
         config.spp = spp;
+    }
+    if config.width.saturating_mul(config.height) > LARGE_PIXEL_COUNT {
+        eprintln!(
+            "Warning: {}x{} is {:.1}M pixels; the accumulation buffers alone need about {:.1} GB",
+            config.width,
+            config.height,
+            (config.width * config.height) as f64 / (1 << 20) as f64,
+            (config.width * config.height) as f64 * 60.0 / (1u64 << 30) as f64,
+        );
     }
     // チェックポイントのキーは最終 config（シーン設定 + CLI 上書き後）から導出する。
     // 無効時はファイルに触れないので、参照ファイルの再読込コストも払わない。

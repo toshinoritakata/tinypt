@@ -37,8 +37,11 @@ pub struct Hit {
     /// 幾何法線方向にずらす（シーンの大きさや絶対位置に依存しない自己交差回避）。
     pub p_error: Vec3,
     /// 三角形の重心座標 (b1, b2)（v1, v2 の重み。v0 の重みは 1 − b1 − b2）。
-    /// メッシュが頂点法線を持つときの補間に使う。球のヒットでは (0, 0)。
+    /// メッシュが頂点法線・UV を持つときの補間に使う。球のヒットでは (0, 0)。
     pub bary: (f64, f64),
+    /// テクスチャ座標。メッシュは頂点 UV の重心座標補間、パラメトリック形状は
+    /// それぞれの定義（[`Sphere::uv_at`] など）で与える。UV を持たない場合は (0, 0)。
+    pub uv: (f64, f64),
 }
 
 impl Hit {
@@ -225,6 +228,19 @@ impl Aabb {
 }
 
 impl Sphere {
+    /// 球面上の点（中心からの単位ベクトル）に対するテクスチャ座標。
+    ///
+    /// Mitsuba の `sphere` と同じ球面座標の割り当て: `u = φ/2π`（`φ = atan2(y, x)` を [0, 2π) に）、
+    /// `v = θ/π`（`θ = acos(z)`）。**極は +z / −z** で、tinypt の球は `center` と `radius` だけを持ち
+    /// オブジェクト空間の回転を持たないので、Mitsuba の `to_world` が恒等なときと同じ向きになる。
+    /// y-up のシーンでは継ぎ目が z 軸まわりに来る点に注意（回転を与える手段が無いのは T1 の制約）。
+    pub fn uv_at(n: Vec3) -> (f64, f64) {
+        let phi = n.y.atan2(n.x);
+        let phi = if phi < 0.0 { phi + 2.0 * std::f64::consts::PI } else { phi };
+        let theta = n.z.clamp(-1.0, 1.0).acos();
+        (phi / (2.0 * std::f64::consts::PI), theta / std::f64::consts::PI)
+    }
+
     /// レイと球の交差判定（二次方程式の解法、誤差上界付き）。
     ///
     /// |P − C|² = r² にレイ P(t) = O + tD を代入した at² + 2bt + c = 0 を、桁落ちしない形
@@ -289,7 +305,7 @@ impl Sphere {
         let p_error = p_obj.abs() * gamma(5) + (self.c.abs() + p_obj.abs()) * gamma(2);
         let n = p_obj / self.r;
         // 解析的な球なので幾何法線とシェーディング法線は同一（補間する頂点法線を持たない）
-        Some(Hit { t, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (0.0, 0.0) })
+        Some(Hit { t, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (0.0, 0.0), uv: Self::uv_at(n) })
     }
 }
 
@@ -425,6 +441,7 @@ impl Triangle {
         let p_error = ((v0 * b0).abs() + (v1 * u).abs() + (v2 * v).abs()) * gamma(9);
         let n = e1.cross(e2).norm();
         // 頂点法線の補間はメッシュ側（三角形は自分の法線配列を知らない）。ここでは ns = ng。
-        Hit { t: thit, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (u, v) }
+        // UV の補間はメッシュ側（三角形は自分の UV 配列を知らない）
+        Hit { t: thit, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (u, v), uv: (0.0, 0.0) }
     }
 }
