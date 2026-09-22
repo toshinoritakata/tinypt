@@ -51,7 +51,8 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
 - **パラメトリック形状の UV**: Mitsuba 準拠。`rectangle` = `((x+1)/2, (y+1)/2)`、`cube` = 面ごとに `[0,1]²`、`disk` = `(r, φ/2π)`、`sphere` = `(φ/2π, θ/π)` (極は ±z)。
 - **現状の制限**: XML でテクスチャを指定できるのは `diffuse` の `reflectance` のみ。ミップマップは未対応。
 - **OBJ の `usemtl` / MTL**: OBJ の `<shape>` に `<bsdf>` も `<emitter>` も書かないと、`mtllib` の MTL から材質を作る (1 メッシュのまま、`usemtl` ごとに三角形の材質が変わる。BVH は割らない)。`<bsdf>` があれば従来どおり**全体を上書き**し MTL は読まない (`sample/sponza.xml` はこちら)。`<boolean name="use_mtl" value="false"/>` でも MTL を無視できる。例: `sample/sponza_textured.xml`。
-  - MTL → BSDF: `map_Kd` があれば `Lambert { albedo: Kd, albedo_tex }` (sRGB デコード。`Kd` は倍率として掛かる)、無ければ `Lambert { albedo: Kd }`。`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
+  - MTL → BSDF: **`map_Kd` があれば常に** `Lambert { albedo: Kd, albedo_tex }` (sRGB デコード。`Kd` は倍率として掛かる)。`map_Kd` が無く、`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。どちらでもなければ `Lambert { albedo: Kd }`。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
+    (`map_Kd` を優先するのは、拡散テクスチャと明るい鏡面反射を両方持つ材質を先に GGX 化すると拡散テクスチャがまるごと捨てられてしまうため — 拡散 + 光沢の合成 BSDF は `Material` に新しい variant が要るので扱わない。)
   - `map_d` はアルファマスク、`map_bump` / `norm` は法線の摂動 ([詳細](#法線マップ--バンプマップ))。未対応: 定数の `d < 1` (シーンで 1 回だけ警告)、`map_Ka` / 非ゼロの `Ke` (材質ごとに 1 回警告)。
   - MTL の癖に対応: タブ字下げ、テクスチャパスの `\` (→ `/`)、未知キー、`newmtl` の重複 (最初の定義を残す)。テクスチャは解決済み絶対パスでキャッシュし、同じ画像を 2 度読まない。
 - 読み込みに失敗したテクスチャは警告して定数色にフォールバックする (描画は続く)。

@@ -283,7 +283,32 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
     (overrides, warnings)
 }
 
+/// ビルド情報（バージョンと有効な feature）を 1 行ずつ返す。
+///
+/// feature は `cfg!` で判定するので、**このバイナリが実際にどうビルドされたか**を示す
+/// （`Cargo.toml` の既定ではなく実体。`--no-default-features` ビルドでは denoise が無効と出る）。
+fn build_info() -> String {
+    let oidn = if cfg!(feature = "oidn") { "oidn (denoise)" } else { "no oidn (--denoise is a no-op)" };
+    format!(
+        "tinypt {} — Monte Carlo path tracer\nFeatures: {}\nRender revision: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        oidn,
+        tinypt::constants::RENDER_REVISION,
+    )
+}
+
 fn main() -> std::io::Result<()> {
+    // 引数なしで起動したら、レンダーせずにビルド情報と使い方を出す。
+    // 既定シーンは 1920x1080 / 512spp で数分かかるので、「試しに叩いた」人を待たせない。
+    // 既定シーンを描きたいときは `--scene` 無しで何かフラグを 1 つ付ける（例: `-o out.ppm`）。
+    if std::env::args().nth(1).is_none() {
+        print!("{}", build_info());
+        println!();
+        print!("{}", USAGE);
+        println!("Rendering the built-in scene: tinypt -o out.ppm");
+        return Ok(());
+    }
+
     // 1. 設定の初期化と引数解析
     let mut config = RenderConfig::default();
     let (overrides, warnings) = parse_args(std::env::args().skip(1), &mut config);
@@ -291,6 +316,8 @@ fn main() -> std::io::Result<()> {
         eprintln!("Warning: {}", w);
     }
     if overrides.help {
+        print!("{}", build_info());
+        println!();
         print!("{}", USAGE);
         return Ok(());
     }

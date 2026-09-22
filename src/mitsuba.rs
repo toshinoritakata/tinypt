@@ -854,13 +854,21 @@ fn mtl_to_material(
 
     let kd = Color::new(m.kd[0], m.kd[1], m.kd[2]);
     let ks = Color::new(m.ks[0], m.ks[1], m.ks[2]);
+    // `map_Kd` があれば拡散テクスチャを優先する（Ks/Ns は使わない）。これが無い経路だと、
+    // 明るい Ks + Ns>1 を持つ材質（Sponza の floor/arch/chain/vase_hanging）が map_Kd を読む前に
+    // Ggx へ早期 return し、拡散テクスチャがまるごと捨てられて単色に見えてしまう（不具合修正）。
+    // 拡散 + 光沢の合成 BSDF（正しい GGX 表現）は Material enum に variant を足す話になるので、
+    // ここでは扱わない（優先順位で解く）。
+    if let Some(p) = m.map_kd.as_deref() {
+        let tex = load_mtl_texture(dir, p, textures, state);
+        return (Material::Lambert { albedo: kd, albedo_tex: tex }, alpha, map);
+    }
     if ks.luminance() > 0.05 && m.ns > 1.0 {
         // Blinn-Phong 指数 → GGX の粗さ: alpha = sqrt(2 / (Ns + 2))
         let rough = (2.0 / (m.ns + 2.0)).sqrt().clamp(1e-3, 1.0);
         return (Material::Ggx { albedo: ks, alpha: rough }, alpha, map);
     }
-    let tex = m.map_kd.as_deref().and_then(|p| load_mtl_texture(dir, p, textures, state));
-    (Material::Lambert { albedo: kd, albedo_tex: tex }, alpha, map)
+    (Material::Lambert { albedo: kd, albedo_tex: None }, alpha, map)
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -1800,15 +1808,13 @@ mod tests {
             let ids: Vec<usize> = scene.world.meshes()[0].tris.iter().map(|t| t.mat_id).collect();
             assert_eq!(ids, vec![0, 1, 1, 1, 1, 2, 2, 2, 3]);
             assert!(scene.world.instances()[0].mat_override.is_none());
-            // A: テクスチャ付き Lambert、B: 明るい Ks かつ Ns>1 → Ggx（alpha = sqrt(2/102)）、C・既定: 灰色 Lambert
+            // A: テクスチャ付き Lambert。B は明るい Ks かつ Ns>1 だが map_Kd を持つので、
+            // テクスチャ付き Lambert が優先される（map_Kd があれば Ks/Ns は使わない。不具合修正）。
+            // C・既定: 灰色 Lambert
             assert!(matches!(scene.mats[1], Material::Lambert { albedo_tex: Some(_), .. }));
-            match scene.mats[2] {
-                Material::Ggx { alpha, .. } => assert!((alpha - (2.0f64 / 102.0).sqrt()).abs() < 1e-12),
-                _ => panic!("B は Ggx のはず"),
-            }
+            assert!(matches!(scene.mats[2], Material::Lambert { albedo_tex: Some(_), .. }), "map_Kd がある B は Lambert のはず");
             assert!(matches!(scene.mats[3], Material::Lambert { albedo_tex: None, .. }));
-            // 同じ a.png を A の map_Kd / map_Ka / map_d と B の map_Kd が指しているが、読むのは 1 回
-            // （B は Ggx になるので map_Kd は使われない → 実際に積まれるのは A の 1 枚）
+            // 同じ a.png を A の map_Kd / map_Ka / map_d と B の map_Kd が指しているが、読むのは 1 回（キャッシュ）
             assert_eq!(scene.textures.len(), 1);
             // 警告: map_Ka はマテリアル A に 1 回だけ。定数 d<1 はシーンで 1 回だけ。面ごとには出ない
             let n = |pat: &str| warnings.iter().filter(|w| w.contains(pat)).count();
@@ -2050,6 +2056,24 @@ mod tests {
             let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
             assert!(matches!(s.mats[0], Material::Ggx { .. }));
             assert!(s.mat_maps[0].is_some());
+        });
+    }
+
+    /// 不具合修正の回帰テスト: `map_Kd` と明るい `Ks`/`Ns` を両方持つ材質は、テクスチャ付き Lambert になる
+    /// （Ggx へ早期 return して拡散テクスチャを捨ててはいけない。Sponza の floor/arch/chain/vase_hanging）。
+    /// `map_Kd` を持たない明るい `Ks`/`Ns` は従来どおり Ggx。どちらの経路でもバンプマップは付く。
+    #[test]
+    fn map_kd_takes_priority_over_the_ggx_branch() {
+        with_mtl_dir(|dir| {
+            write_uv_obj_and_mtl(
+                dir,
+                "newmtl A\n\tKs 0.9 0.9 0.9\n\tNs 100\n\tmap_Kd textures\\a.png\n\tmap_bump textures\\a.png\n\
+                 newmtl B\n\tKs 0.9 0.9 0.9\n\tNs 100\n\tmap_bump textures\\a.png\n",
+            );
+            let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
+            assert!(matches!(s.mats[0], Material::Lambert { albedo_tex: Some(_), .. }), "map_Kd 付き材質は Lambert のはず");
+            assert!(matches!(s.mats[1], Material::Ggx { .. }), "map_Kd の無い材質は従来どおり Ggx のはず");
+            assert!(s.mat_maps[0].is_some() && s.mat_maps[1].is_some(), "どちらの経路でもバンプマップが付くはず");
         });
     }
 

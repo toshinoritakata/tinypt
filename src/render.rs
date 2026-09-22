@@ -638,7 +638,7 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 14;
+    const GOLDEN_REVISION: u32 = 15;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
@@ -650,6 +650,8 @@ mod tests {
     /// テクスチャ導入（RENDER_REVISION 12）でも同じく不変: rectangle / cube に UV は付いたが、
     /// テクスチャを参照しないマテリアルでは UV を一度も読まないため。
     /// 法線マップ／バンプマップ（RENDER_REVISION 14）でも不変: マップを持つ材質が無いシーンは摂動経路に入らない。
+    /// `map_Kd` を GGX 分岐より優先する不具合修正（RENDER_REVISION 15）でも不変: golden シーンは map_Kd と
+    /// 明るい Ks/Ns の両方を持つ材質を含まない。
     /// アルファマスク導入（RENDER_REVISION 13）でも不変: マスクを持たないメッシュは従来の交差経路のまま。
     const GOLDEN_CORNELL: (u64, u64) = (0x6779_3a10_a998_bdb0, 0x7c6a_81d0_9dd4_74a2);
 
