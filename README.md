@@ -6,9 +6,9 @@ Rust 製のモンテカルロパストレーサー。
 
 <table>
 <tr>
-<td width="34%"><a href="sample/sponza_textured.xml"><img src="docs/images/showcase_sponza_textured.png" alt="Sponza (textured)"></a><br>Crytek Sponza (262,267 三角形、テクスチャ + アルファマスク + バンプマップ)。512spp、1200x675、デノイズあり。<a href="sample/sponza_textured.xml"><code>sample/sponza_textured.xml</code></a></td>
-<td width="33%"><a href="sample/default.xml"><img src="docs/images/showcase_default.png" alt="default.xml"></a><br>組み込みマテリアルサンプル (拡散・金属・GGX・ガラス)。2048spp、1200x675、デノイズあり。<a href="sample/default.xml"><code>sample/default.xml</code></a></td>
-<td width="33%"><a href="sample/rungholt.xml"><img src="docs/images/showcase_rungholt.png" alt="Rungholt"></a><br>Rungholt (6,704,264 三角形)。512spp、1200x675、デノイズあり。<a href="sample/rungholt.xml"><code>sample/rungholt.xml</code></a></td>
+<td width="34%"><a href="docs/images/showcase_sponza_textured.png"><img src="docs/images/showcase_sponza_textured.png" alt="Sponza (textured)"></a><br>Crytek Sponza (262,267 三角形、テクスチャ + アルファマスク + バンプマップ)。512spp、1200x675、デノイズあり。<a href="sample/sponza_textured.xml"><code>sample/sponza_textured.xml</code></a></td>
+<td width="33%"><a href="docs/images/showcase_default.png"><img src="docs/images/showcase_default.png" alt="default.xml"></a><br>組み込みマテリアルサンプル (拡散・金属・GGX・ガラス)。2048spp、1200x675、デノイズあり。<a href="sample/default.xml"><code>sample/default.xml</code></a></td>
+<td width="33%"><a href="docs/images/showcase_rungholt.png"><img src="docs/images/showcase_rungholt.png" alt="Rungholt"></a><br>Rungholt (6,704,264 三角形)。512spp、1200x675、デノイズあり。<a href="sample/rungholt.xml"><code>sample/rungholt.xml</code></a></td>
 </tr>
 </table>
 
