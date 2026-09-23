@@ -92,14 +92,75 @@ pub struct Sphere {
 #[derive(Clone, Copy)]
 /// モーションブラー対応の三角形。
 ///
-/// シャッター開（_0）と閉（_1）の頂点を持ち、レイの time で線形補間する。
-/// 静的メッシュでは open = close の同一頂点を設定する。
+/// シャッター**開**（_0）の頂点だけを持つ（PERF-4 P4b）。シャッター**閉**の頂点は、実際にモーション
+/// ブラーのあるメッシュでだけ別配列（[`crate::world::Mesh::motion`]）に持たせ、無いメッシュは
+/// 追加メモリゼロにする。交差判定・接空間導出など閉頂点が要る箇所は、[`TriangleSource`] 経由で
+/// 呼び出し側から閉頂点を渡す `_with` 系のメソッドを使う（渡さない版は「閉 = 開」＝静止三角形として扱う）。
 pub struct Triangle {
     pub v0_0: Vec3, pub v1_0: Vec3, pub v2_0: Vec3, // シャッター開の頂点
-    pub v0_1: Vec3, pub v1_1: Vec3, pub v2_1: Vec3, // シャッター閉の頂点
-    pub e1_0: Vec3, pub e2_0: Vec3, // シャッター開の事前計算エッジ
-    pub e1_1: Vec3, pub e2_1: Vec3, // シャッター閉の事前計算エッジ
     pub mat_id: usize,
+}
+// 辺 (v1-v0, v2-v0) は事前計算しない（PERF-4 P4a）。水密な交差判定（`intersect`）は頂点から直接
+// 計算し、事前計算エッジは `world.rs` の接空間導出でしか使っていなかった。そちらも呼び出し側で
+// 都度計算する（`e1_0 = v1_0 - v0_0` のように、以前ここで事前計算していたのと全く同じ式・同じ順序で
+// 計算してから time 補間するので、結果はバイト単位で従来と同一 —
+// `uv_derivatives`（[`crate::world::Mesh::uv_derivatives`]）参照）。
+
+/// `Bvh` に三角形配列と（あれば）モーションブラーのシャッター閉頂点をまとめて渡すための束（PERF-4 P4b）。
+///
+/// `motion` は空なら「`tris` は全部静止（閉 = 開）」、非空なら `tris` と同じ長さで添字がそのまま対応する
+/// （[`crate::world::Mesh::motion`] と同じ規約）。`&[Triangle]` / `&Vec<Triangle>` から
+/// `.into()`（`motion` 空）で作れるので、モーションブラーを持たない既存の呼び出し側は
+/// `TriangleSource` を明示的に作らなくても書ける。
+#[derive(Clone, Copy)]
+pub struct TriangleSource<'a> {
+    tris: &'a [Triangle],
+    motion: &'a [[Vec3; 3]],
+}
+
+impl<'a> TriangleSource<'a> {
+    pub fn new(tris: &'a [Triangle], motion: &'a [[Vec3; 3]]) -> Self {
+        debug_assert!(motion.is_empty() || motion.len() == tris.len(), "motion must be empty or match tris.len()");
+        Self { tris, motion }
+    }
+
+    /// 三角形 `ti` のシャッター閉頂点。`motion` が空なら開頂点と同じ（静止三角形）。
+    #[inline(always)]
+    fn close(&self, ti: usize) -> (Vec3, Vec3, Vec3) {
+        if self.motion.is_empty() {
+            let t = &self.tris[ti];
+            (t.v0_0, t.v1_0, t.v2_0)
+        } else {
+            let m = self.motion[ti];
+            (m[0], m[1], m[2])
+        }
+    }
+
+    pub fn len(&self) -> usize { self.tris.len() }
+    pub fn is_empty(&self) -> bool { self.tris.is_empty() }
+
+    #[inline]
+    pub fn bounds(&self, ti: usize) -> Aabb {
+        self.tris[ti].bounds_with(self.close(ti))
+    }
+
+    #[inline(always)]
+    pub fn intersect(&self, ti: usize, r: Ray, tmin: f64, tmax: f64) -> Option<(f64, f64, f64)> {
+        self.tris[ti].intersect_with(self.close(ti), r, tmin, tmax)
+    }
+
+    #[inline]
+    pub fn hit_at(&self, ti: usize, r: Ray, t: f64, u: f64, v: f64) -> Hit {
+        self.tris[ti].hit_at_with(self.close(ti), r, t, u, v)
+    }
+}
+
+impl<'a> From<&'a [Triangle]> for TriangleSource<'a> {
+    fn from(tris: &'a [Triangle]) -> Self { Self { tris, motion: &[] } }
+}
+
+impl<'a> From<&'a Vec<Triangle>> for TriangleSource<'a> {
+    fn from(tris: &'a Vec<Triangle>) -> Self { Self { tris: tris.as_slice(), motion: &[] } }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -311,35 +372,40 @@ impl Sphere {
 
 impl Triangle {
     /// 静止三角形（モーションブラーなし）を 3 頂点から構築する。
-    /// シャッター開/閉に同一頂点を設定し、エッジを事前計算する。
     pub fn new_static(v0: Vec3, v1: Vec3, v2: Vec3, mat_id: usize) -> Self {
-        let e1 = v1 - v0;
-        let e2 = v2 - v0;
-        Self {
-            v0_0: v0, v1_0: v1, v2_0: v2,
-            v0_1: v0, v1_1: v1, v2_1: v2,
-            e1_0: e1, e2_0: e2, e1_1: e1, e2_1: e2,
-            mat_id,
-        }
+        Self { v0_0: v0, v1_0: v1, v2_0: v2, mat_id }
     }
 
-    /// シャッター時間 `time` での補間頂点を返す（モーションブラー用）。
+    /// シャッター時間 `time` での補間頂点を返す（静止三角形として扱う版。閉 = 開）。
+    /// モーションブラーのある三角形には [`vertices_at_with`](Self::vertices_at_with) を使うこと。
     pub fn vertices_at(&self, time: f64) -> (Vec3, Vec3, Vec3) {
+        self.vertices_at_with((self.v0_0, self.v1_0, self.v2_0), time)
+    }
+
+    /// [`vertices_at`](Self::vertices_at) の、シャッター閉頂点 `close` を呼び出し側から渡す版
+    /// （実際にモーションブラーのある三角形用。[`TriangleSource`] 経由で使う）。
+    pub fn vertices_at_with(&self, close: (Vec3, Vec3, Vec3), time: f64) -> (Vec3, Vec3, Vec3) {
         let t = time;
-        let v0 = self.v0_0 * (1.0 - t) + self.v0_1 * t;
-        let v1 = self.v1_0 * (1.0 - t) + self.v1_1 * t;
-        let v2 = self.v2_0 * (1.0 - t) + self.v2_1 * t;
+        let v0 = self.v0_0 * (1.0 - t) + close.0 * t;
+        let v1 = self.v1_0 * (1.0 - t) + close.1 * t;
+        let v2 = self.v2_0 * (1.0 - t) + close.2 * t;
         (v0, v1, v2)
     }
 
-    /// モーションブラー全体を囲む保守的な AABB を返す（開+閉の和）。
+    /// 静止三角形として扱った AABB（開頂点のみ）。モーションブラーのある三角形には
+    /// [`bounds_with`](Self::bounds_with) を使うこと。
     pub fn bounds(&self) -> Aabb {
+        Aabb::from_points(self.v0_0, self.v1_0, self.v2_0)
+    }
+
+    /// モーションブラー全体を囲む保守的な AABB を返す（開+閉の和）。
+    pub fn bounds_with(&self, close: (Vec3, Vec3, Vec3)) -> Aabb {
         let b0 = Aabb::from_points(self.v0_0, self.v1_0, self.v2_0);
-        let b1 = Aabb::from_points(self.v0_1, self.v1_1, self.v2_1);
+        let b1 = Aabb::from_points(close.0, close.1, close.2);
         b0.union(b1)
     }
 
-    /// BVH 分割用の重心を返す（モーションブラー全体の AABB の中心）。
+    /// BVH 分割用の重心を返す（静止三角形として扱う版）。
     pub fn centroid(&self) -> Vec3 {
         self.bounds().centroid()
     }
@@ -362,9 +428,17 @@ impl Triangle {
 
     /// 交差の判定だけを行い、`(t, b1, b2)`（v1, v2 の重心座標）を返す。交差点と誤差上界の計算は
     /// [`hit_at`](Self::hit_at) に分けてあり、BVH の走査では最近接の 1 つだけを確定させる（高速化）。
+    /// 静止三角形として扱う（閉 = 開）。モーションブラーのある三角形には
+    /// [`intersect_with`](Self::intersect_with) を使うこと（[`TriangleSource`] 経由）。
     #[inline]
     pub fn intersect(&self, r: Ray, tmin: f64, tmax: f64) -> Option<(f64, f64, f64)> {
-        let (v0, v1, v2) = self.vertices_at(r.time);
+        self.intersect_with((self.v0_0, self.v1_0, self.v2_0), r, tmin, tmax)
+    }
+
+    /// [`intersect`](Self::intersect) の、シャッター閉頂点 `close` を呼び出し側から渡す版。
+    #[inline]
+    pub fn intersect_with(&self, close: (Vec3, Vec3, Vec3), r: Ray, tmin: f64, tmax: f64) -> Option<(f64, f64, f64)> {
+        let (v0, v1, v2) = self.vertices_at_with(close, r.time);
         // 原点基準へ平行移動
         let mut p0 = v0 - r.o;
         let mut p1 = v1 - r.o;
@@ -433,8 +507,15 @@ impl Triangle {
     }
 
     /// [`intersect`](Self::intersect) の結果から交差情報（重心座標で求めた交差点・誤差上界・法線）を作る。
+    /// 静止三角形として扱う（閉 = 開）。モーションブラーのある三角形には
+    /// [`hit_at_with`](Self::hit_at_with) を使うこと（[`TriangleSource`] 経由）。
     pub fn hit_at(&self, r: Ray, thit: f64, u: f64, v: f64) -> Hit {
-        let (v0, v1, v2) = self.vertices_at(r.time);
+        self.hit_at_with((self.v0_0, self.v1_0, self.v2_0), r, thit, u, v)
+    }
+
+    /// [`hit_at`](Self::hit_at) の、シャッター閉頂点 `close` を呼び出し側から渡す版。
+    pub fn hit_at_with(&self, close: (Vec3, Vec3, Vec3), r: Ray, thit: f64, u: f64, v: f64) -> Hit {
+        let (v0, v1, v2) = self.vertices_at_with(close, r.time);
         let (e1, e2) = (v1 - v0, v2 - v0);
         let b0 = 1.0 - u - v;
         let p = v0 * b0 + v1 * u + v2 * v;

@@ -11,7 +11,7 @@
 //! - トラバーサルはスタックベース（固定長 64 + ヒープフォールバック）
 
 use crate::constants::bvh::{LEAF_SIZE, PARALLEL_MIN_TRIS, SAH_BINS};
-use crate::geometry::{Aabb, Hit, Triangle};
+use crate::geometry::{Aabb, Hit, TriangleSource};
 use crate::math::Vec3;
 use crate::ray::Ray;
 use std::cmp::Ordering;
@@ -313,19 +313,19 @@ impl Bvh {
     /// **並列化してもビット単位で逐次版と同じ BVH を作る**（分割の判断そのもの・分割順序は
     /// 一切変えていない。上位の再帰を複数スレッドに分けて、木の同じ場所を並行に組み立てているだけ。
     /// 詳細は [`build_range`] のドキュメント）。
-    pub fn build(tris: &[Triangle]) -> Self {
+    pub fn build(src: TriangleSource<'_>) -> Self {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        Self::build_with_threads(tris, threads)
+        Self::build_with_threads(src, threads)
     }
 
     /// [`Bvh::build`] のスレッド数を明示できる版。`build` は `available_parallelism` を渡すだけの
     /// 薄いラッパー。`threads <= 1` で呼べば常に逐次版と同じコード経路（`build_node_sequential` 1 回）
     /// を通るので、テストで「逐次 = `build_with_threads(tris, 1)`」「並列 = `build_with_threads(tris, N)`」
     /// を比較できる。
-    fn build_with_threads(tris: &[Triangle], threads: usize) -> Self {
-        let mut indices: Vec<usize> = (0..tris.len()).collect();
+    fn build_with_threads(src: TriangleSource<'_>, threads: usize) -> Self {
+        let mut indices: Vec<usize> = (0..src.len()).collect();
 
-        let tri_bounds: Vec<Aabb> = tris.iter().map(|t| t.bounds()).collect();
+        let tri_bounds: Vec<Aabb> = (0..src.len()).map(|ti| src.bounds(ti)).collect();
         let tri_centroids: Vec<Vec3> = tri_bounds.iter().map(|b| b.centroid()).collect();
 
         let nodes = if indices.is_empty() {
@@ -341,8 +341,8 @@ impl Bvh {
     ///
     /// スタックベースの反復トラバーサルを使用。
     /// 子ノードの AABB 交差距離を比較し、近い方を先に処理して早期枝刈りを最大化する。
-    pub fn hit(&self, tris: &[Triangle], r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
-        self.hit_filtered(tris, r, tmin, tmax, |_, _, _| true)
+    pub fn hit(&self, src: TriangleSource<'_>, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        self.hit_filtered(src, r, tmin, tmax, |_, _, _| true)
     }
 
     /// [`Bvh::hit`] に候補の採否判定を足したもの。`accept(三角形番号, u, v)` が false の交差は
@@ -354,7 +354,7 @@ impl Bvh {
     #[inline(always)]
     pub fn hit_filtered<F: Fn(usize, f64, f64) -> bool>(
         &self,
-        tris: &[Triangle],
+        src: TriangleSource<'_>,
         r: Ray,
         tmin: f64,
         mut tmax: f64,
@@ -413,7 +413,7 @@ impl Bvh {
                 let start = n.start as usize;
                 let end = start + n.count as usize;
                 for &ti in &self.indices[start..end] {
-                    if let Some((t, u, v)) = tris[ti].intersect(r, tmin, tmax) {
+                    if let Some((t, u, v)) = src.intersect(ti, r, tmin, tmax) {
                         if !accept(ti, u, v) {
                             continue;
                         }
@@ -466,7 +466,7 @@ impl Bvh {
         }
 
         best.map(|(ti, t, u, v)| {
-            let mut h = tris[ti].hit_at(r, t, u, v);
+            let mut h = src.hit_at(ti, r, t, u, v);
             h.prim_id = ti;
             h
         })
@@ -482,7 +482,7 @@ impl Bvh {
     #[inline(always)]
     pub fn any_hit_filtered<F: Fn(usize, f64, f64) -> bool>(
         &self,
-        tris: &[Triangle],
+        src: TriangleSource<'_>,
         r: Ray,
         tmin: f64,
         tmax: f64,
@@ -539,11 +539,11 @@ impl Bvh {
                 let start = n.start as usize;
                 let end = start + n.count as usize;
                 for &ti in &self.indices[start..end] {
-                    if let Some((t, u, v)) = tris[ti].intersect(r, tmin, tmax) {
+                    if let Some((t, u, v)) = src.intersect(ti, r, tmin, tmax) {
                         if !accept(ti, u, v) {
                             continue;
                         }
-                        let mut h = tris[ti].hit_at(r, t, u, v);
+                        let mut h = src.hit_at(ti, r, t, u, v);
                         h.prim_id = ti;
                         return Some(h);
                     }
@@ -593,6 +593,7 @@ impl Bvh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Triangle;
     use crate::rng::Rng;
 
     fn random_tris(n: usize, rng: &mut Rng) -> Vec<Triangle> {
@@ -634,10 +635,10 @@ mod tests {
     fn parallel_build_matches_sequential_bit_for_bit_for_a_large_mesh() {
         let mut rng = Rng::new(4242);
         let tris = random_tris(PARALLEL_MIN_TRIS + 20_000, &mut rng);
-        let seq = Bvh::build_with_threads(&tris, 1);
+        let seq = Bvh::build_with_threads((&tris).into(), 1);
         assert!(seq.nodes.len() > 1, "test setup: mesh should actually split");
         for &threads in &[2usize, 3, 4, 8, 16] {
-            let par = Bvh::build_with_threads(&tris, threads);
+            let par = Bvh::build_with_threads((&tris).into(), threads);
             assert!(bvh_bit_identical(&seq, &par), "threads={}: BVH differs from the sequential build", threads);
         }
     }
@@ -648,8 +649,8 @@ mod tests {
         let mut rng = Rng::new(99);
         for &n in &[PARALLEL_MIN_TRIS - 1, PARALLEL_MIN_TRIS, PARALLEL_MIN_TRIS + 1] {
             let tris = random_tris(n, &mut rng);
-            let seq = Bvh::build_with_threads(&tris, 1);
-            let par = Bvh::build_with_threads(&tris, 8);
+            let seq = Bvh::build_with_threads((&tris).into(), 1);
+            let par = Bvh::build_with_threads((&tris).into(), 8);
             assert!(bvh_bit_identical(&seq, &par), "n={}: BVH differs from the sequential build", n);
         }
     }
@@ -660,23 +661,23 @@ mod tests {
     fn parallel_build_matches_sequential_for_degenerate_inputs() {
         // 空メッシュ
         let empty: Vec<Triangle> = Vec::new();
-        let seq = Bvh::build_with_threads(&empty, 1);
-        let par = Bvh::build_with_threads(&empty, 8);
+        let seq = Bvh::build_with_threads((&empty).into(), 1);
+        let par = Bvh::build_with_threads((&empty).into(), 8);
         assert!(bvh_bit_identical(&seq, &par));
         assert!(seq.nodes.is_empty());
 
         // 三角形 1 個
         let one = vec![Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
-        let seq = Bvh::build_with_threads(&one, 1);
-        let par = Bvh::build_with_threads(&one, 8);
+        let seq = Bvh::build_with_threads((&one).into(), 1);
+        let par = Bvh::build_with_threads((&one).into(), 8);
         assert!(bvh_bit_identical(&seq, &par));
 
         // 全部同一位置（重心が一点に潰れる）。並列経路に乗る数まで増やす
         let degenerate: Vec<Triangle> = (0..PARALLEL_MIN_TRIS + 1000)
             .map(|i| Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), i))
             .collect();
-        let seq = Bvh::build_with_threads(&degenerate, 1);
-        let par = Bvh::build_with_threads(&degenerate, 8);
+        let seq = Bvh::build_with_threads((&degenerate).into(), 1);
+        let par = Bvh::build_with_threads((&degenerate).into(), 8);
         assert!(bvh_bit_identical(&seq, &par), "degenerate（同一位置）でビット一致しない");
     }
 
@@ -686,7 +687,7 @@ mod tests {
     fn parallel_build_is_a_valid_bvh() {
         let mut rng = Rng::new(55);
         let tris = random_tris(PARALLEL_MIN_TRIS + 5000, &mut rng);
-        let bvh = Bvh::build_with_threads(&tris, 8);
+        let bvh = Bvh::build_with_threads((&tris).into(), 8);
         // 全三角形がちょうど 1 つのリーフに属す
         let mut seen = vec![0u32; tris.len()];
         for node in &bvh.nodes {
@@ -705,7 +706,7 @@ mod tests {
             let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
             let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
             let r = Ray { o, d: (target - o).norm(), time: 0.0 };
-            let a = bvh.hit(&tris, r, 1e-4, 1e30).map(|h| h.t);
+            let a = bvh.hit((&tris).into(), r, 1e-4, 1e30).map(|h| h.t);
             let b = brute_force(&tris, r, 1e-4, 1e30);
             assert_eq!(a, b);
         }
@@ -727,12 +728,12 @@ mod tests {
         let mut rng = Rng::new(123);
         for &n in &[1usize, 5, 12, 15, 16, 40, 500] {
             let tris = random_tris(n, &mut rng);
-            let bvh = Bvh::build(&tris);
+            let bvh = Bvh::build((&tris).into());
             for _ in 0..500 {
                 let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
                 let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
                 let r = Ray { o, d: (target - o).norm(), time: 0.0 };
-                let a = bvh.hit(&tris, r, 1e-4, 1e30).map(|h| h.t);
+                let a = bvh.hit((&tris).into(), r, 1e-4, 1e30).map(|h| h.t);
                 let b = brute_force(&tris, r, 1e-4, 1e30);
                 assert_eq!(a, b, "n={}", n);
             }
@@ -747,15 +748,15 @@ mod tests {
         let mut rng = Rng::new(777);
         for &n in &[1usize, 5, 12, 16, 40, 500] {
             let tris = random_tris(n, &mut rng);
-            let bvh = Bvh::build(&tris);
+            let bvh = Bvh::build((&tris).into());
             for _ in 0..500 {
                 let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
                 let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
                 let r = Ray { o, d: (target - o).norm(), time: 0.0 };
                 // 三角形番号が偶数のものだけ採用する（アルファ透明の棄却を模した accept）
                 let accept = |ti: usize, _u: f64, _v: f64| ti % 2 == 0;
-                let nearest = bvh.hit_filtered(&tris, r, 1e-4, 1e30, accept).is_some();
-                let any = bvh.any_hit_filtered(&tris, r, 1e-4, 1e30, accept).is_some();
+                let nearest = bvh.hit_filtered((&tris).into(), r, 1e-4, 1e30, accept).is_some();
+                let any = bvh.any_hit_filtered((&tris).into(), r, 1e-4, 1e30, accept).is_some();
                 assert_eq!(any, nearest, "n={}: any_hit_filtered と hit_filtered の存在判定が食い違った", n);
             }
         }
@@ -767,7 +768,7 @@ mod tests {
         let mut rng = Rng::new(5);
         for &n in &[3usize, 12, 15, 100] {
             let tris = random_tris(n, &mut rng);
-            let bvh = Bvh::build(&tris);
+            let bvh = Bvh::build((&tris).into());
             let mut seen = vec![0u32; n];
             for node in &bvh.nodes {
                 if node.left == -1 {
@@ -796,7 +797,7 @@ mod tests {
                 Triangle::new_static(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 0.5, 0.0, 0.0), Vec3::new(x, 0.5, 0.0), i)
             })
             .collect();
-        let bvh = Bvh::build(&tris);
+        let bvh = Bvh::build((&tris).into());
         let root = bvh.nodes[0];
         let l = bvh.nodes[root.left as usize].bbox;
         let r = bvh.nodes[root.right as usize].bbox;
@@ -810,16 +811,16 @@ mod tests {
         let mut rng = Rng::new(77);
         for &n in &[1usize, 12, 40, 500] {
             let tris = random_tris(n, &mut rng);
-            let bvh = Bvh::build(&tris);
+            let bvh = Bvh::build((&tris).into());
             let kept: Vec<Triangle> = tris.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, t)| *t).collect();
             for _ in 0..400 {
                 let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
                 let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
                 let r = Ray { o, d: (target - o).norm(), time: 0.0 };
-                let a = bvh.hit_filtered(&tris, r, 1e-4, 1e30, |ti, _, _| ti % 3 != 0).map(|h| h.t);
+                let a = bvh.hit_filtered((&tris).into(), r, 1e-4, 1e30, |ti, _, _| ti % 3 != 0).map(|h| h.t);
                 assert_eq!(a, brute_force(&kept, r, 1e-4, 1e30), "n={}", n);
-                let all = bvh.hit_filtered(&tris, r, 1e-4, 1e30, |_, _, _| true).map(|h| h.t);
-                assert_eq!(all, bvh.hit(&tris, r, 1e-4, 1e30).map(|h| h.t));
+                let all = bvh.hit_filtered((&tris).into(), r, 1e-4, 1e30, |_, _, _| true).map(|h| h.t);
+                assert_eq!(all, bvh.hit((&tris).into(), r, 1e-4, 1e30).map(|h| h.t));
             }
         }
     }

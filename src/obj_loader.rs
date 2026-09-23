@@ -32,17 +32,20 @@ pub struct MeshData {
     /// 三角形ごとの `vt` の添字。3 つとも [`NO_UV`] なら UV 無し（テクスチャは (0,0) を引く）。
     /// `uv` が空のときはこの配列も空
     pub tri_uv: Vec<[u32; 3]>,
+    /// モーションブラーのシャッター閉頂点（PERF-4 P4b）。空なら全三角形が静止（閉 = 開）。
+    /// 非空なら `tris` と同じ長さで添字がそのまま対応する（[`crate::world::Mesh::motion`] と同じ規約）。
+    pub motion: Vec<[Vec3; 3]>,
 }
 
 impl MeshData {
     /// 頂点法線も UV も持たないメッシュ。
     pub fn flat(tris: Vec<Triangle>) -> Self {
-        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new() }
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new(), motion: Vec::new() }
     }
 
     /// UV だけを持つメッシュ（パラメトリック形状用）。
     pub fn with_uv(tris: Vec<Triangle>, uv: Vec<[f64; 2]>, tri_uv: Vec<[u32; 3]>) -> Self {
-        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv, tri_uv }
+        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv, tri_uv, motion: Vec::new() }
     }
 
     /// 1 つでも UV を持つ三角形があるか。
@@ -297,23 +300,16 @@ pub fn load_obj_mesh_mb(path0: &str, path1: &str, mat_id: usize) -> std::io::Res
     }
 
     let mut tris: Vec<Triangle> = Vec::with_capacity(t0.len());
+    let mut motion: Vec<[Vec3; 3]> = Vec::with_capacity(t0.len());
     for [i0, i1, i2] in t0 {
-        let e1_0 = p0[i1] - p0[i0];
-        let e2_0 = p0[i2] - p0[i0];
-        let e1_1 = p1[i1] - p1[i0];
-        let e2_1 = p1[i2] - p1[i0];
-        tris.push(Triangle {
-            v0_0: p0[i0], v1_0: p0[i1], v2_0: p0[i2],
-            v0_1: p1[i0], v1_1: p1[i1], v2_1: p1[i2],
-            e1_0, e2_0, e1_1, e2_1,
-            mat_id,
-        });
+        tris.push(Triangle { v0_0: p0[i0], v1_0: p0[i1], v2_0: p0[i2], mat_id });
+        motion.push([p1[i0], p1[i1], p1[i2]]);
     }
     let (mut vn, mut tri_vn) = (n0, vn0);
     normalize_tri_vn(&mut vn, &mut tri_vn);
     let (mut uv, mut tri_uv) = (uv0, tuv0);
     normalize_tri_uv(&mut uv, &mut tri_uv);
-    Ok(MeshData { tris, vn, tri_vn, uv, tri_uv })
+    Ok(MeshData { tris, vn, tri_vn, uv, tri_uv, motion })
 }
 
 /// 単一の OBJ ファイルを静的三角形メッシュとして読み込む。
@@ -349,7 +345,7 @@ fn static_mesh(parsed: ParsedObj, mut mat_of: impl FnMut(usize) -> usize) -> (Me
     normalize_tri_vn(&mut vn, &mut tri_vn);
     let (mut uv, mut tri_uv) = (parsed.uvs, parsed.tri_uv);
     normalize_tri_uv(&mut uv, &mut tri_uv);
-    (MeshData { tris, vn, tri_vn, uv, tri_uv }, parsed.mat_names, parsed.mtllibs)
+    (MeshData { tris, vn, tri_vn, uv, tri_uv, motion: Vec::new() }, parsed.mat_names, parsed.mtllibs)
 }
 
 /// 単一の OBJ を三角形リストだけ読み込む（頂点法線は捨てる）。

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use crate::bvh::Bvh;
-use crate::geometry::{face_forward, Aabb, Hit, Sphere, Triangle};
+use crate::geometry::{face_forward, Aabb, Hit, Sphere, Triangle, TriangleSource};
 use crate::material::Material;
 use crate::obj_loader::{MeshData, NO_NORMAL, NO_UV};
 use crate::math::{cdf_search, gamma, Color, Vec3};
@@ -29,8 +29,11 @@ use crate::transform::Transform;
 /// 異なる三角形配列を渡されると壊れるため、その対応関係はこの型の外に出さない
 /// （`bvh` が非公開なのはそのため）。交差判定は [`Mesh::hit`] を通して行う。
 pub struct Mesh {
-    /// メッシュの三角形リスト
+    /// メッシュの三角形リスト（シャッター開頂点のみ。閉頂点は `motion`、PERF-4 P4b）
     pub tris: Vec<Triangle>,
+    /// モーションブラーのシャッター閉頂点。空なら全三角形が静止（閉 = 開、追加メモリゼロ）。
+    /// 非空なら `tris` と同じ長さで添字がそのまま対応する。
+    motion: Vec<[Vec3; 3]>,
     /// 頂点法線（OBJ の `vn`、正規化済み）。スムーズシェーディングしないメッシュでは空
     vn: Vec<Vec3>,
     /// 三角形ごとの `vn` の添字。空ならメッシュ全体が面法線
@@ -50,23 +53,25 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    /// 三角形リストからメッシュと BVH を構築する（面法線のみ）。
+    /// 三角形リストからメッシュと BVH を構築する（面法線のみ、モーションブラー無し）。
     pub fn new(tris: Vec<Triangle>) -> Self {
-        let bvh = Bvh::build(&tris);
-        Self { tris, vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new(), masks: Vec::new(), tri_alpha: Vec::new(), bvh }
+        let bvh = Bvh::build(TriangleSource::from(&tris));
+        Self { tris, motion: Vec::new(), vn: Vec::new(), tri_vn: Vec::new(), uv: Vec::new(), tri_uv: Vec::new(), masks: Vec::new(), tri_alpha: Vec::new(), bvh }
     }
 
     /// 頂点法線付きでメッシュを構築する。`tri_vn` の長さが三角形数と合わない場合は
     /// 面法線だけのメッシュとして扱う（壊れた入力で添字がずれるより安全側）。
     pub fn with_normals(tris: Vec<Triangle>, vn: Vec<Vec3>, tri_vn: Vec<[u32; 3]>) -> Self {
-        Self::build(tris, vn, tri_vn, Vec::new(), Vec::new())
+        Self::build(tris, Vec::new(), vn, tri_vn, Vec::new(), Vec::new())
     }
 
     /// 頂点法線と UV（どちらも省略可）を付けてメッシュを構築する。
     /// 添字配列の長さが三角形数と合わない場合は、その属性だけ無かったことにする
-    /// （壊れた入力で添字がずれるより安全側）。
+    /// （壊れた入力で添字がずれるより安全側）。`motion` は空か `tris` と同じ長さであること
+    /// （合わなければモーションブラー無しとして扱う。壊れた入力で添字がずれるより安全側）。
     pub fn build(
         tris: Vec<Triangle>,
+        motion: Vec<[Vec3; 3]>,
         vn: Vec<Vec3>,
         tri_vn: Vec<[u32; 3]>,
         uv: Vec<[f64; 2]>,
@@ -82,13 +87,38 @@ impl Mesh {
         } else {
             (uv, tri_uv)
         };
-        let bvh = Bvh::build(&tris);
-        Self { tris, vn, tri_vn, uv, tri_uv, masks: Vec::new(), tri_alpha: Vec::new(), bvh }
+        let motion = if motion.len() == tris.len() { motion } else { Vec::new() };
+        let bvh = Bvh::build(TriangleSource::new(&tris, &motion));
+        Self { tris, motion, vn, tri_vn, uv, tri_uv, masks: Vec::new(), tri_alpha: Vec::new(), bvh }
     }
 
     /// [`MeshData`] からメッシュを構築する。
     pub fn with_normals_from(data: MeshData) -> Self {
-        Self::build(data.tris, data.vn, data.tri_vn, data.uv, data.tri_uv)
+        Self::build(data.tris, data.motion, data.vn, data.tri_vn, data.uv, data.tri_uv)
+    }
+
+    /// 三角形 `ti` のシャッター閉頂点。`motion` が空なら開頂点と同じ（静止三角形）。
+    #[inline(always)]
+    fn close(&self, ti: usize) -> (Vec3, Vec3, Vec3) {
+        if self.motion.is_empty() {
+            let t = &self.tris[ti];
+            (t.v0_0, t.v1_0, t.v2_0)
+        } else {
+            let m = self.motion[ti];
+            (m[0], m[1], m[2])
+        }
+    }
+
+    /// 三角形 `tri_id` のシャッター時刻 `time` での補間頂点（モーションブラー対応）。
+    pub fn vertices_at(&self, tri_id: usize, time: f64) -> Option<(Vec3, Vec3, Vec3)> {
+        let tri = self.tris.get(tri_id)?;
+        Some(tri.vertices_at_with(self.close(tri_id), time))
+    }
+
+    /// このメッシュ用の [`TriangleSource`]（`Bvh` に渡す束）。
+    #[inline]
+    fn source(&self) -> TriangleSource<'_> {
+        TriangleSource::new(&self.tris, &self.motion)
     }
 
     /// アルファマスクを付ける。`masks[i]` を三角形が `tri_alpha[t] = (i + 1, d)` で参照する
@@ -146,9 +176,9 @@ impl Mesh {
         // アルファマスクを持つメッシュだけ、採否判定つきの探索にする（他は従来の経路のまま）。
         // 透明な交差は無かったことにして探索を続けるので、シャドウレイでも穴を光が抜ける
         let mut h = if self.masks.is_empty() {
-            self.bvh.hit(&self.tris, r, tmin, tmax)?
+            self.bvh.hit(self.source(), r, tmin, tmax)?
         } else {
-            self.bvh.hit_filtered(&self.tris, r, tmin, tmax, |ti, u, v| self.alpha_opaque(ti, u, v))?
+            self.bvh.hit_filtered(self.source(), r, tmin, tmax, |ti, u, v| self.alpha_opaque(ti, u, v))?
         };
         if !self.tri_vn.is_empty() {
             if let Some(ns) = self.shading_normal(h.prim_id, h.bary, h.ng) {
@@ -169,9 +199,9 @@ impl Mesh {
     /// 解決しない（遮蔽の有無にしか使わないので無駄な計算を省く）。
     pub fn occluded(&self, r: Ray, tmin: f64, tmax: f64, skip_prim: Option<usize>) -> Option<Hit> {
         if self.masks.is_empty() {
-            self.bvh.any_hit_filtered(&self.tris, r, tmin, tmax, |ti, _, _| Some(ti) != skip_prim)
+            self.bvh.any_hit_filtered(self.source(), r, tmin, tmax, |ti, _, _| Some(ti) != skip_prim)
         } else {
-            self.bvh.any_hit_filtered(&self.tris, r, tmin, tmax, |ti, u, v| {
+            self.bvh.any_hit_filtered(self.source(), r, tmin, tmax, |ti, u, v| {
                 Some(ti) != skip_prim && self.alpha_opaque(ti, u, v)
             })
         }
@@ -198,8 +228,18 @@ impl Mesh {
             return None;
         }
         let tri = self.tris.get(tri_id)?;
-        let e1 = tri.e1_0 * (1.0 - time) + tri.e1_1 * time;
-        let e2 = tri.e2_0 * (1.0 - time) + tri.e2_1 * time;
+        // 事前計算エッジは持たない（PERF-4 P4a）。以前 `obj_loader`/`Triangle::new_static` が
+        // 構築時にやっていたのと全く同じ式・同じ順序（先に開/閉それぞれの辺を作り、それを time で
+        // 補間する）でその場で計算する。頂点を先に time 補間してから引き算する順序だと
+        // 浮動小数点演算が非結合的なため丸めが変わりうるので、あえてこの順序を踏襲している。
+        // シャッター閉頂点は三角形自身ではなくメッシュ側（`self.motion`）に持つ（PERF-4 P4b）。
+        let (c0, c1, c2) = self.close(tri_id);
+        let e1_0 = tri.v1_0 - tri.v0_0;
+        let e2_0 = tri.v2_0 - tri.v0_0;
+        let e1_1 = c1 - c0;
+        let e2_1 = c2 - c0;
+        let e1 = e1_0 * (1.0 - time) + e1_1 * time;
+        let e2 = e2_0 * (1.0 - time) + e2_1 * time;
         let dpdu = (e1 * dv2 - e2 * dv1) / det;
         let dpdv = (e2 * du1 - e1 * du2) / det;
         Some((dpdu, dpdv))
@@ -951,8 +991,7 @@ fn tri_point_error(world: &World, mesh_id: usize, tri_id: usize, inst_id: usize,
     let (Some(mesh), Some(inst)) = (world.meshes.get(mesh_id), world.instances.get(inst_id)) else {
         return Vec3::new(0.0, 0.0, 0.0);
     };
-    let Some(tri) = mesh.tris.get(tri_id) else { return Vec3::new(0.0, 0.0, 0.0) };
-    let (v0, v1, v2) = tri.vertices_at(time);
+    let Some((v0, v1, v2)) = mesh.vertices_at(tri_id, time) else { return Vec3::new(0.0, 0.0, 0.0) };
     let zero = Vec3::new(0.0, 0.0, 0.0);
     let (w0, e0) = inst.xform.apply_point_with_error(v0, zero);
     let (w1, e1) = inst.xform.apply_point_with_error(v1, zero);
@@ -969,9 +1008,8 @@ fn tri_world_verts(
     time: f64,
 ) -> Option<(Vec3, Vec3, Vec3)> {
     let mesh = world.meshes.get(mesh_id)?;
-    let tri = mesh.tris.get(tri_id)?;
     let inst = world.instances.get(inst_id)?;
-    let (v0, v1, v2) = tri.vertices_at(time);
+    let (v0, v1, v2) = mesh.vertices_at(tri_id, time)?;
     Some((
         inst.xform.apply_point(v0),
         inst.xform.apply_point(v1),
@@ -1035,7 +1073,7 @@ pub(crate) mod test_meshes {
             Triangle::new_static(v(-half, -half), v(half, -half), v(half, half), mat_id),
             Triangle::new_static(v(-half, -half), v(half, half), v(-half, half), mat_id),
         ];
-        MeshData { tris, vn: vec![ns.norm()], tri_vn: vec![[0, 0, 0], [0, 0, 0]], uv: Vec::new(), tri_uv: Vec::new() }
+        MeshData { tris, vn: vec![ns.norm()], tri_vn: vec![[0, 0, 0], [0, 0, 0]], uv: Vec::new(), tri_uv: Vec::new(), motion: Vec::new() }
     }
 
     /// 経度 `nu` × 緯度 `nv` の UV 球。頂点法線は解析的な法線（中心からの単位ベクトル）。
@@ -1069,7 +1107,7 @@ pub(crate) mod test_meshes {
         }
         // 頂点法線 = 単位球面上の位置（解析的な法線）
         let vn = pos.clone();
-        if smooth { MeshData { tris, vn, tri_vn, uv: Vec::new(), tri_uv: Vec::new() } } else { MeshData::flat(tris) }
+        if smooth { MeshData { tris, vn, tri_vn, uv: Vec::new(), tri_uv: Vec::new(), motion: Vec::new() } } else { MeshData::flat(tris) }
     }
 }
 
@@ -2592,17 +2630,13 @@ mod tests {
         let (a0, b0, c0) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
         // 閉時刻では x 方向に 3 倍に伸ばす
         let s = |v: Vec3| Vec3::new(v.x * 3.0, v.y, v.z);
-        let tri = Triangle {
-            v0_0: a0, v1_0: b0, v2_0: c0,
-            v0_1: s(a0), v1_1: s(b0), v2_1: s(c0),
-            e1_0: b0 - a0, e2_0: c0 - a0, e1_1: s(b0) - s(a0), e2_1: s(c0) - s(a0),
-            mat_id: 0,
-        };
-        let data = MeshData::with_uv(vec![tri], vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![[0, 1, 2]]);
+        let tri = Triangle { v0_0: a0, v1_0: b0, v2_0: c0, mat_id: 0 };
+        let mut data = MeshData::with_uv(vec![tri], vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![[0, 1, 2]]);
+        data.motion = vec![[s(a0), s(b0), s(c0)]];
         let mesh = Mesh::with_normals_from(data);
         for &t in &[0.0, 0.25, 1.0] {
             let (dpdu, dpdv) = mesh.uv_derivatives(0, t).unwrap();
-            let (v0, v1, v2) = mesh.tris[0].vertices_at(t);
+            let (v0, v1, v2) = mesh.vertices_at(0, t).unwrap();
             assert!((dpdu - (v1 - v0)).len() < 1e-12, "t={}", t);
             assert!((dpdv - (v2 - v0)).len() < 1e-12, "t={}", t);
         }
@@ -2762,7 +2796,7 @@ mod tests {
         let tris = vec![Triangle::new_static(
             Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
         let mesh = Mesh::build(
-            tris, Vec::new(), Vec::new(),
+            tris, Vec::new(), Vec::new(), Vec::new(),
             vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![[0, 1, 2]],
         );
         assert!(mesh.has_uv());
@@ -2794,7 +2828,7 @@ mod tests {
             Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0),
             Triangle::new_static(Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0),
         ];
-        let mesh = Mesh::build(tris, Vec::new(), Vec::new(), vec![[0.0, 0.0]], vec![[0, 0, 0]]); // 1 個しかない
+        let mesh = Mesh::build(tris, Vec::new(), Vec::new(), Vec::new(), vec![[0.0, 0.0]], vec![[0, 0, 0]]); // 1 個しかない
         assert!(!mesh.has_uv());
     }
 
@@ -2806,7 +2840,7 @@ mod tests {
             Triangle::new_static(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(0.0, 0.05, 0.0), Vec3::new(1.0, 1.0, 0.0), 0),
         ];
         let mesh = Mesh::build(
-            tris, Vec::new(), Vec::new(),
+            tris, Vec::new(), Vec::new(), Vec::new(),
             vec![[0.3, 0.4]], vec![[0, 0, 0], [NO_UV; 3]],
         );
         let shoot = |y: f64| mesh.hit(Ray { o: Vec3::new(0.0, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30);
@@ -2907,6 +2941,7 @@ mod tests {
                 tri_vn: vec![[0, 0, 0], [NO_NORMAL; 3]],
                 uv: Vec::new(),
                 tri_uv: Vec::new(),
+                motion: Vec::new(),
             },
             Transform::scale(Vec3::new(2.0, 0.5, 1.5)),
             None,
