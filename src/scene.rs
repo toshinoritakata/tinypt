@@ -12,6 +12,17 @@ use crate::math::{Color, Vec3};
 use crate::ray::Camera;
 use crate::world::World;
 
+/// シーン読み込みの内訳（起動時の表示用）。描画そのものには影響しない。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadStats {
+    /// OBJ の解析（ファイル読み込み + 三角形化）
+    pub obj_parse: std::time::Duration,
+    /// メッシュ構築（BVH 構築を含む）
+    pub mesh_build: std::time::Duration,
+    /// テクスチャ・マップ・環境マップの読み込み
+    pub texture_load: std::time::Duration,
+}
+
 /// シーンコンテナ（カメラ・ワールド・マテリアル・環境マップ）。
 pub struct Scene {
     /// カメラ（レイ生成に使用）
@@ -31,6 +42,8 @@ pub struct Scene {
     pub mat_maps: Vec<Option<MapId>>,
     /// 環境マップ（None でデフォルトの空色を使用）
     pub env: Option<EnvMap>,
+    /// 読み込みの内訳（表示用。`World::mesh_build_time` などから埋める）
+    pub load_stats: LoadStats,
 }
 
 /// レンダリング設定からデフォルトシーンを構築する。
@@ -104,7 +117,8 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
         None => None,
     };
 
-    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), env }
+    let load_stats = LoadStats { mesh_build: world.mesh_build_time(), ..Default::default() };
+    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), env, load_stats }
 }
 
 fn push(mats: &mut Vec<Material>, m: Material) -> usize {

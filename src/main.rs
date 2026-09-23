@@ -322,11 +322,12 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // 2. シーン構築（カメラ・ジオメトリ・マテリアル・環境マップ）
+    // 2. シーン構築（カメラ・ジオメトリ・マテリアル・環境マップ）。時間の内訳も出す
     //    --scene 指定時は Mitsuba XML サブセットから解像度・spp・integrator 設定も読み込む。
     //    CLI の解像度はローダーに渡す: センサーのアスペクト比が解像度から決まるので、
     //    読み込んだ後に width/height だけ差し替えると画角がずれる。
     let forced_resolution = overrides.resolution();
+    let load_start = std::time::Instant::now();
     let scene = if let Some(path) = config.scene_path.clone() {
         load_scene(&path, &mut config, forced_resolution)?
     } else {
@@ -338,6 +339,28 @@ fn main() -> std::io::Result<()> {
     if let Some(spp) = overrides.spp {
         config.spp = spp;
     }
+    // 読み込みの内訳。大きなシーンでは BVH 構築が支配的なので、描画時間と分けて見えるようにする
+    {
+        let total = load_start.elapsed();
+        let st = &scene.load_stats;
+        eprintln!(
+            "Scene: {} ({} tris, {} instances, {} spheres, {} lights, {} textures)",
+            config.scene_path.as_deref().unwrap_or("built-in"),
+            scene.world.triangle_count(),
+            scene.world.instances().len(),
+            scene.world.spheres().len(),
+            scene.world.lights().len(),
+            scene.textures.len(),
+        );
+        eprintln!(
+            "Loaded in {:.2}s (obj parse {:.2}s, mesh + BVH build {:.2}s, textures {:.2}s)",
+            total.as_secs_f64(),
+            st.obj_parse.as_secs_f64(),
+            st.mesh_build.as_secs_f64(),
+            st.texture_load.as_secs_f64(),
+        );
+    }
+
     if config.width.saturating_mul(config.height) > LARGE_PIXEL_COUNT {
         eprintln!(
             "Warning: {}x{} is {:.1}M pixels; the accumulation buffers alone need about {:.1} GB",

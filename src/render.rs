@@ -398,6 +398,7 @@ mod tests {
             normal_maps: Vec::new(),
             mat_maps: Vec::new(),
             env: None,
+            load_stats: Default::default(),
         }
     }
 

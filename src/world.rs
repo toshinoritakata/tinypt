@@ -299,6 +299,8 @@ pub struct World {
     /// 球インデックス → lights 上の ID（発光体でなければ None）。
     /// `light_pdf` が BSDF サンプリングで命中した発光体を逆引きするために使う。
     sphere_light_id: Vec<Option<usize>>,
+    /// メッシュ構築（BVH 構築を含む）に費やした累計時間。起動時の内訳表示に使う。
+    mesh_build_time: std::time::Duration,
     /// (インスタンス ID, メッシュ内三角形 ID) → lights 上の ID。
     tri_light_id: std::collections::HashMap<(usize, usize), usize>,
 }
@@ -314,6 +316,7 @@ impl World {
             light_cdf: Vec::new(),
             light_total: 0.0,
             sphere_light_id: Vec::new(),
+            mesh_build_time: std::time::Duration::ZERO,
             tri_light_id: std::collections::HashMap::new(),
         }
     }
@@ -352,12 +355,16 @@ impl World {
     /// 三角形群からメッシュを構築し、`xform` で配置したインスタンスを追加する。
     /// 追加したインスタンスの ID を返す。
     pub fn add_mesh_instance(&mut self, tris: Vec<Triangle>, xform: Transform, mat_override: Option<usize>) -> usize {
-        self.add_mesh(Mesh::new(tris), xform, mat_override)
+        let (mesh, dt) = timed(|| Mesh::new(tris));
+        self.mesh_build_time += dt;
+        self.add_mesh(mesh, xform, mat_override)
     }
 
     /// OBJ から読んだメッシュ（頂点法線付きでありうる）を `xform` で配置したインスタンスを追加する。
     pub fn add_mesh_data_instance(&mut self, data: MeshData, xform: Transform, mat_override: Option<usize>) -> usize {
-        self.add_mesh(Mesh::with_normals_from(data), xform, mat_override)
+        let (mesh, dt) = timed(|| Mesh::with_normals_from(data));
+        self.mesh_build_time += dt;
+        self.add_mesh(mesh, xform, mat_override)
     }
 
     /// 構築済みのメッシュを登録してインスタンスを追加する（上の 2 つの共通部分）。
@@ -369,7 +376,9 @@ impl World {
         tri_alpha: Vec<(u16, f32)>,
         xform: Transform,
     ) -> usize {
-        self.add_mesh(Mesh::with_normals_from(data).with_alpha(masks, tri_alpha), xform, None)
+        let (mesh, dt) = timed(|| Mesh::with_normals_from(data).with_alpha(masks, tri_alpha));
+        self.mesh_build_time += dt;
+        self.add_mesh(mesh, xform, None)
     }
 
     fn add_mesh(&mut self, mesh: Mesh, xform: Transform, mat_override: Option<usize>) -> usize {
@@ -379,6 +388,19 @@ impl World {
         let world_bounds = instance_world_bounds(&self.meshes[mesh_id], &xform);
         self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds });
         inst_id
+    }
+
+    /// メッシュ構築（BVH 構築を含む）に費やした累計時間。
+    pub fn mesh_build_time(&self) -> std::time::Duration {
+        self.mesh_build_time
+    }
+
+    /// 全インスタンス展開後の三角形数（表示用。インスタンスごとにメッシュの三角形数を足す）。
+    pub fn triangle_count(&self) -> usize {
+        self.instances
+            .iter()
+            .map(|i| self.meshes.get(i.mesh_id).map_or(0, |m| m.tris.len()))
+            .sum()
     }
 
     /// 球プリミティブの一覧を返す。
@@ -2631,4 +2653,11 @@ mod tests {
         assert!(checked > 300, "ヒットが少なすぎる ({})", checked);
         assert!(smooth_hits > checked / 2, "補間が効いているヒットが少なすぎる（テストが空回り）");
     }
+}
+
+/// クロージャの所要時間を測って `(結果, 経過)` を返す（構築時間の内訳表示用）。
+fn timed<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
+    let t0 = std::time::Instant::now();
+    let v = f();
+    (v, t0.elapsed())
 }

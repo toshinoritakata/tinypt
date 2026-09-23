@@ -165,6 +165,28 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// 読み込み内訳の計測用アキュムレータ。シーンの読み込みは 1 スレッドで進むので thread_local で足りる
+// （引数を多数の関数に通さずに済む）。`load_scene_from_str` の先頭で 0 にする。
+thread_local! {
+    static OBJ_PARSE_TIME: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    static TEXTURE_LOAD_TIME: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// `f` の所要時間を該当のアキュムレータに足しつつ結果を返す。
+fn timed_obj<T>(f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let v = f();
+    OBJ_PARSE_TIME.with(|c| c.set(c.get() + t0.elapsed()));
+    v
+}
+
+fn timed_texture<T>(f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let v = f();
+    TEXTURE_LOAD_TIME.with(|c| c.set(c.get() + t0.elapsed()));
+    v
+}
+
 fn warn(msg: &str) {
     #[cfg(test)]
     CAPTURED_WARNINGS.with(|w| {
@@ -232,6 +254,8 @@ pub fn load_scene_from_str(
     base_config: &RenderConfig,
     forced_resolution: (Option<usize>, Option<usize>),
 ) -> io::Result<(Scene, SceneSettings)> {
+    OBJ_PARSE_TIME.with(|c| c.set(std::time::Duration::ZERO));
+    TEXTURE_LOAD_TIME.with(|c| c.set(std::time::Duration::ZERO));
     let root = parse_tree(xml)?;
     if root.tag != "scene" {
         return Err(err("root element is not <scene>"));
@@ -341,7 +365,12 @@ pub fn load_scene_from_str(
         mat_maps.clear();
     }
     debug_assert!(mat_maps.is_empty() || mat_maps.len() == mats.len());
-    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env }, settings))
+    let load_stats = crate::scene::LoadStats {
+        obj_parse: OBJ_PARSE_TIME.with(|c| c.get()),
+        mesh_build: world.mesh_build_time(),
+        texture_load: TEXTURE_LOAD_TIME.with(|c| c.get()),
+    };
+    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env, load_stats }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
@@ -393,7 +422,7 @@ fn parse_scene_emitter(el: &Element, base_dir: &Path) -> Option<EnvMap> {
         "envmap" => {
             let filename = el.string("filename")?;
             let resolved = resolve_path(base_dir, filename);
-            match EnvMap::from_hdr(resolved.to_string_lossy().as_ref()) {
+            match timed_texture(|| EnvMap::from_hdr(resolved.to_string_lossy().as_ref())) {
                 Ok(m) => Some(m.scaled(scale)),
                 Err(e) => {
                     warn(&format!("failed to load envmap '{}': {}; ignored", resolved.display(), e));
@@ -570,7 +599,7 @@ fn parse_shape(
                 }
             };
             let resolved = resolve_path(base_dir, filename);
-            match load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id) {
+            match timed_obj(|| load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id)) {
                 Ok(m) => if face_normals { m.into_flat() } else { m },
                 Err(e) => {
                     warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
@@ -646,7 +675,7 @@ fn parse_obj_with_mtl(
         }
     };
     let resolved = resolve_path(base_dir, filename);
-    let ObjGroups { mut mesh, mat_names, mtllibs } = match load_obj_groups(resolved.to_string_lossy().as_ref()) {
+    let ObjGroups { mut mesh, mat_names, mtllibs } = match timed_obj(|| load_obj_groups(resolved.to_string_lossy().as_ref())) {
         Ok(g) => g,
         Err(e) => {
             warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
@@ -739,7 +768,7 @@ fn load_mtl_texture(dir: &Path, rel: &str, textures: &mut Vec<Texture>, state: &
     if let Some(&cached) = state.tex_cache.get(&key) {
         return cached;
     }
-    let id = match Texture::load(key.to_string_lossy().as_ref(), true, Wrap::Repeat) {
+    let id = match timed_texture(|| Texture::load(key.to_string_lossy().as_ref(), true, Wrap::Repeat)) {
         Ok(t) => {
             textures.push(t);
             Some((textures.len() - 1) as TexId)
@@ -771,10 +800,10 @@ fn load_mtl_map(
     }
     let path = key.to_string_lossy();
     let map = match kind {
-        MapKind::Tangent => Texture::load(path.as_ref(), false, Wrap::Repeat)
+        MapKind::Tangent => timed_texture(|| Texture::load(path.as_ref(), false, Wrap::Repeat))
             .map(|tex| NormalMap::Tangent { tex, scale: 1.0 }),
         MapKind::Height => {
-            HeightMap::load(path.as_ref(), Wrap::Repeat).map(|map| NormalMap::Height { map, strength })
+            timed_texture(|| HeightMap::load(path.as_ref(), Wrap::Repeat)).map(|map| NormalMap::Height { map, strength })
         }
     };
     let id = match map {
@@ -798,7 +827,7 @@ fn load_mtl_mask(dir: &Path, rel: &str, state: &mut MtlState) -> Option<Arc<Alph
     if let Some(cached) = state.mask_cache.get(&key) {
         return cached.clone();
     }
-    let m = match AlphaMask::load(key.to_string_lossy().as_ref(), Wrap::Repeat) {
+    let m = match timed_texture(|| AlphaMask::load(key.to_string_lossy().as_ref(), Wrap::Repeat)) {
         Ok(m) => Some(Arc::new(m)),
         Err(e) => {
             warn(&format!("failed to load alpha mask '{}': {}; ignored", key.display(), e));
@@ -1046,7 +1075,7 @@ fn parse_texture(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> 
     let (resolved, wrap) = bitmap_source(el, base_dir)?;
     // 色テクスチャは sRGB。`raw=true` はデータテクスチャ（リニア）
     let srgb = !el.boolean_or("raw", false);
-    match Texture::load(resolved.to_string_lossy().as_ref(), srgb, wrap) {
+    match timed_texture(|| Texture::load(resolved.to_string_lossy().as_ref(), srgb, wrap)) {
         Ok(t) => {
             textures.push(t);
             Some((textures.len() - 1) as TexId)
@@ -1130,7 +1159,7 @@ fn parse_bsdf(
                     if !t.boolean_or("raw", true) {
                         warn("normalmap texture with raw=false: ignoring it and reading the map as linear (raw)");
                     }
-                    match Texture::load(path_s.as_ref(), false, wrap) {
+                    match timed_texture(|| Texture::load(path_s.as_ref(), false, wrap)) {
                         Ok(tex) => Some(NormalMap::Tangent { tex, scale: 1.0 }),
                         Err(e) => {
                             warn(&format!("failed to load normal map '{}': {}; ignored", path.display(), e));
@@ -1138,7 +1167,7 @@ fn parse_bsdf(
                         }
                     }
                 } else {
-                    match HeightMap::load(path_s.as_ref(), wrap) {
+                    match timed_texture(|| HeightMap::load(path_s.as_ref(), wrap)) {
                         Ok(map) => Some(NormalMap::Height { map, strength: el.float("scale").unwrap_or(1.0) }),
                         Err(e) => {
                             warn(&format!("failed to load height map '{}': {}; ignored", path.display(), e));
