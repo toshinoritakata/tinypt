@@ -143,14 +143,17 @@ pub fn radiance(
         if !mat.is_delta() {
             // NEE: Environment map
             if let Some(env_map) = env {
-                let occluded = |shadow: Ray| world.hit(shadow, 0.0, RAY_T_MAX).is_some();
+                // any-hit: 遮蔽の有無だけが要るので、最初に見つかった交差で打ち切る（最近接は不要）。
+                // 環境光には「除外すべき光源自身」が無いので skip は None
+                let occluded = |shadow: Ray| world.occluded(shadow, 0.0, RAY_T_MAX, None);
                 let contrib = nee_environment(occluded, env_map, &mat, path_throughput, &hit, n, ng, ray, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
             if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
                 let contrib = nee_area_light(
-                    |shadow: Ray, tmax: f64| world.hit(shadow, 0.0, tmax),
+                    // any-hit + 光源自身の除外（`(ls.inst_id, ls.prim_id)` に一致する交差は遮蔽と数えない）
+                    |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, Some((ls.inst_id, ls.prim_id))),
                     &mat, path_throughput, &hit, n, ng, ray, &ls,
                 );
                 accumulated_radiance = accumulated_radiance + contrib;
@@ -318,9 +321,11 @@ fn is_black(c: Color) -> bool {
 /// CDF で選択されたライトの表面上をサンプリングし、
 /// シャドウレイで遮蔽判定後、MIS 重みを適用して寄与を返す。
 ///
-/// `closest_hit(shadow, tmax)` はシャドウレイの最近接ヒット（通常は `world.hit`）。
+/// `occluded(shadow, tmax)` はシャドウレイの遮蔽判定（any-hit。通常は `world.occluded`）。
+/// 光源自身（同じプリミティブ）への交差は、呼び出し側があらかじめ除外して渡す前提
+/// （`World::occluded` の `skip` 引数。理由は下のコメント参照）。
 fn nee_area_light(
-    closest_hit: impl Fn(Ray, f64) -> Option<Hit>,
+    occluded: impl Fn(Ray, f64) -> bool,
     mat: &Material,
     path_throughput: Color,
     hit: &Hit,
@@ -353,21 +358,20 @@ fn nee_area_light(
 
     // シャドウレイ（PBRT の SpawnRayTo と同じ考え方）: 始点はシェーディング点の誤差の箱の外へ光源側に、
     // 終点は光源上の点の誤差の箱の外へシェーディング点側にずらし、その間の線分で遮蔽を調べる。
-    // 最近接ヒットが光源自身（同じプリミティブ）なら遮蔽ではない: 平面の三角形も、見える側の点を
-    // 狙った球も、自分自身でサンプル点を隠すことはない。この除外は保険ではなく**必須**: 球光源では、
+    // 光源自身（同じプリミティブ）への交差は遮蔽ではない: 平面の三角形も、見える側の点を狙った球も、
+    // 自分自身でサンプル点を隠すことはない。この除外は保険ではなく**必須**: 球光源では、
     // レイと球の交差の t の誤差上界が終点側のずらし量（光源点の p_error）を超えうるので、終点を箱の外へ
     // ずらしても光源面が線分の内側（t < 線分長）でヒットすることがある。除外を外すと、そのサンプルが
     // 遮蔽扱いになり、sample/default.xml で画像が約 6%（−6.1%）暗くなる（verify_batch3c で計測）。
+    // any-hit 化した現在は `occluded` の呼び出し側（`World::occluded` の `skip` 引数）がこの除外を担う。
     let from = offset_ray_origin(hit.p, hit.p_error, hit.ng, to_light);
     let to = offset_ray_origin(ls.position, ls.p_error, ls.normal, from - ls.position);
     let seg = to - from;
     let seg_len = seg.len();
     if seg_len > 0.0 {
         let shadow = Ray { o: from, d: seg / seg_len, time: ray.time };
-        if let Some(h) = closest_hit(shadow, seg_len) {
-            if !ls.is_light_itself(&h) {
-                return Color::new(0.0, 0.0, 0.0);
-            }
+        if occluded(shadow, seg_len) {
+            return Color::new(0.0, 0.0, 0.0);
         }
     }
 
@@ -480,7 +484,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
         assert!((c.luminance() - FIREFLY_CLAMP).abs() < 1e-9, "luminance = {}", c.luminance());
         assert!((c.r() / c.g() - 2.0).abs() < 1e-9);
     }
@@ -499,7 +503,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
         let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), Vec3::new(0.0, 1.0, 0.0), n);
         let expected = f.r() * mis_weight(1.0, pdf_bsdf);
         assert!((c.r() - expected).abs() < 1e-12, "{} vs {}", c.r(), expected);
@@ -702,7 +706,7 @@ mod tests {
         };
         let seen: Cell<Option<Vec3>> = Cell::new(None);
         let c = nee_area_light(
-            |shadow: Ray, _| { seen.set(Some(shadow.o)); None },
+            |shadow: Ray, _| { seen.set(Some(shadow.o)); false },
             &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls,
         );
         assert!(c.luminance() > 0.0, "この配置では寄与が出るはず");
@@ -767,7 +771,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls);
         assert!(is_black(c), "幾何的に裏側の光源から寄与が漏れている: {:?}", (c.r(), c.g(), c.b()));
 
         // 環境 NEE も同じ: ng の裏半球だけが光る環境にすると寄与は 0 になる
@@ -789,7 +793,7 @@ mod tests {
 
         // ガードの本丸: 裏向きの方向だけを明示的に渡す面光源の方は必ず 0
         let ls_back = LightSample { position: hit.p + Vec3::new(0.2, 0.0, -1.0), ..ls };
-        let c2 = nee_area_light(|_, _| None, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls_back);
+        let c2 = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls_back);
         assert!(is_black(c2), "真裏の光源から寄与が漏れている");
     }
 

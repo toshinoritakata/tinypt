@@ -163,6 +163,20 @@ impl Mesh {
         Some(h)
     }
 
+    /// メッシュ内三角形に対する遮蔽判定（オブジェクト空間、any-hit）。`skip_prim` はこのメッシュ内の
+    /// 三角形番号で、サンプルした光源自身がこのメッシュにある場合に渡す（一致する交差は遮蔽と数えず
+    /// 探索を続ける。アルファ透明と同じ「棄却して継続」の仕組みに乗せる）。シェーディング法線・UV は
+    /// 解決しない（遮蔽の有無にしか使わないので無駄な計算を省く）。
+    pub fn occluded(&self, r: Ray, tmin: f64, tmax: f64, skip_prim: Option<usize>) -> Option<Hit> {
+        if self.masks.is_empty() {
+            self.bvh.any_hit_filtered(&self.tris, r, tmin, tmax, |ti, _, _| Some(ti) != skip_prim)
+        } else {
+            self.bvh.any_hit_filtered(&self.tris, r, tmin, tmax, |ti, u, v| {
+                Some(ti) != skip_prim && self.alpha_opaque(ti, u, v)
+            })
+        }
+    }
+
     /// 三角形 `tri_id` の ∂p/∂u, ∂p/∂v（オブジェクト空間、正規化しない）。`time` は交差判定と同じく
     /// シャッター時刻で、辺 `e1`/`e2` を `time` で補間して使う（交差点と接空間が別時刻の幾何にならない）。
     ///
@@ -516,6 +530,75 @@ impl World {
         }
 
         best
+    }
+
+    /// シャドウレイの遮蔽判定（any-hit）。`hit` と違い「最近接」ではなく「(tmin, tmax) に採用できる
+    /// 交差が 1 つでもあるか」だけを返す。見つかり次第、残りのインスタンス・球は調べずに打ち切る。
+    ///
+    /// `skip` はサンプルした光源自身（`(inst_id, prim_id)`、`Hit`/`LightSample` と同じ規約）。
+    /// これに一致する交差は遮蔽と数えず探索を続ける（球光源では交差の t の誤差上界が終点側の
+    /// ずらし量を超えうるので、光源自身への交差が `(tmin, tmax)` 内に来ることがある。この除外は
+    /// 保険ではなく必須 — 外すと `sample/default.xml` で光が約 6% 失われる。§`nee_area_light` 参照）。
+    /// 環境光 NEE のように除外すべき光源が無い場合は `None` を渡す。
+    ///
+    /// インスタンスの物体空間変換・tmin 写像・自己交差時の再探索・誤差上界は [`World::hit`] と同じ
+    /// 規律に従う（水密交差・スケール不変を壊さない）。アルファマスクの透明判定は [`Mesh::occluded`] に
+    /// 委譲する。
+    pub fn occluded(&self, r: Ray, tmin: f64, tmax: f64, skip: Option<(Option<usize>, usize)>) -> bool {
+        let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
+        for (inst_id, inst) in self.instances.iter().enumerate() {
+            let mesh = match self.meshes.get(inst.mesh_id) {
+                Some(m) => m,
+                None => continue,
+            };
+            if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), tmax * (1.0 + 1e-9)) {
+                continue;
+            }
+            // このインスタンスが光源自身を含むなら、そのメッシュ内三角形番号を渡して除外する
+            let skip_prim = match skip {
+                Some((Some(light_inst), prim)) if light_inst == inst_id => Some(prim),
+                _ => None,
+            };
+
+            let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
+            let d_obj_raw = inst.xform.apply_vec_inv(r.d);
+            let d_len = d_obj_raw.len().max(1e-30);
+            let d_obj = d_obj_raw / d_len;
+            let dt = d_obj.l1() * o_err;
+            let r_obj = Ray { o: o_obj + d_obj * dt, d: d_obj, time: r.time };
+
+            // `World::hit` と同じ理由でどちらの端も相対 1e-9 だけ外側に広げる（採否はワールド空間 t が決める）。
+            // `tmax` は `closest` のように縮めない（any-hit なので他インスタンスの結果と比べる必要が無い）。
+            let tmin_obj = tmin * d_len * (1.0 - 1e-9);
+            let tmax_obj = tmax * d_len * (1.0 + 1e-9);
+
+            let mut search_from = tmin_obj;
+            for _ in 0..=INSTANCE_RETRY_LIMIT {
+                let Some(h_obj) = mesh.occluded(r_obj, search_from, tmax_obj, skip_prim) else { break };
+                let (p_world, _) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
+                let t_world = (p_world - r.o).dot(r.d);
+                if t_world <= tmin {
+                    search_from = h_obj.t.next_up();
+                    continue;
+                }
+                if t_world < tmax {
+                    return true;
+                }
+                break;
+            }
+        }
+
+        // Spheres
+        for (idx, s) in self.spheres.iter().enumerate() {
+            if skip == Some((None, idx)) {
+                continue;
+            }
+            if s.hit(r, tmin, tmax).is_some() {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// ヒット点のワールド空間の接ベクトル対 (∂p/∂u, ∂p/∂v)（長さを保つ = 正規化しない）。
@@ -1054,6 +1137,231 @@ mod tests {
             let h = world.hit(r, 0.0, 1e30).unwrap();
             assert_eq!(h.mat_id == 0, expect_plate, "mask={}", v);
         }
+    }
+
+    // ---- PERF-1: シャドウレイの any-hit 化（`World::occluded`） ----
+
+    /// `World::occluded` は `tmax` を守る（`tmax` を超えて存在する遮蔽物を遮蔽と数えない）。
+    /// 1 つのメッシュに、真の tmax 内にある遮蔽物（近い三角形）と、tmax の外にある別の遮蔽物
+    /// （遠い三角形、配列の先頭に置いて any-hit の探索順で先に見つかりやすくしてある）を同居させる。
+    /// `tmax` を無視して探すと、遠い三角形を先に見つけて「範囲外だから」と探索を打ち切ってしまい、
+    /// 本来見つかるはずの近い三角形を取りこぼして「遮蔽なし」と誤判定しうる。
+    #[test]
+    fn occluded_respects_tmax_even_when_a_farther_triangle_is_probed_first() {
+        let far = Triangle::new_static(Vec3::new(-1.0, -1.0, 10.0), Vec3::new(1.0, -1.0, 10.0), Vec3::new(0.0, 1.0, 10.0), 0);
+        let near = Triangle::new_static(Vec3::new(-1.0, -1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(0.0, 1.0, 1.0), 0);
+        let mut world = World::new();
+        // far を先に入れる（1 リーフに収まる三角形数なので、探索順に影響しうる）
+        world.add_mesh_instance(vec![far, near], Transform::identity(), None);
+        let ray = Ray { o: Vec3::new(0.0, 0.0, 0.0), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        // tmax=2: near（t=1）は範囲内、far（t=10）は範囲外
+        assert!(world.occluded(ray, 0.0, 2.0, None), "範囲内の近い三角形を遮蔽として見つけられるはず");
+        // tmax=0.5: どちらも範囲外
+        assert!(!world.occluded(ray, 0.0, 0.5, None), "どちらも範囲外なら遮蔽なしのはず");
+        // 対照: tmax=20 なら両方範囲内（当然遮蔽）
+        assert!(world.occluded(ray, 0.0, 20.0, None));
+    }
+
+    /// `World::occluded` の `tmin` 境界（`t_world <= tmin` で自己交差とみなして再探索する規律）と、
+    /// 再探索ループ（インスタンスの近い面が帯の中で棄却されたとき、奥の面を諦めずに探す）が、
+    /// `World::hit` と同じく効いていることを確認する（PERF-1 追補: check がこの領域の穴を発見）。
+    ///
+    /// `s=1`（恒等に近い変換）にして、手前の板のワールド距離がちょうど `tmin` になるようレイ原点を
+    /// 置く。正しい実装なら「ちょうど `tmin`」は自己交差とみなして棄却・再探索し、奥の板（t≈1+tmin）
+    /// を見つける。`tmax` を奥の板より手前に絞れば、手前の板を遮蔽物と誤認しない限り「遮蔽なし」になる
+    /// はず — これが `<=`→`<` の境界緩和（手前の板を誤って採用してしまう）を検出する。
+    /// `tmax` を奥の板まで届く値にすれば「遮蔽あり」になるはずで、これが再探索ループの欠落
+    /// （奥の板を探しにいかない）を検出する。
+    #[test]
+    fn occluded_treats_exact_tmin_as_self_intersection_and_retries_for_the_far_plate() {
+        let tmin = 1e-4;
+        let world = two_plates_world(1.0, 1.0);
+        let r = Ray { o: Vec3::new(0.3, -0.2, -tmin), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        // 前提: 手前の板のワールド距離がちょうど tmin であること（境界値のすり替えを検出するための土台）
+        let h = world.hit(r, 0.0, 1e30).expect("near plate must be hittable without a tmin floor");
+        assert_eq!(h.t.to_bits(), tmin.to_bits(), "test setup: near-plate t must equal tmin exactly");
+
+        // 手前の板だけが範囲内（tmax=0.5 < 奥の板の t≈1）でも、手前の板はちょうど tmin なので
+        // 自己交差とみなし、遮蔽物として数えてはいけない
+        assert!(
+            !world.occluded(r, tmin, 0.5, None),
+            "ちょうど tmin の手前の板を遮蔽物として採用してしまった（tmin 境界の緩和を検出）"
+        );
+        // tmax を奥の板まで伸ばせば、再探索で見つかって遮蔽ありになるはず
+        assert!(
+            world.occluded(r, tmin, 2.0, None),
+            "再探索で奥の板を見つけられなかった（再探索ループの欠落を検出）"
+        );
+    }
+
+    /// 再探索の上限回数（`INSTANCE_RETRY_LIMIT`）に達しても無限ループせず、諦めて「遮蔽なし」を返す
+    /// （`World::hit` の `retry_limit_terminates_on_many_faces_inside_tmin_band` と同じ状況を
+    /// `occluded` でも確認する）。
+    #[test]
+    fn occluded_terminates_when_the_retry_limit_is_reached() {
+        let tmin = 1e-4;
+        let quad = |z: f64| {
+            vec![
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, -1.0, z), Vec3::new(1.0, 1.0, z), 0),
+                Triangle::new_static(Vec3::new(-1.0, -1.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(-1.0, 1.0, z), 0),
+            ]
+        };
+        let mut world = World::new();
+        let mut tris = Vec::new();
+        for k in 0..20 {
+            tris.extend(quad(k as f64 * 1e-12));
+        }
+        tris.extend(quad(0.5));
+        world.add_mesh_instance(tris, Transform::identity(), None);
+        let r = Ray { o: Vec3::new(0.1, 0.1, -tmin * (1.0 - 1e-6)), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        // 終了すること自体が要件（タイムアウトしないこと）。tmax を極端に大きくしても壊れない
+        let _ = world.occluded(r, tmin, 1e30, None);
+    }
+
+    /// `World::occluded` は `tmax` の境界でも `World::hit` と同じ規約（`t_world < closest` 相当。
+    /// ちょうど `tmax` の面は範囲外）に従う。
+    #[test]
+    fn occluded_excludes_a_surface_exactly_at_tmax() {
+        let world = two_plates_world(1.0, 1.0);
+        let r = Ray { o: Vec3::new(0.3, -0.2, -0.5), d: Vec3::new(0.0, 0.0, 1.0), time: 0.0 };
+        // 手前の板までの距離はちょうど 0.5
+        let h = world.hit(r, 0.0, 1e30).expect("hit");
+        assert_eq!(h.t, 0.5);
+        assert!(!world.occluded(r, 0.0, 0.5, None), "ちょうど tmax の面は範囲外のはず（World::hit と同じ規約）");
+        assert!(world.occluded(r, 0.0, 0.5 + 1e-9, None), "tmax をわずかに超えれば範囲内のはず");
+    }
+
+    /// `World::occluded` は「解決済みの `skip` に一致する三角形だけ」を除外し、アルファ不透明な三角形は
+    /// `skip` の有無に関わらず遮蔽として扱う（除外条件の取り違えが無いことの確認）。
+    #[test]
+    fn occluded_skip_and_alpha_combine_correctly() {
+        let world = masked_plate_world([255, 0]);
+        let opaque_ray = Ray { o: Vec3::new(0.1, 0.5, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        let h = world.hit(opaque_ray, 0.0, 1e30).expect("hit");
+        // skip は「指定した三角形番号だけ」を除外する。板は 2 枚の三角形でできているので、
+        // 当たっていない方（prim_id が違う方）を指定しても、当たった三角形はまだ遮蔽扱いのはず
+        let other_prim = 1 - h.prim_id;
+        assert!(
+            world.occluded(opaque_ray, 0.0, 2.9, Some((h.inst_id, other_prim))),
+            "当たっていない三角形を skip しても不透明側はまだ遮蔽するはず"
+        );
+        // 当たった三角形そのものを skip すれば、遮蔽されない
+        assert!(!world.occluded(opaque_ray, 0.0, 2.9, Some((h.inst_id, h.prim_id))), "skip した三角形自身は遮蔽しないはず");
+    }
+
+    /// `World::occluded` は `World::hit(...).is_some()` と常に一致する（遮蔽の有無について。
+    /// アルファマスク付きの板で、不透明部分は遮蔽・透明部分は素通しになることを any-hit 経路でも確認する）。
+    #[test]
+    fn occluded_agrees_with_hit_through_alpha_mask() {
+        let world = masked_plate_world([255, 0]);
+        let down = |x: f64, y: f64| Ray { o: Vec3::new(x, y, 2.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        // 不透明側: 板で遮蔽される（奥の床 t=3 より手前）
+        assert!(world.occluded(down(0.1, 0.5), 0.0, 2.9, None), "不透明部分は遮蔽するはず");
+        assert_eq!(world.occluded(down(0.1, 0.5), 0.0, 2.9, None), world.hit(down(0.1, 0.5), 0.0, 2.9).is_some());
+        // 透明側: 板は素通しで、奥の床（t=3）より手前の tmax=2.9 では何にも当たらない
+        assert!(!world.occluded(down(0.9, 0.5), 0.0, 2.9, None), "透明部分は遮蔽しないはず");
+        assert_eq!(world.occluded(down(0.9, 0.5), 0.0, 2.9, None), world.hit(down(0.9, 0.5), 0.0, 2.9).is_some());
+        // 透明側でも、奥の床まで届く tmax なら床で遮蔽される
+        assert!(world.occluded(down(0.9, 0.5), 0.0, 3.5, None), "奥の床までは届くはず");
+    }
+
+    /// 光源自身（三角形光源）への交差は `World::occluded` の `skip` で遮蔽と数えない。
+    /// ランダムサンプリングでの再現（元の `shadow_ray_does_not_self_hit_sampled_light` と同じ配置）に加え、
+    /// 光源面をわざと突き抜ける tmax を渡して「必ず光源自身に当たる」状況を作り、`skip` の有無で
+    /// 結果が変わることを直接確認する（除外を外すミューテーションで確実に落ちる）。
+    #[test]
+    fn occluded_excludes_the_sampled_light_itself() {
+        use crate::transform::Transform;
+        let mut world = World::new();
+        let m = |x: f64, z: f64| Vec3::new(0.35 * x, 1.98, 0.35 * z);
+        let tris = vec![
+            Triangle::new_static(m(-1.0, -1.0), m(1.0, -1.0), m(1.0, 1.0), 0),
+            Triangle::new_static(m(-1.0, -1.0), m(1.0, 1.0), m(-1.0, 1.0), 0),
+        ];
+        let inst_id = world.add_mesh_instance(tris, Transform::identity(), None);
+        let mats = vec![Material::DiffuseLight { emit: Color::new(4.6, 3.9, 2.0) }];
+        world.build_lights(&mats);
+
+        let mut rng = Rng::new(123);
+        let p = Vec3::new(0.0, 1.4, -1.0);
+        let mut sampled = 0;
+        for _ in 0..2000 {
+            if let Some(ls) = world.sample_light(&mut rng, 0.0, p) {
+                sampled += 1;
+                let to = crate::geometry::offset_ray_origin(ls.position, ls.p_error, ls.normal, p - ls.position);
+                let seg = to - p;
+                let ray = Ray { o: p, d: seg / seg.len(), time: 0.0 };
+                assert!(
+                    !world.occluded(ray, 0.0, seg.len(), Some((ls.inst_id, ls.prim_id))),
+                    "光源自身を遮蔽と数えてしまった"
+                );
+                assert_eq!(ls.inst_id, Some(inst_id));
+            }
+        }
+        assert!(sampled > 0, "no light samples drawn");
+
+        // 光源面を確実に突き抜ける tmax（真の距離 + 大きめの余白）で、必ず光源自身に当たる状況を作る
+        let ls = world.sample_light(&mut rng, 0.0, p).expect("light sample");
+        let to_light = ls.position - p;
+        let dist = to_light.len();
+        let ray = Ray { o: p, d: to_light / dist, time: 0.0 };
+        assert!(!world.occluded(ray, 0.0, dist + 0.5, Some((ls.inst_id, ls.prim_id))), "skip 付きなら光源自身は遮蔽ではない");
+        assert!(world.occluded(ray, 0.0, dist + 0.5, None), "skip 無しなら光源自身への交差も遮蔽扱いのはず（比較用）");
+    }
+
+    /// 光源自身への交差の除外は球光源でも効く（`inst_id = None`）。`default.xml` 実測（S3）で、
+    /// この除外を外すと画像が約 6% 暗くなったのと同じ配置（床の真上の球光源）で確認する。
+    /// ランダムサンプリングに加え、球面を確実に突き抜ける tmax で「必ず光源自身に当たる」状況も直接確認する
+    /// （除外を外すミューテーションで確実に落ちる）。
+    #[test]
+    fn occluded_excludes_the_sampled_sphere_light_itself() {
+        let mut world = World::new();
+        let light_idx = 0usize;
+        world.spheres.push(Sphere { c: Vec3::new(0.0, 3.0, 0.0), r: 1.0, mat_id: 0 });
+        // 床（大きな四角形、光源の真下）
+        let f = |x: f64, z: f64| Vec3::new(x, 0.0, z);
+        world.add_mesh_instance(
+            vec![
+                Triangle::new_static(f(-5.0, -5.0), f(5.0, -5.0), f(5.0, 5.0), 1),
+                Triangle::new_static(f(-5.0, -5.0), f(5.0, 5.0), f(-5.0, 5.0), 1),
+            ],
+            Transform::identity(),
+            None,
+        );
+        let mats = vec![Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) }, Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        world.build_lights(&mats);
+
+        let mut rng = Rng::new(9);
+        let p = Vec3::new(0.0, 0.0, 0.0);
+        let mut sampled = 0;
+        let mut last_ls = None;
+        for _ in 0..2000 {
+            if let Some(ls) = world.sample_light(&mut rng, 0.0, p) {
+                if !ls.visible {
+                    continue;
+                }
+                sampled += 1;
+                assert_eq!(ls.inst_id, None);
+                assert_eq!(ls.prim_id, light_idx);
+                let to = crate::geometry::offset_ray_origin(ls.position, ls.p_error, ls.normal, p - ls.position);
+                let seg = to - p;
+                let ray = Ray { o: p, d: seg / seg.len(), time: 0.0 };
+                assert!(
+                    !world.occluded(ray, 0.0, seg.len(), Some((ls.inst_id, ls.prim_id))),
+                    "球光源自身を遮蔽と数えてしまった"
+                );
+                last_ls = Some(ls);
+            }
+        }
+        assert!(sampled > 0, "no light samples drawn");
+
+        // 球面を確実に突き抜ける tmax で、必ず光源自身に当たる状況を作る
+        let ls = last_ls.expect("at least one visible sample");
+        let to_light = ls.position - p;
+        let dist = to_light.len();
+        let ray = Ray { o: p, d: to_light / dist, time: 0.0 };
+        assert!(!world.occluded(ray, 0.0, dist + 0.5, Some((ls.inst_id, ls.prim_id))), "skip 付きなら球光源自身は遮蔽ではない");
+        assert!(world.occluded(ray, 0.0, dist + 0.5, None), "skip 無しなら球光源自身への交差も遮蔽扱いのはず（比較用）");
     }
 
     fn emissive_sphere_world(c: Vec3, r: f64) -> World {

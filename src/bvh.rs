@@ -360,6 +360,123 @@ impl Bvh {
             h
         })
     }
+
+    /// `hit_filtered` の any-hit 版（シャドウレイ専用）: 採用できる交差が 1 つ見つかった時点で
+    /// 探索を打ち切り、その交差を返す（**最近接である保証はない**。遮蔽の有無だけが要る呼び出し側でのみ使うこと）。
+    ///
+    /// 区間 `(tmin, tmax)` は最後まで縮めない（採用しない候補があっても同じ区間で探し続けるのは
+    /// `hit_filtered` と同じで、アルファ透明の扱いと自己交差回避はそのまま）。子ノードは近い方から
+    /// 押す（`hit_filtered` と同じ順）が、any-hit では正しさに影響しない（見つかり次第即座に返すため）。
+    /// 平均的には近い方から見つかりやすく、無駄なノード訪問を減らせる。
+    #[inline(always)]
+    pub fn any_hit_filtered<F: Fn(usize, f64, f64) -> bool>(
+        &self,
+        tris: &[Triangle],
+        r: Ray,
+        tmin: f64,
+        tmax: f64,
+        accept: F,
+    ) -> Option<Hit> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+
+        let inv = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
+
+        let mut stack_buf = [0i32; 64];
+        let mut sp = 0usize;
+        stack_buf[sp] = 0;
+        sp += 1;
+        let mut heap_stack: Vec<i32> = Vec::new();
+
+        macro_rules! push_id {
+            ($id:expr) => {{
+                let id = $id;
+                if heap_stack.is_empty() {
+                    if sp < stack_buf.len() {
+                        stack_buf[sp] = id;
+                        sp += 1;
+                    } else {
+                        heap_stack = stack_buf[..sp].to_vec();
+                        heap_stack.push(id);
+                    }
+                } else {
+                    heap_stack.push(id);
+                }
+            }};
+        }
+
+        loop {
+            let nid = if heap_stack.is_empty() {
+                if sp == 0 {
+                    return None;
+                }
+                sp -= 1;
+                stack_buf[sp]
+            } else {
+                match heap_stack.pop() {
+                    Some(v) => v,
+                    None => return None,
+                }
+            };
+            let n = &self.nodes[nid as usize];
+            if !n.bbox.hit_inv(r, inv, tmin, tmax) {
+                continue;
+            }
+
+            if n.left == -1 && n.right == -1 {
+                let start = n.start as usize;
+                let end = start + n.count as usize;
+                for &ti in &self.indices[start..end] {
+                    if let Some((t, u, v)) = tris[ti].intersect(r, tmin, tmax) {
+                        if !accept(ti, u, v) {
+                            continue;
+                        }
+                        let mut h = tris[ti].hit_at(r, t, u, v);
+                        h.prim_id = ti;
+                        return Some(h);
+                    }
+                }
+            } else {
+                let a_id = n.left;
+                let b_id = n.right;
+
+                if a_id == -1 {
+                    if b_id != -1 { push_id!(b_id); }
+                    continue;
+                }
+                if b_id == -1 {
+                    push_id!(a_id);
+                    continue;
+                }
+
+                let a = &self.nodes[a_id as usize];
+                let b = &self.nodes[b_id as usize];
+
+                let a_hit = a.bbox.hit_range_inv(r, inv, tmin, tmax);
+                let b_hit = b.bbox.hit_range_inv(r, inv, tmin, tmax);
+
+                match (a_hit, b_hit) {
+                    (Some((a_t0, _)), Some((b_t0, _))) => {
+                        if a_t0 <= b_t0 {
+                            push_id!(b_id);
+                            push_id!(a_id);
+                        } else {
+                            push_id!(a_id);
+                            push_id!(b_id);
+                        }
+                    }
+                    (Some(_), None) => {
+                        push_id!(a_id);
+                    }
+                    (None, Some(_)) => {
+                        push_id!(b_id);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +518,28 @@ mod tests {
                 let a = bvh.hit(&tris, r, 1e-4, 1e30).map(|h| h.t);
                 let b = brute_force(&tris, r, 1e-4, 1e30);
                 assert_eq!(a, b, "n={}", n);
+            }
+        }
+    }
+
+    /// `any_hit_filtered` の「交差の有無」は `hit_filtered`（最近接探索）と常に一致する
+    /// （総当たりのランダムシーン・レイで比較。`accept` は毎回同じ判定関数を渡すので、
+    /// 採否そのものではなく「どこかに採用できる交差があるか」の一致だけを見る）。
+    #[test]
+    fn any_hit_existence_matches_nearest_hit_existence() {
+        let mut rng = Rng::new(777);
+        for &n in &[1usize, 5, 12, 16, 40, 500] {
+            let tris = random_tris(n, &mut rng);
+            let bvh = Bvh::build(&tris);
+            for _ in 0..500 {
+                let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
+                let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
+                let r = Ray { o, d: (target - o).norm(), time: 0.0 };
+                // 三角形番号が偶数のものだけ採用する（アルファ透明の棄却を模した accept）
+                let accept = |ti: usize, _u: f64, _v: f64| ti % 2 == 0;
+                let nearest = bvh.hit_filtered(&tris, r, 1e-4, 1e30, accept).is_some();
+                let any = bvh.any_hit_filtered(&tris, r, 1e-4, 1e30, accept).is_some();
+                assert_eq!(any, nearest, "n={}: any_hit_filtered と hit_filtered の存在判定が食い違った", n);
             }
         }
     }
