@@ -2,6 +2,20 @@
 
 Rust 製のモンテカルロパストレーサー。
 
+## ギャラリー
+
+<table>
+<tr>
+<td width="34%"><a href="sample/sponza_textured.xml"><img src="docs/images/showcase_sponza_textured.png" alt="Sponza (textured)"></a><br>Crytek Sponza (262,267 三角形、テクスチャ + アルファマスク + バンプマップ)。512spp、1200x675、10 コア、デノイズあり、19 分 39 秒。<a href="sample/sponza_textured.xml"><code>sample/sponza_textured.xml</code></a></td>
+<td width="33%"><a href="sample/default.xml"><img src="docs/images/showcase_default.png" alt="default.xml"></a><br>組み込みマテリアルサンプル (拡散・金属・GGX・ガラス)。2048spp、1200x675、10 コア、デノイズあり、1 分 30 秒。<a href="sample/default.xml"><code>sample/default.xml</code></a></td>
+<td width="33%"><a href="sample/rungholt.xml"><img src="docs/images/showcase_rungholt.png" alt="Rungholt"></a><br>Rungholt (6,704,264 三角形)。512spp、1200x675、10 コア、デノイズあり、4 分 06 秒。<a href="sample/rungholt.xml"><code>sample/rungholt.xml</code></a></td>
+</tr>
+</table>
+
+Sponza と Rungholt は外部モデル ([取得方法](#外部ベンチマークモデル-sponza--rungholt))。
+出典: Morgan McGuire, *Computer Graphics Archive*, July 2017 (<https://casual-effects.com/data>)。
+Sponza Atrium は CC BY 3.0 / © 2010 Frank Meinl, Crytek。Rungholt は CC BY 3.0 / © kescha。
+
 ## 特徴
 
 - **BVH 加速構造** (SAH) による高速レイ-ジオメトリ交差判定
