@@ -706,7 +706,23 @@ impl World {
 
     /// CDF を使ってライトを重点的にサンプリングし、位置・法線・放射輝度・PDF を返す。
     /// PDF は立体角ベース（面積 PDF をジオメトリ変換で立体角に変換）。
+    ///
+    /// 光源面上の点を選ぶ 2 次元乱数は `rng` から引く（層化なし）。乱数消費順は
+    /// 「光源の選択 → 面上の点」で、[`Self::sample_light_with_uv`]（`uv_override: None`）と
+    /// ビット単位で同じ結果になる。
     pub fn sample_light(&self, rng: &mut Rng, time: f64, p: Vec3) -> Option<LightSample> {
+        self.sample_light_impl(rng, time, p, None)
+    }
+
+    /// [`Self::sample_light`] の、光源面上の点を選ぶ 2 次元乱数 `uv` を外から指定できる版
+    /// （PERF-3: 層化サンプリング用）。**光源の選択**（複数の発光体があるときにどれを狙うか）は
+    /// 引き続き `rng` から引く — 層化するのは「選んだ光源の面上のどこを狙うか」だけ
+    /// （Sponza のように光源が 1 つで小さいシーンで効くのはこちらのため）。
+    pub fn sample_light_with_uv(&self, rng: &mut Rng, time: f64, p: Vec3, uv: (f64, f64)) -> Option<LightSample> {
+        self.sample_light_impl(rng, time, p, Some(uv))
+    }
+
+    fn sample_light_impl(&self, rng: &mut Rng, time: f64, p: Vec3, uv_override: Option<(f64, f64)>) -> Option<LightSample> {
         if self.light_total <= 0.0 || self.lights.is_empty() {
             return None;
         }
@@ -714,10 +730,13 @@ impl World {
         let idx = cdf_search(&self.light_cdf, r).min(self.lights.len().saturating_sub(1));
         let info = self.lights[idx];
         let pdf_select = info.weight / self.light_total;
+        // 層化なし（`uv_override` が None）のときは、元の実装と同じ順で rng から引く
+        // （「選択 → 面上の点」）ので、`sample_light` はビット単位で従来どおりの挙動になる。
+        let uv = uv_override.unwrap_or_else(|| (rng.next_f64(), rng.next_f64()));
 
         // シェープ別のサンプリングと PDF は Light に委譲する。PDF は light_pdf と同じ関数で
         // 求めるので、BSDF サンプリング側の MIS 重みと常に一致する。
-        let (pos, normal) = info.light.sample(self, time, p, rng)?;
+        let (pos, normal) = info.light.sample(self, time, p, uv)?;
         let pdf = pdf_select * info.light.pdf_omega(self, time, p, pos, normal);
         if !(pdf > 0.0 && pdf.is_finite()) {
             return None;
@@ -781,12 +800,13 @@ impl Light {
     /// - 球: `from` が球の外なら、`from` から見える円錐（立体角）を一様サンプリングする。
     ///   球の内部（境界を含む）・表面すれすれの外部なら表面積一様サンプリングにフォールバックする。
     /// - 三角形: 表面積一様サンプリング。
-    fn sample(&self, world: &World, time: f64, from: Vec3, rng: &mut Rng) -> Option<(Vec3, Vec3)> {
+    /// `uv` は面上の点を選ぶ 2 次元乱数（各成分 [0,1)）。層化サンプリング（PERF-3）で外から
+    /// 指定できるよう、乱数生成器そのものではなく既に引いた値を受け取る形にしてある。
+    fn sample(&self, world: &World, time: f64, from: Vec3, uv: (f64, f64)) -> Option<(Vec3, Vec3)> {
+        let (u, v) = uv;
         match *self {
             Light::Sphere { idx } => {
                 let s = world.spheres.get(idx)?;
-                let u = rng.next_f64();
-                let v = rng.next_f64();
                 match sphere_cone(s, from) {
                     Some(cone) => {
                         // 球の円錐サンプリング（PBRT v4 と同じ幾何）。cosθ を [cosθmax, 1] で一様に取る。
@@ -815,8 +835,6 @@ impl Light {
             }
             Light::Triangle { mesh_id, tri_id, inst_id } => {
                 let (v0w, v1w, v2w) = tri_world_verts(world, mesh_id, tri_id, inst_id, time)?;
-                let u = rng.next_f64();
-                let v = rng.next_f64();
                 let su = u.sqrt();
                 let b0 = 1.0 - su;
                 let b1 = v * su;

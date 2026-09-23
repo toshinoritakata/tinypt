@@ -42,6 +42,32 @@ fn background(d: Vec3, env: Option<&EnvMap>) -> Color {
     }
 }
 
+/// PERF-3: 層化サンプリングの文脈。1 ピクセルの `spp` 本のサンプルのうち、いま何番目かを
+/// 「層番号」として伝える。**最初のバウンス（`bounce == 0`）の NEE 面光源サンプリングだけ**が
+/// これを使う（Sponza のように光源が小さく NEE 主体のシーンで効くのはここで、深いバウンスまで
+/// 層化しても複雑さに見合わないため。README／レポート参照）。
+#[derive(Clone, Copy)]
+pub struct Strata {
+    /// このサンプルの層番号（0 起点。ピクセルごとに乱択した回転を含む — 適応的サンプリングが
+    /// 途中で打ち切っても、常に同じ部分格子だけが選ばれて偏らないようにするため）。
+    pub stratum: usize,
+    /// 格子の横方向の層数
+    pub nx: usize,
+    /// 格子の縦方向の層数（`nx * ny >= spp` で、`spp` が `nx` の倍数でなければ余りが出る）
+    pub ny: usize,
+}
+
+impl Strata {
+    /// この層番号に対応する 2 次元乱数 [0,1)²（`rng` で層内をジッターする）。
+    fn uv(&self, rng: &mut Rng) -> (f64, f64) {
+        let cx = self.stratum % self.nx;
+        let cy = (self.stratum / self.nx) % self.ny;
+        let u = (cx as f64 + rng.next_f64()) / self.nx as f64;
+        let v = (cy as f64 + rng.next_f64()) / self.ny as f64;
+        (u, v)
+    }
+}
+
 /// パストレーシングのパラメータ（シーン/設定由来でランタイムに与える）。
 #[derive(Clone, Copy)]
 pub struct PathLimits {
@@ -73,6 +99,7 @@ pub fn radiance(
     ray: Ray,
     rng: &mut Rng,
     limits: PathLimits,
+    strata: Option<Strata>,
 ) -> Color {
     let mut accumulated_radiance = Color::new(0.0, 0.0, 0.0); // パス全体の蓄積放射輝度
     let mut path_throughput = Color::new(1.0, 1.0, 1.0);       // パスのスループット（減衰係数）
@@ -150,7 +177,16 @@ pub fn radiance(
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
-            if let Some(ls) = world.sample_light(rng, ray.time, hit.p) {
+            // 最初のバウンスだけ、層化した 2 次元乱数で光源面上の点を選ぶ（PERF-3）。
+            // 深いバウンスは従来どおり rng から直接引く（層化しない）
+            let ls = match (bounce, strata) {
+                (0, Some(s)) => {
+                    let uv = s.uv(rng);
+                    world.sample_light_with_uv(rng, ray.time, hit.p, uv)
+                }
+                _ => world.sample_light(rng, ray.time, hit.p),
+            };
+            if let Some(ls) = ls {
                 let contrib = nee_area_light(
                     // any-hit + 光源自身の除外（`(ls.inst_id, ls.prim_id)` に一致する交差は遮蔽と数えない）
                     |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, Some((ls.inst_id, ls.prim_id))),
@@ -530,7 +566,7 @@ mod tests {
         let mut rng = Rng::new(seed);
         let (mut s, mut s2) = (0.0, 0.0);
         for _ in 0..n {
-            let x = radiance(world, mats, &Surfaces::none(), Some(env), ray, &mut rng, limits).r();
+            let x = radiance(world, mats, &Surfaces::none(), Some(env), ray, &mut rng, limits, None).r();
             s += x;
             s2 += x * x;
         }
@@ -549,9 +585,9 @@ mod tests {
         let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
 
         let mut rng = Rng::new(1);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(0)).r(), 0.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(1)).r(), 4.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_floor, &mut rng, limits(1)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(0), None).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(1), None).r(), 4.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_floor, &mut rng, limits(1), None).r(), 0.0);
 
         let exact = 0.5 * 4.0 / 9.0;
         for max_depth in [2usize, 3, 8, usize::MAX] {
@@ -570,6 +606,32 @@ mod tests {
             let (mean, se) = estimate(&world, &mats, &env, to_floor, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 11);
             assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "rr_depth={}: {} ± {} vs exact {}", rr_depth, mean, se, exact);
         }
+    }
+
+    /// PERF-3: 最初のバウンスの NEE を層化（`Strata` 付き）しても、直接照明の理論値
+    /// （ρ·L/9）に不偏で収束する。256 層を順に一巡させながら呼ぶ（`render.rs` の
+    /// `sample_pixel` が層番号を割り当てる使い方の最小再現）。
+    #[test]
+    fn stratified_nee_is_unbiased_for_the_analytic_direct_lighting_value() {
+        let (world, mats, env) = floor_under_sphere_light();
+        let to_floor = Ray { o: Vec3::new(2.0, 1.0, 0.0), d: Vec3::new(-2.0, -1.0, 0.0).norm(), time: 0.0 };
+        let exact = 0.5 * 4.0 / 9.0;
+        let limits = PathLimits { max_depth: usize::MAX, rr_depth: 1000 };
+        let (nx, ny) = (16usize, 16usize);
+        let n_cells = nx * ny;
+
+        let mut rng = Rng::new(42);
+        let n = 200_000usize;
+        let (mut s, mut s2) = (0.0, 0.0);
+        for i in 0..n {
+            let strata = Strata { stratum: i % n_cells, nx, ny };
+            let x = radiance(&world, &mats, &Surfaces::none(), Some(&env), to_floor, &mut rng, limits, Some(strata)).r();
+            s += x;
+            s2 += x * x;
+        }
+        let mean = s / n as f64;
+        let se = ((s2 / n as f64 - mean * mean).max(0.0) / n as f64).sqrt();
+        assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "{} ± {} vs exact {}", mean, se, exact);
     }
 
     /// 生存確率は max(throughput)·η² を [0.05, 0.95] にクランプしたもの。
@@ -945,7 +1007,7 @@ mod tests {
             let (mut sum, n) = (0.0, 20_000);
             for _ in 0..n {
                 sum += radiance(&world, &mats, &Surfaces::textures_only(&textures), Some(&env), ray, &mut rng,
-                                PathLimits { max_depth: 2, rr_depth: 8 }).r();
+                                PathLimits { max_depth: 2, rr_depth: 8 }, None).r();
             }
             sum / n as f64
         };
@@ -1176,7 +1238,7 @@ mod map_tests {
         let n = 60_000;
         let mut sum = 0.0;
         for _ in 0..n {
-            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits).g();
+            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits, None).g();
         }
         let got = sum / n as f64;
 
@@ -1219,7 +1281,7 @@ mod map_tests {
             let mut rng = Rng::new(3);
             let mut sum = 0.0;
             for _ in 0..4000 {
-                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits).g();
+                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits, None).g();
             }
             sum
         };
@@ -1287,7 +1349,7 @@ mod map_tests {
         let limits = PathLimits { max_depth: 6, rr_depth: 8 };
         for _ in 0..20_000 {
             let d = crate::rng::uniform_sphere_dir(&mut rng);
-            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits);
+            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits, None);
             assert_eq!(c.r(), 0.0, "立方体の内側に光が漏れた");
         }
         std::fs::remove_dir_all(&dir).ok();
