@@ -289,11 +289,13 @@ fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderConfig)
 /// （`Cargo.toml` の既定ではなく実体。`--no-default-features` ビルドでは denoise が無効と出る）。
 fn build_info() -> String {
     let oidn = if cfg!(feature = "oidn") { "oidn (denoise)" } else { "no oidn (--denoise is a no-op)" };
+    // render revision はバージョンから導出される数値なので、バージョンと並べて 1 行にまとめる
+    // （同じバージョンなら同じ絵、という規約がそのまま読み取れるように）
     format!(
-        "tinypt {} — Monte Carlo path tracer\nFeatures: {}\nRender revision: {}\n",
+        "tinypt {} (render revision {}) — Monte Carlo path tracer\nFeatures: {}\n",
         env!("CARGO_PKG_VERSION"),
-        oidn,
         tinypt::constants::RENDER_REVISION,
+        oidn,
     )
 }
 

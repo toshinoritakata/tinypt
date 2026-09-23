@@ -75,15 +75,15 @@ impl Fnv64 {
 /// - width / height / spp / max_depth / rr_depth / seed
 /// - adaptive（有効フラグ・min_spp・threshold）
 /// - tile / morton（タスク ID の割り当てが変わるとレジューム位置が狂うため）
-/// - レンダラーのバージョン（`CARGO_PKG_VERSION`）と出力挙動のリビジョン
-///   （[`RENDER_REVISION`](crate::constants::RENDER_REVISION)）
+/// - 出力挙動のリビジョン（[`RENDER_REVISION`](crate::constants::RENDER_REVISION)）。
+///   これは `Cargo.toml` の `version` から一意に導出される値なので、バージョン文字列を
+///   別途混ぜる必要はない（同じ情報を二重に持つだけになる）。
 ///
 /// 出力パス・デノイズ・トーンマップ・露出・チェックポイント間隔は後処理か保存頻度にしか
 /// 影響しないので含めない。
 pub fn scene_hash(config: &RenderConfig) -> std::io::Result<u64> {
     let mut h = Fnv64::new();
     h.field(b"tinypt-scene-hash-v1");
-    h.field(env!("CARGO_PKG_VERSION").as_bytes());
     h.u64(crate::constants::RENDER_REVISION as u64);
     match &config.scene_path {
         Some(path) => {

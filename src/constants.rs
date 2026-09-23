@@ -3,12 +3,103 @@
 /// レイの最大距離（実質的に無限遠）。
 pub const RAY_T_MAX: f64 = 1e30;
 
-/// レンダラーの出力挙動のリビジョン。
+/// レンダラーの出力挙動のリビジョン。**クレートのバージョン（`Cargo.toml` の `version`、
+/// `major.minor.patch`）から一意に導出する**（`major*1_000_000 + minor*1_000 + patch`）。
+/// バージョンが唯一の情報源で、この定数はそれを数値にしただけ — 別に手で管理する値ではない。
 ///
 /// 同じシーン・設定でも蓄積バッファの中身が変わる変更（積分器・BSDF・サンプリング・
-/// 乱数列など）を入れたら 1 つ上げる。チェックポイントのシーンハッシュに混ぜ、
-/// 挙動の異なるビルドが書いたチェックポイントから再開しないようにする。
-pub const RENDER_REVISION: u32 = 16;
+/// 乱数列など）を入れたら、**`Cargo.toml` のパッチバージョンを上げる**こと。上げ忘れは
+/// `render::tests::golden_*` が（`RENDER_REVISION != GOLDEN_REVISION` として）検出する。
+/// チェックポイントのシーンハッシュに混ぜ、挙動の異なるビルドが書いたチェックポイントから
+/// 再開しないようにする（[`crate::checkpoint::scene_hash`]）。
+pub const RENDER_REVISION: u32 = revision_from_version(env!("CARGO_PKG_VERSION"));
+
+/// `"major.minor.patch"` 形式のバージョン文字列を `major*1_000_000 + minor*1_000 + patch` に変換する。
+/// `const fn` なのでコンパイル時に評価される（`RENDER_REVISION` の定義に使う）。
+///
+/// 数字と `.` 以外の文字（pre-release/build サフィックス `-beta.1` や `+build` など）、
+/// 3 つ組でない形式、各成分の桁あふれ（minor/patch は 1000 未満、全体は `u32` に収まる範囲）は
+/// **コンパイルエラー**にする（実行時に落ちるより早く気づけるように。`trybuild` 等は使わず、
+/// 呼び出し元の doc コメントで「不正な形式は const 評価でコンパイルが失敗する」ことを示すに留める）。
+const fn revision_from_version(v: &str) -> u32 {
+    let bytes = v.as_bytes();
+    let mut parts: [u64; 3] = [0, 0, 0];
+    let mut part_idx: usize = 0;
+    let mut has_digit = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'.' {
+            if !has_digit {
+                panic!("invalid CARGO_PKG_VERSION: empty version component");
+            }
+            part_idx += 1;
+            if part_idx > 2 {
+                panic!("invalid CARGO_PKG_VERSION: expected exactly 3 dot-separated components (major.minor.patch)");
+            }
+            has_digit = false;
+        } else if b.is_ascii_digit() {
+            has_digit = true;
+            let digit = (b - b'0') as u64;
+            let Some(mul) = parts[part_idx].checked_mul(10) else {
+                panic!("invalid CARGO_PKG_VERSION: version component overflow");
+            };
+            let Some(sum) = mul.checked_add(digit) else {
+                panic!("invalid CARGO_PKG_VERSION: version component overflow");
+            };
+            parts[part_idx] = sum;
+        } else {
+            panic!("invalid CARGO_PKG_VERSION: expected only digits and '.' (pre-release/build suffixes are not supported)");
+        }
+        i += 1;
+    }
+    if !has_digit || part_idx != 2 {
+        panic!("invalid CARGO_PKG_VERSION: expected exactly 3 dot-separated components (major.minor.patch)");
+    }
+    if parts[1] >= 1000 {
+        panic!("invalid CARGO_PKG_VERSION: minor version must be < 1000 (RENDER_REVISION encodes it as 3 digits)");
+    }
+    if parts[2] >= 1000 {
+        panic!("invalid CARGO_PKG_VERSION: patch version must be < 1000 (RENDER_REVISION encodes it as 3 digits)");
+    }
+    let combined = parts[0] * 1_000_000 + parts[1] * 1_000 + parts[2];
+    if combined > u32::MAX as u64 {
+        panic!("invalid CARGO_PKG_VERSION: major version too large to fit RENDER_REVISION (u32)");
+    }
+    combined as u32
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::revision_from_version;
+
+    #[test]
+    fn known_versions_map_to_the_documented_encoding() {
+        assert_eq!(revision_from_version("0.2.0"), 2000);
+        assert_eq!(revision_from_version("0.2.1"), 2001);
+        assert_eq!(revision_from_version("1.0.0"), 1_000_000);
+        assert_eq!(revision_from_version("0.10.3"), 10_003);
+        assert_eq!(revision_from_version("12.345.678"), 12_345_678);
+        assert_eq!(revision_from_version("0.0.0"), 0);
+    }
+
+    /// 現在の `Cargo.toml` バージョンが `RENDER_REVISION` の実値と一致する
+    /// （`env!` の値が変わってもこのテストが追随して確かめてくれる）。
+    #[test]
+    fn render_revision_matches_the_crate_version() {
+        assert_eq!(super::RENDER_REVISION, revision_from_version(env!("CARGO_PKG_VERSION")));
+    }
+}
+
+// 不正な形式・桁あふれがコンパイルエラーになることの確認（`trybuild` は使わない）:
+// これらは `const fn` の中で `panic!` に到達し、const 評価はコンパイル時に走るので、
+// 以下はどれも「一時的にコメントを外すとビルドが失敗する」ことを手元で確認済み。
+// - `revision_from_version("1.2")`            // 3 つ組でない
+// - `revision_from_version("1.2.3.4")`        // 3 つ組でない（多すぎる）
+// - `revision_from_version("1.2.x")`          // 数字以外
+// - `revision_from_version("1.2.3-beta.1")`   // pre-release サフィックス
+// - `revision_from_version("1.1000.0")`       // minor が桁あふれ（1000 未満でない）
+// - `revision_from_version("1.0.1000")`       // patch が桁あふれ（1000 未満でない）
 
 /// パストレーシングの定数。
 pub mod path {

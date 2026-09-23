@@ -80,6 +80,10 @@ _Avoid_: a fixed ray epsilon (absolute or scene-relative).
 **Firefly clamp**:
 Every contribution added to a path's radiance — any emitter/background hit (MIS-weighted or not, e.g. seen directly from the camera or after a delta bounce) **and** every NEE contribution — is luminance-scaled to at most `FIREFLY_CLAMP` (50) before being accumulated. Biased by design; applied per contribution (not per path), so both MIS strategies share the same limit.
 
+**`RENDER_REVISION`** (`constants::RENDER_REVISION`):
+A number that identifies "the same rendered output" for checkpoint compatibility. It is *derived* from the crate's `Cargo.toml` version (`major*1_000_000 + minor*1_000 + patch`, computed at compile time by the `const fn revision_from_version`) rather than tracked by hand — the version is the single source of truth. **Convention: same version ⇒ same pixels for the same scene/settings.** A change that alters the accumulation buffer (integrator, BSDF, sampling, the RNG sequence, …) means bumping `Cargo.toml`'s patch version; the golden tests in `render.rs` (`GOLDEN_REVISION` vs `RENDER_REVISION`) catch a forgotten bump. `checkpoint::scene_hash` mixes in `RENDER_REVISION` alone (not a separate version string — that would be the same information twice, since the revision already encodes the version losslessly).
+_Avoid_: a hand-maintained revision counter separate from the crate version.
+
 ### Scene description
 
 **Scene file**:

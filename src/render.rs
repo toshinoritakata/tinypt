@@ -685,7 +685,9 @@ mod tests {
     }
 
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
-    const GOLDEN_REVISION: u32 = 16;
+    /// `RENDER_REVISION` は `Cargo.toml` の `version` から導出されるので、実質的には
+    /// 「このハッシュを記録したときの `Cargo.toml` のバージョン」を数値で持っているのと同じ。
+    const GOLDEN_REVISION: u32 = 2000;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
@@ -754,15 +756,16 @@ mod tests {
         let (_, _, buffer, ppm) = hashes[0];
         assert_eq!(
             crate::constants::RENDER_REVISION, GOLDEN_REVISION,
-            "RENDER_REVISION was bumped: re-record the golden hashes for the new output \
-             ({}: 0x{:016x} / 0x{:016x}) and set GOLDEN_REVISION to match",
+            "Cargo.toml's version (-> RENDER_REVISION) was bumped: re-record the golden hashes for the new \
+             output ({}: 0x{:016x} / 0x{:016x}) and set GOLDEN_REVISION to match",
             name, buffer, ppm
         );
         assert!(
             (buffer, ppm) == golden,
             "{}: rendered output changed: buffer hash 0x{:016x} (golden 0x{:016x}), PPM hash 0x{:016x} (golden 0x{:016x}).\n\
-             If this change is meant to alter the output, bump constants::RENDER_REVISION (so old checkpoints \
-             are not resumed) and update the GOLDEN_* hashes in src/render.rs to the new values.\n\
+             If this change is meant to alter the output, bump Cargo.toml's patch version (so old checkpoints \
+             are not resumed, since RENDER_REVISION is derived from it) and update the GOLDEN_* hashes in \
+             src/render.rs to the new values.\n\
              If it is not meant to alter the output, this is a regression.",
             name, buffer, golden.0, ppm, golden.1
         );
