@@ -28,6 +28,10 @@ pub mod bvh {
     pub const SAH_BINS: usize = 8;
     /// リーフノードの最大プリミティブ数。
     pub const LEAF_SIZE: usize = 4;
+    /// BVH 構築を並列化する最小の三角形数（部分木の三角形数がこれ未満ならスレッドを起こさず
+    /// 逐次構築に切り替える）。値の根拠は PERF-2 のレポート参照（Sponza 相当の数万三角形の
+    /// シーンで並列化のオーバーヘッドが計測できなくなる値を実測で選んだ）。
+    pub const PARALLEL_MIN_TRIS: usize = 50_000;
 }
 
 /// UI / 進捗表示の定数。
