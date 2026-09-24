@@ -77,6 +77,25 @@ How a ray leaving a surface avoids hitting that surface again, independent of sc
 Triangles use PBRT v4's watertight intersection (translate to the ray origin, permute so the dominant ray axis is z, shear, 2D edge functions where exactly-zero edges count as inside), so rays through an edge or vertex shared by adjacent triangles never slip through (the earlier Möller–Trumbore test missed a few percent of rays aimed exactly at shared edges, depending on the mesh). `World::hit` rejects an instance with a conservative world-space bounding box (transformed mesh bounds padded both by the transform's error bound and by γ(3) of the coordinates; either padding alone suffices, and a test fails if both are removed) before transforming the ray into object space.
 _Avoid_: a fixed ray epsilon (absolute or scene-relative).
 
+**Occlusion query** (`World::occluded`):
+How a shadow ray asks whether anything blocks it. It stops at the first hit it accepts rather than finding the
+nearest one, which is what the closest-hit search would do — half of an interior scene's rays are shadow rays and
+most of them are blocked, so the rest of that search is wasted (Sponza visits 21% fewer BVH nodes with it).
+Everything that decides whether a hit counts lives in one accept predicate: an alpha-masked transparent hit and
+a hit on the sampled light itself are both rejected there and the search continues. The instance `tmin` mapping
+and its retry behave as in `World::hit`; a test covers each, because neither is caught by the byte-identity
+comparisons.
+_Avoid_: reusing the closest-hit search for visibility.
+
+**Stratification** (`render::Strata`):
+How samples are spread instead of drawn independently. A pixel's sub-pixel position and the point picked on an
+area light for the first bounce's NEE are each assigned to a cell of a √spp × √spp grid, jittered within it.
+Each pixel draws its own Fisher–Yates permutation of the cells, so adaptive sampling stopping early does not
+leave every pixel missing the same part of the grid. It lowers variance (23–39% by scene) without moving the
+mean, so the samples needed for a given noise level fall by about the same fraction. BSDF direction sampling is
+not stratified.
+_Avoid_: calling it "more samples" — the sample count is unchanged.
+
 **Firefly clamp**:
 Every contribution added to a path's radiance — any emitter/background hit (MIS-weighted or not, e.g. seen directly from the camera or after a delta bounce) **and** every NEE contribution — is luminance-scaled to at most `FIREFLY_CLAMP` (50) before being accumulated. Biased by design; applied per contribution (not per path), so both MIS strategies share the same limit.
 
