@@ -82,6 +82,12 @@ impl Fnv64 {
 /// 出力パス・デノイズ・トーンマップ・露出・チェックポイント間隔は後処理か保存頻度にしか
 /// 影響しないので含めない。
 pub fn scene_hash(config: &RenderConfig) -> std::io::Result<u64> {
+    scene_hash_with_medium(config, None)
+}
+
+/// [`scene_hash`] に参加媒質のパラメータを混ぜたもの。媒質が `None` のときは何も混ぜないので、
+/// 媒質の無いシーンのハッシュ（と既存のチェックポイント）は変わらない。
+pub fn scene_hash_with_medium(config: &RenderConfig, medium: Option<&crate::medium::Medium>) -> std::io::Result<u64> {
     let mut h = Fnv64::new();
     h.field(b"tinypt-scene-hash-v1");
     h.u64(crate::constants::RENDER_REVISION as u64);
@@ -120,6 +126,24 @@ pub fn scene_hash(config: &RenderConfig) -> std::io::Result<u64> {
         config.morton_enabled as u64,
     ] {
         h.u64(v);
+    }
+    if let Some(m) = medium {
+        h.field(b"medium");
+        let (lo, hi) = match &m.bounds {
+            Some(b) => (Some(b.min), Some(b.max)),
+            None => (None, None),
+        };
+        let mut vals = vec![
+            m.sigma_t.r(), m.sigma_t.g(), m.sigma_t.b(),
+            m.albedo.r(), m.albedo.g(), m.albedo.b(), m.g,
+        ];
+        h.u64(lo.is_some() as u64);
+        for v in [lo, hi].into_iter().flatten() {
+            vals.extend([v.x, v.y, v.z]);
+        }
+        for v in vals {
+            h.u64(v.to_bits());
+        }
     }
     Ok(h.0)
 }
@@ -387,6 +411,27 @@ mod tests {
     #[test]
     fn scene_hash_is_deterministic() {
         assert_eq!(scene_hash(&base()).unwrap(), scene_hash(&base()).unwrap());
+    }
+
+    /// 媒質が `None` ならハッシュは従来と同じ。媒質のパラメータを変えるとハッシュが変わる。
+    #[test]
+    fn scene_hash_mixes_in_the_medium_only_when_present() {
+        use crate::geometry::Aabb;
+        use crate::medium::Medium;
+        let h0 = scene_hash(&base()).unwrap();
+        assert_eq!(scene_hash_with_medium(&base(), None).unwrap(), h0);
+        let m = Medium { sigma_t: Color::new(0.1, 0.5, 2.0), albedo: Color::new(1.0, 1.0, 1.0), g: 0.3, bounds: None };
+        let h1 = scene_hash_with_medium(&base(), Some(&m)).unwrap();
+        assert_ne!(h1, h0);
+        let variants = [
+            Medium { sigma_t: Color::new(0.1, 0.5, 2.1), ..m },
+            Medium { albedo: Color::new(1.0, 1.0, 0.9), ..m },
+            Medium { g: 0.31, ..m },
+            Medium { bounds: Some(Aabb { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(1.0, 1.0, 1.0) }), ..m },
+        ];
+        for v in &variants {
+            assert_ne!(scene_hash_with_medium(&base(), Some(v)).unwrap(), h1);
+        }
     }
 
     /// レンダー結果/タスク並びに効く設定を変えるとハッシュが変わる。

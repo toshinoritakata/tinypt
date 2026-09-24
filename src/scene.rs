@@ -42,6 +42,8 @@ pub struct Scene {
     pub mat_maps: Vec<Option<MapId>>,
     /// 環境マップ（None でデフォルトの空色を使用）
     pub env: Option<EnvMap>,
+    /// 一様な参加媒質（None で真空）。M3 までシーンファイルからは読めず、テストとコードから直接与える
+    pub medium: Option<crate::medium::Medium>,
     /// 読み込みの内訳（表示用。`World::mesh_build_time` などから埋める）
     pub load_stats: LoadStats,
 }
@@ -118,7 +120,7 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
     };
 
     let load_stats = LoadStats { mesh_build: world.mesh_build_time(), ..Default::default() };
-    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), env, load_stats }
+    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), env, medium: None, load_stats }
 }
 
 fn push(mats: &mut Vec<Material>, m: Material) -> usize {

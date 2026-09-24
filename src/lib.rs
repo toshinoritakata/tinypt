@@ -40,7 +40,7 @@ pub mod texture;     // ビットマップテクスチャ（UV サンプリン�
 pub mod mtl;         // Wavefront MTL パーサ
 pub mod normal_map;  // ハイトマップ／ノーマルマップによる法線の摂動
 
-pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash};
+pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash, scene_hash_with_medium};
 pub use config::{RenderConfig, Tonemap};
 pub use output::{resolve_pixels, OutputFormat, OutputSettings};
 pub use mitsuba::load_scene;

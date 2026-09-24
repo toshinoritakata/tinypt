@@ -370,7 +370,7 @@ pub fn load_scene_from_str(
         mesh_build: world.mesh_build_time(),
         texture_load: TEXTURE_LOAD_TIME.with(|c| c.get()),
     };
-    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env, load_stats }, settings))
+    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env, medium: None, load_stats }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O

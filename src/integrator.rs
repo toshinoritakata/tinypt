@@ -20,6 +20,7 @@ use crate::constants::RAY_T_MAX;
 use crate::env::EnvMap;
 use crate::material::{BsdfSample, Material};
 use crate::math::{Color, Vec3};
+use crate::medium::{hg_eval, hg_sample, Medium, MediumEvent};
 use crate::ray::Ray;
 use crate::rng::Rng;
 use crate::normal_map::{orthonormalize, MapId, NormalMap};
@@ -96,6 +97,7 @@ pub fn radiance(
     mats: &[Material],
     surfaces: &Surfaces,
     env: Option<&EnvMap>,
+    medium: Option<&Medium>,
     ray: Ray,
     rng: &mut Rng,
     limits: PathLimits,
@@ -113,7 +115,74 @@ pub fn radiance(
         // レイとシーンの交差判定。自己交差は、レイの原点を面の誤差の箱の外へずらしてあること
         // （`offset_ray_origin`）と、各プリミティブが「t > 計算誤差の上界」のヒットだけを返すことで
         // 防ぐので、tmin は 0 でよい
-        let hit = match world.hit(ray, 0.0, RAY_T_MAX) {
+        let hit = world.hit(ray, 0.0, RAY_T_MAX);
+
+        // 参加媒質: 表面（または無限遠）までの区間で自由行程をサンプリングする。
+        // `medium` が `None` なら丸ごと飛ばし、乱数も引かない（媒質の無いシーンの出力はビット単位で不変）。
+        if let Some(med) = medium {
+            let t_surface = hit.as_ref().map(|h| h.t).unwrap_or(RAY_T_MAX);
+            match med.sample_distance(ray, t_surface, rng) {
+                MediumEvent::Pass { weight } => {
+                    path_throughput = path_throughput.hadamard(weight);
+                }
+                MediumEvent::Scatter { t, weight } => {
+                    path_throughput = path_throughput.hadamard(weight);
+                    // 深さの数え方は表面頂点と同じ（散乱を 1 頂点と数える。Mitsuba の depth と同じ）
+                    if bounce + 2 > limits.max_depth {
+                        break;
+                    }
+                    let p = ray.o + ray.d * t;
+                    let wo = (-ray.d).norm();
+
+                    // NEE（環境光・面光源）。表面版との違い: cos 項なし・原点ずらしなし・裏面棄却なし、
+                    // f = 位相関数。別関数にしてあるのは表面版のバイト一致を守るため
+                    if let Some(env_map) = env {
+                        let occluded = |shadow: Ray| world.occluded(shadow, 0.0, RAY_T_MAX, None);
+                        let contrib = nee_environment_phase(occluded, env_map, med, path_throughput, p, wo, ray.time, rng);
+                        accumulated_radiance = accumulated_radiance + contrib;
+                    }
+                    let ls = match (bounce, strata) {
+                        (0, Some(s)) => {
+                            let uv = s.uv(rng);
+                            world.sample_light_with_uv(rng, ray.time, p, uv)
+                        }
+                        _ => world.sample_light(rng, ray.time, p),
+                    };
+                    if let Some(ls) = ls {
+                        let contrib = nee_area_light_phase(
+                            |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, Some((ls.inst_id, ls.prim_id))),
+                            med, path_throughput, p, wo, ray.time, &ls,
+                        );
+                        accumulated_radiance = accumulated_radiance + contrib;
+                    }
+
+                    // Russian Roulette: 表面と完全に同じ規則（省くと光学的に厚い媒質で経路が終わらない）。
+                    // `eta_scale` は変えない（η² 補償は透過専用）
+                    let throughput_max = path_throughput.r().max(path_throughput.g()).max(path_throughput.b());
+                    if throughput_max <= 0.0 {
+                        break;
+                    }
+                    if bounce + 1 >= limits.rr_depth {
+                        let p_rr = rr_survival_probability(throughput_max, eta_scale);
+                        if rng.next_f64() >= p_rr {
+                            break;
+                        }
+                        path_throughput = path_throughput / p_rr;
+                    }
+
+                    // 位相関数サンプリング。HG は位相関数そのものに比例してサンプルする（完全重点サンプリング）
+                    // ので weight = f / pdf = 1 で、`path_throughput` には何も掛けない
+                    let (wi, pdf) = hg_sample(wo, med.g, rng);
+                    ray = Ray { o: p, d: wi, time: ray.time };
+                    last_bsdf_pdf = pdf;
+                    last_non_delta = true;
+                    last_p = p;
+                    continue;
+                }
+            }
+        }
+
+        let hit = match hit {
             Some(v) => v,
             None => {
                 // ミス: 背景（環境マップまたは空）からの寄与を加算
@@ -173,7 +242,7 @@ pub fn radiance(
                 // any-hit: 遮蔽の有無だけが要るので、最初に見つかった交差で打ち切る（最近接は不要）。
                 // 環境光には「除外すべき光源自身」が無いので skip は None
                 let occluded = |shadow: Ray| world.occluded(shadow, 0.0, RAY_T_MAX, None);
-                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, &hit, n, ng, ray, rng);
+                let contrib = nee_environment(occluded, env_map, &mat, path_throughput, &hit, n, ng, ray, medium, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
@@ -190,7 +259,7 @@ pub fn radiance(
                 let contrib = nee_area_light(
                     // any-hit + 光源自身の除外（`(ls.inst_id, ls.prim_id)` に一致する交差は遮蔽と数えない）
                     |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, Some((ls.inst_id, ls.prim_id))),
-                    &mat, path_throughput, &hit, n, ng, ray, &ls,
+                    &mat, path_throughput, &hit, n, ng, ray, &ls, medium,
                 );
                 accumulated_radiance = accumulated_radiance + contrib;
             }
@@ -321,6 +390,7 @@ fn nee_environment(
     n: Vec3,
     ng: Vec3,
     ray: Ray,
+    medium: Option<&Medium>,
     rng: &mut Rng,
 ) -> Color {
     let (wi, li, pdf_env) = env_map.sample_dir(rng);
@@ -343,7 +413,12 @@ fn nee_environment(
     let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), wi, n);
     let w = mis_weight(pdf_env, pdf_bsdf);
     // BSDF 側（背景ヒット）と同じ閾値でクランプし、MIS の両側を対称にする
-    (path_throughput.hadamard(f).hadamard(li) * (cos * w / pdf_env)).clamp_luminance(FIREFLY_CLAMP)
+    let mut c = path_throughput.hadamard(f).hadamard(li) * (cos * w / pdf_env);
+    // 参加媒質内のシャドウレイは減衰する（None なら何もしない）。クランプは透過率を掛けた後
+    if let Some(med) = medium {
+        c = c.hadamard(med.transmittance(shadow, 0.0, RAY_T_MAX));
+    }
+    c.clamp_luminance(FIREFLY_CLAMP)
 }
 
 /// 全チャネルが厳密に 0 か。負値チャネルを含む色を誤って捨てないよう、
@@ -369,6 +444,7 @@ fn nee_area_light(
     ng: Vec3,
     ray: Ray,
     ls: &LightSample,
+    medium: Option<&Medium>,
 ) -> Color {
     // 光源自身に隠される点（球の外部からの面積フォールバックで引いた裏側）は寄与 0
     if !ls.visible {
@@ -404,10 +480,14 @@ fn nee_area_light(
     let to = offset_ray_origin(ls.position, ls.p_error, ls.normal, from - ls.position);
     let seg = to - from;
     let seg_len = seg.len();
+    let mut transmittance = None;
     if seg_len > 0.0 {
         let shadow = Ray { o: from, d: seg / seg_len, time: ray.time };
         if occluded(shadow, seg_len) {
             return Color::new(0.0, 0.0, 0.0);
+        }
+        if let Some(med) = medium {
+            transmittance = Some(med.transmittance(shadow, 0.0, seg_len));
         }
     }
 
@@ -418,7 +498,79 @@ fn nee_area_light(
 
     let w = mis_weight(ls.pdf, pdf_bsdf);
     // BSDF 側（発光体ヒット）と同じ閾値でクランプし、MIS の両側を対称にする
-    (path_throughput.hadamard(f).hadamard(ls.emit) * (cos * w / ls.pdf)).clamp_luminance(FIREFLY_CLAMP)
+    let mut c = path_throughput.hadamard(f).hadamard(ls.emit) * (cos * w / ls.pdf);
+    // 参加媒質内のシャドウレイは減衰する（None なら何もしない）。クランプは透過率を掛けた後
+    if let Some(tr) = transmittance {
+        c = c.hadamard(tr);
+    }
+    c.clamp_luminance(FIREFLY_CLAMP)
+}
+
+/// 媒質散乱点 `p` からの環境光 NEE。[`nee_environment`] との違い: cos 項なし（位相関数は立体角あたりの
+/// 密度）、原点ずらしなし（面の上ではない）、裏面棄却なし、`f = hg_eval(wo·wi, g)`（`pdf_bsdf` も同じ値）。
+/// 乱数の引き方（`sample_dir` を先に必ず 1 回）は表面版と同じ。
+fn nee_environment_phase(
+    occluded: impl Fn(Ray) -> bool,
+    env_map: &EnvMap,
+    med: &Medium,
+    path_throughput: Color,
+    p: Vec3,
+    wo: Vec3,
+    time: f64,
+    rng: &mut Rng,
+) -> Color {
+    let (wi, li, pdf_env) = env_map.sample_dir(rng);
+    if pdf_env <= 0.0 || is_black(li) {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let shadow = Ray { o: p, d: wi, time };
+    if occluded(shadow) {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let f = hg_eval(wo.dot(wi), med.g);
+    let w = mis_weight(pdf_env, f);
+    let c = path_throughput.hadamard(li) * (f * w / pdf_env);
+    c.hadamard(med.transmittance(shadow, 0.0, RAY_T_MAX)).clamp_luminance(FIREFLY_CLAMP)
+}
+
+/// 媒質散乱点 `p` からの面光源 NEE。[`nee_area_light`] との違いは [`nee_environment_phase`] と同じ。
+fn nee_area_light_phase(
+    occluded: impl Fn(Ray, f64) -> bool,
+    med: &Medium,
+    path_throughput: Color,
+    p: Vec3,
+    wo: Vec3,
+    time: f64,
+    ls: &LightSample,
+) -> Color {
+    if !ls.visible {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let to_light = ls.position - p;
+    let dist = to_light.dot(to_light).sqrt();
+    if !(dist > 0.0) {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let wi = to_light / dist;
+    // 始点は散乱点そのもの。終点は光源側だけ表面版と同じく誤差の箱の外へずらす
+    let to = offset_ray_origin(ls.position, ls.p_error, ls.normal, p - ls.position);
+    let seg = to - p;
+    let seg_len = seg.len();
+    let mut transmittance = Color::new(1.0, 1.0, 1.0);
+    if seg_len > 0.0 {
+        let shadow = Ray { o: p, d: seg / seg_len, time };
+        if occluded(shadow, seg_len) {
+            return Color::new(0.0, 0.0, 0.0);
+        }
+        transmittance = med.transmittance(shadow, 0.0, seg_len);
+    }
+    if ls.pdf <= 0.0 {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let f = hg_eval(wo.dot(wi), med.g);
+    let w = mis_weight(ls.pdf, f);
+    let c = path_throughput.hadamard(ls.emit) * (f * w / ls.pdf);
+    c.hadamard(transmittance).clamp_luminance(FIREFLY_CLAMP)
 }
 
 /// Power Heuristic (β=2) による MIS 重みを計算する。
@@ -463,7 +615,7 @@ mod tests {
         for _ in 0..1000 {
             let c = nee_environment(
                 |_| { calls.set(calls.get() + 1); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, None, &mut rng,
             );
             let _ = env.sample_dir(&mut reference);
             assert!(is_black(c));
@@ -483,7 +635,7 @@ mod tests {
         for _ in 0..1000 {
             let c = nee_environment(
                 |_| { calls.set(calls.get() + 1); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, None, &mut rng,
             );
             total += c.luminance();
         }
@@ -499,7 +651,7 @@ mod tests {
         let mut rng = Rng::new(7);
         let mut max_l: f64 = 0.0;
         for _ in 0..200 {
-            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &mut rng);
+            let c = nee_environment(|_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, None, &mut rng);
             max_l = max_l.max(c.luminance());
         }
         assert!(max_l > 0.0);
@@ -520,7 +672,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls, None);
         assert!((c.luminance() - FIREFLY_CLAMP).abs() < 1e-9, "luminance = {}", c.luminance());
         assert!((c.r() / c.g() - 2.0).abs() < 1e-9);
     }
@@ -539,7 +691,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &test_hit(p, n), n, n, ray, &ls, None);
         let (f, pdf_bsdf) = mat.eval((-ray.d).norm(), Vec3::new(0.0, 1.0, 0.0), n);
         let expected = f.r() * mis_weight(1.0, pdf_bsdf);
         assert!((c.r() - expected).abs() < 1e-12, "{} vs {}", c.r(), expected);
@@ -566,7 +718,7 @@ mod tests {
         let mut rng = Rng::new(seed);
         let (mut s, mut s2) = (0.0, 0.0);
         for _ in 0..n {
-            let x = radiance(world, mats, &Surfaces::none(), Some(env), ray, &mut rng, limits, None).r();
+            let x = radiance(world, mats, &Surfaces::none(), Some(env), None, ray, &mut rng, limits, None).r();
             s += x;
             s2 += x * x;
         }
@@ -585,9 +737,9 @@ mod tests {
         let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
 
         let mut rng = Rng::new(1);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(0), None).r(), 0.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_light, &mut rng, limits(1), None).r(), 4.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), to_floor, &mut rng, limits(1), None).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(0), None).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(1), None).r(), 4.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_floor, &mut rng, limits(1), None).r(), 0.0);
 
         let exact = 0.5 * 4.0 / 9.0;
         for max_depth in [2usize, 3, 8, usize::MAX] {
@@ -625,7 +777,7 @@ mod tests {
         let (mut s, mut s2) = (0.0, 0.0);
         for i in 0..n {
             let strata = Strata { stratum: i % n_cells, nx, ny };
-            let x = radiance(&world, &mats, &Surfaces::none(), Some(&env), to_floor, &mut rng, limits, Some(strata)).r();
+            let x = radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_floor, &mut rng, limits, Some(strata)).r();
             s += x;
             s2 += x * x;
         }
@@ -769,7 +921,7 @@ mod tests {
         let seen: Cell<Option<Vec3>> = Cell::new(None);
         let c = nee_area_light(
             |shadow: Ray, _| { seen.set(Some(shadow.o)); false },
-            &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls,
+            &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls, None,
         );
         assert!(c.luminance() > 0.0, "この配置では寄与が出るはず");
         let o = seen.get().expect("シャドウレイが撃たれていない");
@@ -794,7 +946,7 @@ mod tests {
         for _ in 0..200 {
             let c = nee_environment(
                 |shadow: Ray| { seen.set(Some((shadow.o, shadow.d))); false },
-                &env, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &mut rng,
+                &env, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, None, &mut rng,
             );
             let Some((o, d)) = seen.get() else { continue };
             seen.set(None);
@@ -833,7 +985,7 @@ mod tests {
             inst_id: None,
             prim_id: 0,
         };
-        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls);
+        let c = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls, None);
         assert!(is_black(c), "幾何的に裏側の光源から寄与が漏れている: {:?}", (c.r(), c.g(), c.b()));
 
         // 環境 NEE も同じ: ng の裏半球だけが光る環境にすると寄与は 0 になる
@@ -842,7 +994,7 @@ mod tests {
         let mut leaked = 0;
         for _ in 0..2000 {
             let c = nee_environment(
-                |_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &mut rng,
+                |_| false, &env, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, None, &mut rng,
             );
             // 寄与が出た方向は必ず幾何法線の表側から来ていること（裏なら 0 のはず）を、
             // 同じ乱数列で方向を引き直して突き合わせる
@@ -855,7 +1007,7 @@ mod tests {
 
         // ガードの本丸: 裏向きの方向だけを明示的に渡す面光源の方は必ず 0
         let ls_back = LightSample { position: hit.p + Vec3::new(0.2, 0.0, -1.0), ..ls };
-        let c2 = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls_back);
+        let c2 = nee_area_light(|_, _| false, &mat, Color::new(1.0, 1.0, 1.0), &hit, ns, ng, ray, &ls_back, None);
         assert!(is_black(c2), "真裏の光源から寄与が漏れている");
     }
 
@@ -1006,7 +1158,7 @@ mod tests {
             let mut rng = Rng::new(3);
             let (mut sum, n) = (0.0, 20_000);
             for _ in 0..n {
-                sum += radiance(&world, &mats, &Surfaces::textures_only(&textures), Some(&env), ray, &mut rng,
+                sum += radiance(&world, &mats, &Surfaces::textures_only(&textures), Some(&env), None, ray, &mut rng,
                                 PathLimits { max_depth: 2, rr_depth: 8 }, None).r();
             }
             sum / n as f64
@@ -1118,6 +1270,134 @@ mod tests {
         assert!(is_black(Color::new(0.0, 0.0, 0.0)));
         assert!(!is_black(Color::new(0.0, 1e-300, 0.0)));
         assert!(!is_black(Color::new(-0.1, 0.0, 0.0)));
+    }
+
+    // ---- 参加媒質（M2）----
+
+    use crate::geometry::Aabb;
+
+    /// 媒質付きの推定。全チャンネルの (平均, 標準誤差)。
+    fn estimate_medium(world: &World, mats: &[Material], env: &EnvMap, med: &Medium, ray: Ray, limits: PathLimits, n: usize, seed: u64) -> ([f64; 3], [f64; 3]) {
+        let mut rng = Rng::new(seed);
+        let (mut s, mut s2) = ([0.0; 3], [0.0; 3]);
+        for _ in 0..n {
+            let c = radiance(world, mats, &Surfaces::none(), Some(env), Some(med), ray, &mut rng, limits, None);
+            for (i, x) in [c.r(), c.g(), c.b()].into_iter().enumerate() {
+                s[i] += x;
+                s2[i] += x * x;
+            }
+        }
+        let nf = n as f64;
+        let mean = [s[0] / nf, s[1] / nf, s[2] / nf];
+        let se = [0, 1, 2].map(|i| ((s2[i] / nf - mean[i] * mean[i]).max(0.0) / nf).sqrt());
+        (mean, se)
+    }
+
+    /// 原点中心・半辺長 `k` の箱に閉じた媒質と、それを +x 方向に貫くカメラレイ（箱の手前 `4k` から）。
+    fn box_medium(k: f64, sigma_t: Color, albedo: Color, g: f64) -> (Medium, Ray) {
+        let bounds = Aabb { min: Vec3::new(-k, -k, -k), max: Vec3::new(k, k, k) };
+        (
+            Medium { sigma_t, albedo, g, bounds: Some(bounds) },
+            Ray { o: Vec3::new(-5.0 * k, 0.0, 0.0), d: Vec3::new(1.0, 0.0, 0.0), time: 0.0 },
+        )
+    }
+
+    /// B + F: 白炉。幾何なし・一様環境光 1・吸収なしの媒質は、どの `g`・`rr_depth`・色付き `σt`・スケールでも 1。
+    #[test]
+    fn medium_white_furnace_is_one() {
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        let world = World::new();
+        let white = Color::new(1.0, 1.0, 1.0);
+        let cases = [
+            (1.0, Color::new(1.0, 1.0, 1.0), 0.0, 3),
+            (1.0, Color::new(1.0, 1.0, 1.0), 0.7, 1),
+            (1.0, Color::new(0.1, 0.5, 2.0), 0.0, 1),
+            (1.0, Color::new(0.1, 0.5, 2.0), 0.7, 3),
+            (1e-3, Color::new(100.0, 500.0, 2000.0), 0.7, 3),
+            (1e3, Color::new(1e-4, 5e-4, 2e-3), 0.0, 1),
+        ];
+        for (k, sigma_t, g, rr_depth) in cases {
+            let (med, ray) = box_medium(k, sigma_t, white, g);
+            let limits = PathLimits { max_depth: usize::MAX, rr_depth };
+            let (mean, se) = estimate_medium(&world, &[], &env, &med, ray, limits, 200_000, 5);
+            for i in 0..3 {
+                assert!((mean[i] - 1.0).abs() < 5.0 * se[i] + 1e-12, "k={k} σt={sigma_t:?} g={g} rr={rr_depth} ch{i}: {} ± {}", mean[i], se[i]);
+            }
+        }
+    }
+
+    /// C + F: 吸収のみ（albedo 0）の媒質は Beer-Lambert に一致する。
+    #[test]
+    fn absorbing_medium_matches_beer_lambert() {
+        let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
+        let world = World::new();
+        for k in [1.0, 1e-3, 1e3] {
+            let sigma_t = Color::new(0.1, 0.5, 2.0) * (1.0 / k);
+            let (med, ray) = box_medium(k, sigma_t, Color::new(0.0, 0.0, 0.0), 0.0);
+            let limits = PathLimits { max_depth: usize::MAX, rr_depth: 3 };
+            let (mean, se) = estimate_medium(&world, &[], &env, &med, ray, limits, 400_000, 9);
+            let l = 2.0 * k;
+            let want = [(-0.1 / k * l as f64).exp(), (-0.5 / k * l).exp(), (-2.0 / k * l).exp()];
+            for i in 0..3 {
+                assert!((mean[i] - want[i]).abs() < 4.0 * se[i] + 1e-12, "k={k} ch{i}: {} ± {} vs {}", mean[i], se[i], want[i]);
+            }
+        }
+    }
+
+    /// D: 吸収のみの媒質（全空間）を挟んだ直接照明。床の原点から見える球光源（中心高さ 3、半径 1、L=4）への
+    /// 立体角積分を、光源への距離込みで数値積分した値 × カメラレイ側の減衰と一致する。表面 NEE と
+    /// BSDF サンプリング側（Pass の weight）の両方が入っているので、片方でも透過率が抜けると外れる。
+    #[test]
+    fn surface_nee_attenuates_by_the_medium() {
+        let (world, mats, env) = floor_under_sphere_light();
+        let to_floor = Ray { o: Vec3::new(2.0, 1.0, 0.0), d: Vec3::new(-2.0, -1.0, 0.0).norm(), time: 0.0 };
+        let cam_len = 5.0f64.sqrt();
+        let limits = PathLimits { max_depth: usize::MAX, rr_depth: 1000 };
+        let sigma = 0.3;
+        // E = ∫ cosθ e^{-σ d(θ)} 2π sinθ dθ（軸まわり対称）。d = 3cosθ - sqrt(1 - 9 sin²θ)
+        let theta_max = (1.0f64 / 3.0).asin();
+        let m = 200_000;
+        let mut integral = 0.0;
+        for i in 0..m {
+            let th = (i as f64 + 0.5) / m as f64 * theta_max;
+            let d = 3.0 * th.cos() - (1.0 - 9.0 * th.sin().powi(2)).max(0.0).sqrt();
+            integral += th.cos() * (-sigma * d).exp() * 2.0 * std::f64::consts::PI * th.sin() * theta_max / m as f64;
+        }
+        let exact = 0.5 / std::f64::consts::PI * 4.0 * integral * (-sigma * cam_len).exp();
+        let med = Medium { sigma_t: Color::new(sigma, sigma, sigma), albedo: Color::new(0.0, 0.0, 0.0), g: 0.0, bounds: None };
+        let (mean, se) = estimate_medium(&world, &mats, &env, &med, to_floor, limits, 400_000, 3);
+        assert!((mean[0] - exact).abs() < 5.0 * se[0] + 1e-3 * exact, "{} ± {} vs {}", mean[0], se[0], exact);
+        // 媒質なしの解析値 ρL/9 より確かに暗い（テストが自明に通っていないことの確認）
+        assert!(exact < 0.5 * 4.0 / 9.0 * 0.6);
+    }
+
+    /// 媒質散乱点の NEE（面光源）と位相関数サンプリング側の MIS: `max_depth = 2` は単一散乱だけを数える。
+    /// 球光源（中心 (0,0,2)、半径 0.3、L=4）のそばを通る +x 向きのカメラレイに対し、単一散乱の
+    /// 積分 ∫ σ e^{-σ(t-a)} · L·Ω(t)/(4π) · e^{-σD(t)} dt（Ω は球の立体角）と一致する。
+    #[test]
+    fn single_scattering_from_a_sphere_light_matches_analytic() {
+        use crate::geometry::Sphere;
+        let mats = vec![Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) }];
+        let mut world = World::new();
+        world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 2.0), r: 0.3, mat_id: 0 });
+        world.build_lights(&mats);
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+        let sigma = 0.05;
+        let (med, ray) = box_medium(3.0, Color::new(sigma, sigma, sigma), Color::new(1.0, 1.0, 1.0), 0.0);
+        let limits = PathLimits { max_depth: 2, rr_depth: 1000 };
+        // ボックス内は t ∈ [2, 8]（x = -3..3）
+        let m = 100_000;
+        let mut exact = 0.0;
+        for i in 0..m {
+            let t = 2.0 + 6.0 * (i as f64 + 0.5) / m as f64;
+            let x = -5.0 + t;
+            let dd = (x * x + 4.0f64).sqrt();
+            let omega = 2.0 * std::f64::consts::PI * (1.0 - (1.0 - 0.09 / (dd * dd)).sqrt());
+            exact += sigma * (-sigma * (t - 2.0)).exp() * 4.0 * omega / (4.0 * std::f64::consts::PI) * (-sigma * dd).exp() * 6.0 / m as f64;
+        }
+        let (mean, se) = estimate_medium(&world, &mats, &env, &med, ray, limits, 2_000_000, 17);
+        // 光源側の減衰を中心距離で近似しているぶん（σ·r ≈ 1.5%）を許容する
+        assert!((mean[0] - exact).abs() < 5.0 * se[0] + 0.02 * exact, "{} ± {} vs {}", mean[0], se[0], exact);
     }
 }
 
@@ -1238,7 +1518,7 @@ mod map_tests {
         let n = 60_000;
         let mut sum = 0.0;
         for _ in 0..n {
-            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits, None).g();
+            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits, None).g();
         }
         let got = sum / n as f64;
 
@@ -1281,7 +1561,7 @@ mod map_tests {
             let mut rng = Rng::new(3);
             let mut sum = 0.0;
             for _ in 0..4000 {
-                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), down_ray(0.0, 0.0), &mut rng, limits, None).g();
+                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits, None).g();
             }
             sum
         };
@@ -1349,7 +1629,7 @@ mod map_tests {
         let limits = PathLimits { max_depth: 6, rr_depth: 8 };
         for _ in 0..20_000 {
             let d = crate::rng::uniform_sphere_dir(&mut rng);
-            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits, None);
+            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits, None);
             assert_eq!(c.r(), 0.0, "立方体の内側に光が漏れた");
         }
         std::fs::remove_dir_all(&dir).ok();

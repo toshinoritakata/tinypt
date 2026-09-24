@@ -25,6 +25,7 @@ use crate::env::EnvMap;
 use crate::integrator::{radiance, PathLimits, Strata, Surfaces};
 use crate::material::Material;
 use crate::math::Color;
+use crate::medium::Medium;
 use crate::ray::Camera;
 use crate::rng::{seed_for, Rng};
 use crate::scene::Scene;
@@ -135,6 +136,7 @@ fn sample_pixel(
     mats: &[Material],
     surfaces: &Surfaces,
     env: Option<&EnvMap>,
+    medium: Option<&Medium>,
     cam: &Camera,
     limits: PathLimits,
     config: &RenderConfig,
@@ -167,7 +169,7 @@ fn sample_pixel(
         let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
         let ray = cam.ray(sx, sy, rng);
         let strata = Strata { stratum: light_order[local], nx, ny };
-        radiance(world, mats, surfaces, env, ray, rng, limits, Some(strata))
+        radiance(world, mats, surfaces, env, medium, ray, rng, limits, Some(strata))
     };
 
     if config.adaptive_enabled {
@@ -299,6 +301,7 @@ fn render_with_threads(
         let mats_ref = &scene.mats;
         let cam_ref = &scene.cam;
         let env_ref = scene.env.as_ref();
+        let medium_ref = scene.medium.as_ref();
 
         for _ in 0..threads {
             let rx = rx.clone();
@@ -308,6 +311,7 @@ fn render_with_threads(
             let surfaces = surfaces_ref;
             let cam = cam_ref;
             let env = env_ref;
+            let medium = medium_ref;
             sp.spawn(move |_| {
                 // ワーカーループ: チャネルからタスクを受信し処理
                 while let Ok(t) = rx.recv() {
@@ -319,7 +323,7 @@ fn render_with_threads(
                     for y in t.y0..t.y1 {
                         for x in t.x0..t.x1 {
                             let local_idx = (y - t.y0) * tile_w + (x - t.x0);
-                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, surfaces, env, cam, limits, config);
+                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, surfaces, env, medium, cam, limits, config);
                             sum[local_idx] = c;
                             wsum[local_idx] = n;
                         }
@@ -444,6 +448,7 @@ mod tests {
             normal_maps: Vec::new(),
             mat_maps: Vec::new(),
             env: None,
+            medium: None,
             load_stats: Default::default(),
         }
     }

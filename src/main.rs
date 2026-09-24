@@ -3,7 +3,7 @@
 //! コマンドライン引数を解析し、シーン構築 → レンダリング → 後処理 → 画像出力を実行する。
 //! 対応フォーマット: PPM / HDR (Radiance) / EXR (ACEScg)
 
-use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, remove_stale_tmp, render, resolve_pixels, scene_hash, OutputFormat, OutputSettings, RenderConfig, Tonemap};
+use tinypt::{build_default_scene, ckpt_path, denoise, load_scene, remove_stale_tmp, render, resolve_pixels, scene_hash_with_medium, OutputFormat, OutputSettings, RenderConfig, Tonemap};
 
 /// CLI で明示的に指定された値（シーンファイルの設定より優先させる）。
 #[derive(Default)]
@@ -375,7 +375,7 @@ fn main() -> std::io::Result<()> {
     // チェックポイントのキーは最終 config（シーン設定 + CLI 上書き後）から導出する。
     // 無効時はファイルに触れないので、参照ファイルの再読込コストも払わない。
     let ckpt_file = if config.checkpoint_enabled {
-        config.scene_hash = scene_hash(&config)?;
+        config.scene_hash = scene_hash_with_medium(&config, scene.medium.as_ref())?;
         let path = ckpt_path(config.scene_hash);
         // 前回の強制終了で残った書き込み途中の一時ファイルを掃除する
         if remove_stale_tmp(&path) {
