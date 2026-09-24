@@ -22,6 +22,7 @@ pub mod bvh;         // BVH（Bounding Volume Hierarchy）加速構造
 pub mod world;       // ワールド（全ジオメトリ・インスタンス・ライト）
 pub mod transform;   // アフィン変換（任意軸回転・非一様スケール・せん断）
 pub mod material;    // マテリアルと BSDF サンプリング
+pub mod medium;      // 一様な参加媒質（透過率・距離サンプリング・HG 位相関数）
 pub mod integrator;  // パストレーシング積分器（MIS + NEE）
 pub mod task;        // タイル分割タスク定義
 pub mod obj_loader;  // Wavefront OBJ ローダー

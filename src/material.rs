@@ -402,7 +402,7 @@ fn sample_cosine_hemisphere(n: Vec3, rng: &mut Rng) -> Vec3 {
 }
 
 /// 法線 `n` から正規直交接線フレーム (tangent, bitangent) を構築する。
-fn tangent_frame(n: Vec3) -> (Vec3, Vec3) {
+pub(crate) fn tangent_frame(n: Vec3) -> (Vec3, Vec3) {
     let a = if n.x.abs() > 0.9 { Vec3::new(0.0,1.0,0.0) } else { Vec3::new(1.0,0.0,0.0) };
     let t = n.cross(a).norm();
     let b = t.cross(n);
