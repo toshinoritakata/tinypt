@@ -429,13 +429,15 @@ pub fn load_scene(
     Ok(scene)
 }
 
-/// XML が参照する外部ファイル（`<string name="filename">`）を文書順に列挙する。
+/// XML が参照する外部ファイル（`<string name="filename">` と `<string name="filename_end">`）を
+/// 文書順に列挙する。**`filename_end` を落とさないこと**: 落とすと、モーションの閉じ側 OBJ だけを
+/// 書き換えたときにシーンハッシュが変わらず、古いチェックポイントから再開してしまう。
 ///
 /// パスは [`load_scene_from_str`] と同じく `base_dir` 基準で解決する。
 /// チェックポイントのシーンハッシュが OBJ/環境マップの内容まで含むために使う。
 pub fn referenced_files(xml: &str, base_dir: &Path) -> io::Result<Vec<PathBuf>> {
     fn walk(el: &Element, base_dir: &Path, out: &mut Vec<PathBuf>) {
-        if el.tag == "string" && el.attr("name") == Some("filename") {
+        if el.tag == "string" && matches!(el.attr("name"), Some("filename") | Some("filename_end")) {
             if let Some(v) = el.attr("value") {
                 out.push(resolve_path(base_dir, v));
             }

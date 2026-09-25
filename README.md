@@ -23,7 +23,8 @@ Sponza Atrium は CC BY 3.0 / © 2010 Frank Meinl, Crytek。Rungholt は CC BY 3
 
 ## 特徴
 
-- **BVH 加速構造** (SAH) による高速レイ-ジオメトリ交差判定。構築は部分木ごとに並列化 (逐次構築とビット単位で同じ木を作る)
+- **BVH 加速構造** (SAH) による二層構成。メッシュごとの BVH (物体空間) の上に、インスタンスと球をまとめて覆うトップレベル BVH (TLAS) を載せる。構築は部分木ごとに並列化 (逐次構築とビット単位で同じ木を作る) ([詳細](#メッシュの共有と-tlas))
+- **メッシュの共有**: 同じ OBJ を何度配置しても三角形と BVH は 1 つ。材質はインスタンスごとに変えられる
 - **スムーズシェーディング**: OBJ の頂点法線を補間 ([詳細](#スムーズシェーディング-法線の補間))
 - **テクスチャ**: ビットマップテクスチャ (UV バイリニア、sRGB デコード) ([詳細](#テクスチャ))
 - **マテリアル**: ランバート拡散・完全鏡面金属・GGX マイクロファセット・誘電体 (ガラス)・面光源 ([詳細](#マテリアル))
@@ -72,7 +73,7 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
 - **UV の向き**: OBJ/Mitsuba の `vt` は左下が原点 (v が上向き)。画像は上の行から並ぶので、テクセル行は `(1 − v)` 側から数える。
 - **定数色との併用**: `<rgb name="reflectance">` も書くと、その色は**倍率**としてテクスチャに掛かる。片方だけなら他方は白 (1 倍)。
 - **パラメトリック形状の UV**: Mitsuba 準拠。`rectangle` = `((x+1)/2, (y+1)/2)`、`cube` = 面ごとに `[0,1]²`、`disk` = `(r, φ/2π)`、`sphere` = `(φ/2π, θ/π)` (極は ±z)。
-- **現状の制限**: XML でテクスチャを指定できるのは `diffuse` の `reflectance` のみ。ミップマップは未対応。
+- **現状の制限**: XML でテクスチャを指定できるのは `diffuse` の `reflectance` のみ。
 - **OBJ の `usemtl` / MTL**: OBJ の `<shape>` に `<bsdf>` も `<emitter>` も書かないと、`mtllib` の MTL から材質を作る (1 メッシュのまま、`usemtl` ごとに三角形の材質が変わる。BVH は割らない)。`<bsdf>` があれば従来どおり**全体を上書き**し MTL は読まない (`sample/sponza.xml` はこちら)。`<boolean name="use_mtl" value="false"/>` でも MTL を無視できる。例: `sample/sponza_textured.xml`。
   - MTL → BSDF: **`map_Kd` があれば常に** `Lambert { albedo: Kd, albedo_tex }` (sRGB デコード。`Kd` は倍率として掛かる)。`map_Kd` が無く、`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。どちらでもなければ `Lambert { albedo: Kd }`。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
     (`map_Kd` を優先するのは、拡散テクスチャと明るい鏡面反射を両方持つ材質を先に GGX 化すると拡散テクスチャがまるごと捨てられてしまうため — 拡散 + 光沢の合成 BSDF は `Material` に新しい variant が要るので扱わない。)
@@ -160,7 +161,7 @@ cargo run --release -- [オプション]
 
 ```
 Scene: sample/rungholt.xml (6704266 tris, 2 instances, 0 spheres, 2 lights, 0 textures)
-Loaded in 1.94s (obj parse 0.75s, mesh + BVH build 1.18s, textures 0.00s)
+Loaded in 2.81s (obj parse 0.91s, mesh + BVH build 1.87s, textures 0.00s)
 ```
 
 組み込みシーンの既定解像度は 1920x1080。`--width` / `--height` / `--res` で変更できる (`--scene` 指定時も同じ)。シーンファイルの `<film>` は、対応する CLI 指定が無いときだけ使われる。
@@ -241,6 +242,23 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 ./target/release/tinypt --scene sample/default.xml -o output.ppm
 ```
 
+## メッシュの共有と TLAS
+
+交差判定は二層の BVH で行う。**下段**はメッシュごとの BVH で、三角形を物体空間で覆う。
+**上段 (TLAS)** はインスタンスと球をまとめて 1 つの BVH で覆い、ワールド空間で探索する。
+以前はインスタンスと球を線形に総当たりしていたので、画面に入らないジオメトリにも費用がかかっていた。
+画面外に立方体を 500 個置いたシーンで 1.76 秒 → 0.15 秒、球 500 個で 1.18 秒 → 0.14 秒。
+プリミティブが 20 個未満のときは線形の総当たりに戻す (ボックスが大きく重なる小さなシーンでは、
+そのほうが速い)。
+
+**メッシュの共有**: 同じ OBJ を複数の `<shape>` で参照しても、三角形と BVH は 1 つだけ作って共有する。
+材質はインスタンスの属性なので、共有していても `<shape>` ごとに変えられる。
+同じ OBJ を 36 回置く `sample/highpoly.xml` で、読み込みが 0.36 秒 → 0.27 秒、ピーク RSS が 275MB → 259MB。
+
+共有されるのは、**同じファイル・同じ `face_normals`・同じ `filename_end`** で、かつ `<shape>` に
+`<bsdf>` を書いた経路のときだけ。MTL から材質を作る経路は共有しない (三角形に焼き込む材質・
+アルファマスク・`usemtl` の割り当てが MTL の内容で決まり、「2 つが同じ」の判定を誤ると静かに壊れるため)。
+
 ## シーンファイル (Mitsuba XML)
 
 `--scene` で [Mitsuba レンダラー](https://www.mitsuba-renderer.org/) の XML シーン記述のサブセットを読み込める（未指定時は組み込みのデフォルトシーン）。採用理由は [`docs/adr/0002`](docs/adr/0002-mitsuba-xml-scene-format.md) を参照。
@@ -267,7 +285,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<film>` / `<sampler>` / `<integrator>` | 解像度 / `sample_count` / `max_depth`・`rr_depth` (Mitsuba と同じパス長の意味: `max_depth` 1 = 直接見える発光体のみ、2 = 直接照明まで、-1 = 無制限。組み込みシーンの既定は `max_depth` 9・`rr_depth` 4) |
 
 - **色**: `<rgb>` はリニア、`<srgb>` は sRGB (ガンマ展開)。
-- **CLI 優先**: `--spp` はシーンファイルの `sample_count` を上書きする (解像度・`max_depth`・`rr_depth` は CLI から変更不可)。
+- **CLI 優先**: `--spp` はシーンファイルの `sample_count` を上書きする。解像度は `--width` / `--height` / `--res` で上書きできる (`<film>` より優先)。`max_depth`・`rr_depth` は CLI から変更不可。
 - **背景**: 環境 emitter が無ければ黒 (Mitsuba 準拠)。組み込みシーンの手続き的な空は使わない。
 - **スムーズシェーディング**: OBJ に頂点法線 (`vn`) があれば重心座標で補間してシェーディングに使う (既定)。`<boolean name="face_normals" value="true"/>` を shape に書くと頂点法線を捨てて面法線だけで陰影を付ける。`rectangle` / `cube` / `disk` / `sphere` は元から頂点法線を持たないので、この指定で結果は変わらない。 値は Mitsuba と同じく `true` / `false` のみで、それ以外 (`1` / `yes` / `TRUE` など) は**警告して既定にフォールバック**する。
 - 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。ただし `<default>` と `<rfilter>` は**警告なし**で無視される。
