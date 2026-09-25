@@ -33,13 +33,13 @@
   <!-- 地面 -->
   <shape type="rectangle">
     <transform name="to_world"><rotate x="1" angle="-90"/><scale x="14" y="8" z="1"/></transform>
-    <bsdf type="diffuse"><rgb name="reflectance" value="0.55, 0.55, 0.57"/></bsdf>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.12, 0.12, 0.14"/></bsdf>
   </shape>
 
   <!-- 奥の壁 -->
   <shape type="rectangle">
     <transform name="to_world"><translate x="0" y="3" z="-3.5"/><scale x="14" y="3" z="1"/></transform>
-    <bsdf type="diffuse"><rgb name="reflectance" value="0.35, 0.36, 0.42"/></bsdf>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.07, 0.08, 0.12"/></bsdf>
   </shape>
 
   <!-- 静止した箱（比較の基準） -->
@@ -48,7 +48,7 @@
     <transform name="to_world">
       <translate x="-3.6" y="0.5" z="0"/><rotate y="1" angle="25"/>
     </transform>
-    <bsdf type="diffuse"><rgb name="reflectance" value="0.8, 0.3, 0.25"/></bsdf>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.85, 0.12, 0.08"/></bsdf>
   </shape>
 
   <!-- 回転する箱: その場で y 軸まわりに 100° 回る（少し傾けた軸） -->
@@ -60,19 +60,19 @@
     <transform name="to_world_end">
       <translate x="-1.7" y="0.5" z="0"/><rotate x="0.15" y="1" z="0.1" angle="100"/>
     </transform>
-    <bsdf type="diffuse"><rgb name="reflectance" value="0.9, 0.75, 0.25"/></bsdf>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.95, 0.65, 0.05"/></bsdf>
   </shape>
 
-  <!-- 横切る箱: 右へ 1.4（自分の幅の約 1.4 倍）動きながら 40° 回る -->
+  <!-- 横切る箱: 右へ 1.0（自分の幅ぶん）動きながら 25° 回る -->
   <shape type="obj">
     <string name="filename" value="cube.obj"/>
     <transform name="to_world">
       <translate x="-0.5" y="0.5" z="0"/><rotate y="1" angle="10"/>
     </transform>
     <transform name="to_world_end">
-      <translate x="0.9" y="0.5" z="0"/><rotate y="1" angle="50"/>
+      <translate x="0.5" y="0.5" z="0"/><rotate y="1" angle="35"/>
     </transform>
-    <bsdf type="diffuse"><rgb name="reflectance" value="0.3, 0.55, 0.8"/></bsdf>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.08, 0.3, 0.9"/></bsdf>
   </shape>
 
   <!-- 変形するボール: 頂点モーション（潰れて伸びながら持ち上がる）+ 横移動 -->
@@ -81,14 +81,14 @@
     <string name="filename_end" value="motion_ball_close.obj"/>
     <transform name="to_world"><translate x="2.9" y="0.5" z="0"/></transform>
     <transform name="to_world_end"><translate x="3.7" y="0.5" z="0"/></transform>
-    <bsdf type="diffuse"><rgb name="reflectance" value="0.35, 0.7, 0.4"/></bsdf>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.1, 0.65, 0.2"/></bsdf>
   </shape>
 
   <!-- 上方の面光源 -->
   <shape type="rectangle">
     <transform name="to_world">
-      <translate x="0.5" y="7" z="2"/><rotate x="1" angle="90"/><scale x="3" y="2" z="1"/>
+      <translate x="-1.5" y="7" z="3"/><rotate x="1" angle="90"/><scale x="1.2" y="1.2" z="1"/>
     </transform>
-    <emitter type="area"><rgb name="radiance" value="12, 12, 11"/></emitter>
+    <emitter type="area"><rgb name="radiance" value="55, 52, 46"/></emitter>
   </shape>
 </scene>

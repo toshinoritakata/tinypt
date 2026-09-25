@@ -12,9 +12,8 @@ Rust 製のモンテカルロパストレーサー。
 </tr>
 <tr>
 <td width="34%"><a href="docs/images/showcase_fog.png"><img src="docs/images/showcase_fog.png" alt="fog.xml"></a><br>参加媒質 (霧) と天井のスリットからのゴッドレイ。2048spp、1200x675、デノイズあり。<a href="sample/fog.xml"><code>sample/fog.xml</code></a></td>
-</tr>
-<tr>
-<td width="34%"><a href="docs/images/showcase_spotlight.png"><img src="docs/images/showcase_spotlight.png" alt="spotlight.xml"></a><br>スポットライト 2 灯と薄い霧 (デルタ光源)。2048spp、1200x675、デノイズあり。<a href="sample/spotlight.xml"><code>sample/spotlight.xml</code></a></td>
+<td width="33%"><a href="docs/images/showcase_spotlight.png"><img src="docs/images/showcase_spotlight.png" alt="spotlight.xml"></a><br>スポットライト 2 灯と薄い霧 (デルタ光源)。2048spp、1200x675、デノイズあり。<a href="sample/spotlight.xml"><code>sample/spotlight.xml</code></a></td>
+<td width="33%"><a href="docs/images/showcase_motion.png"><img src="docs/images/showcase_motion.png" alt="motion.xml"></a><br>モーションブラー (静止・回転・移動 + 回転・頂点変形)。2048spp、1200x675、デノイズあり。<a href="sample/motion.xml"><code>sample/motion.xml</code></a></td>
 </tr>
 </table>
 
