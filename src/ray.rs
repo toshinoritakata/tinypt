@@ -84,6 +84,15 @@ impl Camera {
             shutter_close: 1.0,
         }
     }
+    /// シャッター区間（レイの `time` の範囲）を設定する。既定は [0, 1]。`open == close` は時刻固定（ブラー無し）。
+    pub fn set_shutter(&mut self, open: f64, close: f64) {
+        self.shutter_open = open;
+        self.shutter_close = close;
+    }
+    /// シャッター区間 `(open, close)`。
+    pub fn shutter(&self) -> (f64, f64) {
+        (self.shutter_open, self.shutter_close)
+    }
     /// 正規化スクリーン座標 [-1, 1] からカメラレイを生成する。
     ///
     /// DOF 有効時: レンズ上のランダムな点から焦点面上の点へレイを飛ばす。焦点面は視線（−w）に

@@ -30,6 +30,7 @@ Sponza Atrium は CC BY 3.0 / © 2010 Frank Meinl, Crytek。Rungholt は CC BY 3
 - **マテリアル**: ランバート拡散・完全鏡面金属・GGX マイクロファセット・誘電体 (ガラス)・面光源 ([詳細](#マテリアル))
 - **参加媒質**: 一様な霧・煙 (σt・アルベド・Henyey-Greenstein の g・任意の AABB 範囲)。チャンネル MIS 付きの距離サンプリング、媒質散乱点での NEE ([詳細](#参加媒質))
 - **デルタ光源**: 点・平行・スポットライト。NEE で全灯を評価し MIS なし・乱数なし ([詳細](#デルタ光源))
+- **モーションブラー**: 回転・スケール・せん断を含む一般のアフィン変換の動き (`to_world_end`) と、OBJ 2 枚による頂点モーション (`filename_end`)、シャッター時刻 ([詳細](#モーションブラー))
 - **Multiple Importance Sampling (MIS)** + **Next Event Estimation (NEE)** による分散低減
 - **層化サンプリング**: ピクセル内のジッターと NEE の光源サンプリングを √spp × √spp の格子に層化。同じ spp で分散が 23〜39% 下がる (平均は変わらない)
 - **Firefly クランプ**: 寄与単位・輝度ベース (閾値 50)。発光体/背景ヒットと NEE のすべての寄与に適用し、MIS の両側で同じ上限になる (バイアスあり)
@@ -326,6 +327,36 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - 参加媒質と併用でき、霧の中では光の円錐が見える。**媒質を使うときは `max_depth` を上げること** ([参加媒質](#参加媒質))。
 - 不正値 (零方向・範囲外の角度・`beam_width` > `cutoff_angle`・負の強度) は警告して補正か無視。`<shape>` の中に書いた点・平行・スポットは警告して無視。
 
+### モーションブラー
+
+`<shape>` にシャッター閉じ時点の変換を与えると、露光中の動きがブラーになる (`sample/motion.xml`)。**以下はすべて tinypt の独自拡張**。
+
+```xml
+<shape type="obj">
+  <string name="filename" value="cube.obj"/>
+  <transform name="to_world"><translate x="-1" y="0.5" z="0"/></transform>          <!-- シャッター開 -->
+  <transform name="to_world_end">                                                     <!-- シャッター閉 -->
+    <rotate x="0" y="1" z="0" angle="35"/><translate x="1" y="0.5" z="0"/>
+  </transform>
+  <!-- 頂点の変形（開と閉の OBJ。頂点数・面の添字が一致すること） -->
+  <string name="filename_end" value="ball_close.obj"/>
+</shape>
+```
+
+```xml
+<sensor type="perspective">
+  <float name="shutter_open" value="0"/>     <!-- 既定 0、[0, 1] -->
+  <float name="shutter_close" value="1"/>    <!-- 既定 1。0.5 にすると動きが半分になる -->
+</sensor>
+```
+
+- `to_world_end` は回転・スケール・せん断を含む**一般のアフィン変換**に対応する。行列を直接補間すると回転が縮むので、読み込み時に極分解 (`A = R·S`) して、平行移動は線形・回転は四元数 slerp・伸縮は成分ごとに線形補間する。省略した形状は静止で、従来と出力がビット単位で同じ。
+- `to_world_end` と `filename_end` は**併用できる** (頂点の変形と変換の動きが両方効く)。
+- 開・閉どちらかの変換が**特異または鏡像** (行列式が負) のときは補間できないので、警告して静止のままにする。
+- `shutter_open > shutter_close` は入れ替え、`shutter_open == shutter_close` は時刻固定 (ブラー無し) で有効。範囲外は [0, 1] に収める (頂点モーションの鍵が時刻 0 と 1 のため)。
+- 動かせるのはメッシュ (`obj` / `rectangle` / `cube` / `disk`)。**球・面光源・カメラは動かせない** (警告して静止)。キーフレームは 2 つだけ。
+- 動くインスタンスは、レイごとに変換を補間して再合成するぶん静止より重い (`sample/motion.xml` で全体が約 5 割増し)。
+
 ### サンプル
 
 | ファイル | 内容 |
@@ -335,6 +366,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
 | `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
 | `sample/spotlight.xml` | スポットライト 2 灯 + 薄い霧。光の円錐と球・箱の影。光源は写らない ([詳細](#デルタ光源)) |
+| `sample/motion.xml` | モーションブラー: 静止した箱・回転する箱・横切りながら回る箱・変形するボール ([詳細](#モーションブラー)) |
 | `sample/fog.xml` | 天井のスリットから差し込む光がつくるゴッドレイ (光の筋)。部屋の中を霧 (`<medium>`) で満たす ([詳細](#参加媒質)) |
 | `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
 | `sample/sponza.xml` | Crytek Sponza (262,267 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |

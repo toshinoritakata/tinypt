@@ -39,7 +39,7 @@ use crate::material::TexId;
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
 use crate::constants::normal_map::MTL_BUMP_K;
 use crate::normal_map::{HeightMap, MapId, NormalMap};
-use crate::obj_loader::{load_obj_groups, load_obj_mesh, MeshData, ObjGroups};
+use crate::obj_loader::{load_obj_groups, load_obj_mesh, load_obj_mesh_mb, MeshData, ObjGroups};
 use crate::texture::{AlphaMask, Texture, Wrap};
 use std::sync::Arc;
 use crate::ray::Camera;
@@ -395,6 +395,9 @@ pub fn load_scene_from_str(
     for l in delta_lights {
         world.add_delta_light(l);
     }
+    // 動くインスタンスの掃過ボリュームは、シャッター区間（センサーの shutter_open / shutter_close）で作る
+    let (shutter_open, shutter_close) = cam.shutter();
+    world.set_shutter(shutter_open, shutter_close);
     world.build_lights(&mats);
     // マップを持つ材質が 1 つも無ければテーブルを空にする（積分器は空テーブルなら何も引かない）
     if mat_maps.iter().all(|m| m.is_none()) {
@@ -671,7 +674,26 @@ fn parse_sensor(el: &Element, aspect: f64) -> Camera {
 
     // look_at_dof は lens_radius = 0.5 * aperture とするため、aperture_radius を
     // レンズ半径として渡すには 2 倍する。
-    Camera::look_at_dof(eye, target, up, vfov, aspect, focus, 2.0 * aperture_radius)
+    let mut cam = Camera::look_at_dof(eye, target, up, vfov, aspect, focus, 2.0 * aperture_radius);
+    // シャッター時刻（Mitsuba 準拠、既定 0 と 1）。頂点モーションの鍵は time = 0 と 1 なので [0, 1] に収める。
+    // open > close は入れ替える。open == close はブラー無し（時刻固定）で有効な指定
+    let mut open = el.float("shutter_open").unwrap_or(0.0);
+    let mut close = el.float("shutter_close").unwrap_or(1.0);
+    if !(open.is_finite() && close.is_finite()) {
+        warn("shutter_open / shutter_close must be finite; using 0 and 1");
+        (open, close) = (0.0, 1.0);
+    }
+    if open > close {
+        warn(&format!("shutter_open {} > shutter_close {}; swapped", open, close));
+        std::mem::swap(&mut open, &mut close);
+    }
+    if open < 0.0 || close > 1.0 {
+        warn(&format!("shutter [{}, {}] is outside [0, 1]; clamped (motion keyframes are at time 0 and 1)", open, close));
+        open = open.clamp(0.0, 1.0);
+        close = close.clamp(0.0, 1.0);
+    }
+    cam.set_shutter(open, close);
+    cam
 }
 
 /// `<lookat origin=".." target=".." up=".."/>` を解析する。
@@ -711,6 +733,7 @@ fn parse_shape(
     if el.typ() == "obj"
         && el.child_tag("bsdf").is_none()
         && shape_emitter(el).is_none()
+        && el.string("filename_end").is_none()
         && el.boolean_or("use_mtl", true)
     {
         parse_obj_with_mtl(el, base_dir, world, mats, mat_maps, textures, normal_maps, mtl_state);
@@ -733,12 +756,16 @@ fn parse_shape(
     // 頂点法線を持たないので、この指定があっても結果は変わらない。
     let face_normals = el.boolean_or("face_normals", false);
     // OBJ をメッシュキャッシュに登録するときのキー（キャッシュミスで読んだときだけ Some）
-    let mut cache_key: Option<(PathBuf, bool)> = None;
+    let mut cache_key: Option<(PathBuf, Option<PathBuf>, bool)> = None;
+    let is_emitter = shape_emitter(el).is_some();
     let mesh: MeshData = match el.typ() {
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
             push_material(mats, mat_maps, mat, map);
+            if el.children.iter().any(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end")) {
+                warn("to_world_end on a sphere is unsupported (only mesh shapes can move); ignored");
+            }
             world.add_sphere(Sphere { c: center, r: radius, mat_id });
             return;
         }
@@ -757,18 +784,33 @@ fn parse_shape(
                 }
             };
             let resolved = resolve_path(base_dir, filename);
-            let key = (std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone()), face_normals);
+            // 頂点モーション（独自拡張）: `filename_end` はシャッター閉の OBJ（トポロジー一致が必要）
+            let resolved_end = el.string("filename_end").map(|f| resolve_path(base_dir, f));
+            // キーは「同じ Mesh になる条件」: 開側のパス・閉側のパス・face_normals。閉側を含め忘れると、
+            // 静止版と動く版（または閉側が違うもの）が共有されて静かに壊れる
+            let canon = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            let key = (canon(&resolved), resolved_end.as_ref().map(canon), face_normals);
             // 同じ OBJ（同じ face_normals）が既に読まれていれば、メッシュを共有してインスタンスだけ足す。
             // 最初のメッシュには最初の形状の mat_id が焼き込まれているので、材質は必ず mat_override で与える
             // （`Hit.mat_id` と面光源の判定は mat_override を見る）
             if let Some(&mesh_id) = mtl_state.obj_cache.get(&key) {
-                let xform = el.child_tag("transform").map(parse_transform).unwrap_or_else(Transform::identity);
+                let xform = shape_to_world(el);
                 push_material(mats, mat_maps, mat, map);
-                world.add_instance_of(mesh_id, xform, Some(mat_id));
+                let inst_id = world.add_instance_of(mesh_id, xform, Some(mat_id));
+                apply_end_transform(el, world, inst_id, is_emitter);
                 return;
             }
             cache_key = Some(key);
-            match timed_obj(|| load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id)) {
+            let loaded = match &resolved_end {
+                Some(end) => timed_obj(|| load_obj_mesh_mb(resolved.to_string_lossy().as_ref(), end.to_string_lossy().as_ref(), mat_id))
+                    .or_else(|e| {
+                        // トポロジー不一致・読み込み失敗: 警告して、モーション無しで開側だけを読む
+                        warn(&format!("vertex motion '{}' -> '{}' unusable: {}; loading without vertex motion", resolved.display(), end.display(), e));
+                        timed_obj(|| load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id))
+                    }),
+                None => timed_obj(|| load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id)),
+            };
+            match loaded {
                 Ok(m) => if face_normals { m.into_flat() } else { m },
                 Err(e) => {
                     warn(&format!("failed to load obj '{}': {}; skipped", resolved.display(), e));
@@ -783,14 +825,36 @@ fn parse_shape(
     };
 
     // to_world 変換（なければ恒等）でメッシュをインスタンス配置する。
-    let xform = el
-        .child_tag("transform")
-        .map(parse_transform)
-        .unwrap_or_else(Transform::identity);
+    let xform = shape_to_world(el);
     push_material(mats, mat_maps, mat, map);
     let inst_id = world.add_mesh_data_instance(mesh, xform, None);
     if let Some(key) = cache_key {
         mtl_state.obj_cache.insert(key, world.instance_mesh_id(inst_id));
+    }
+    apply_end_transform(el, world, inst_id, is_emitter);
+}
+
+/// 形状の `to_world` 変換（`name="to_world"` か名前無しの `<transform>`。`to_world_end` は含まない）。無ければ恒等。
+fn shape_to_world(el: &Element) -> Transform {
+    el.children
+        .iter()
+        .find(|c| c.tag == "transform" && matches!(c.attr("name"), None | Some("to_world")))
+        .map(parse_transform)
+        .unwrap_or_else(Transform::identity)
+}
+
+/// `<transform name="to_world_end">`（**独自拡張**）: シャッター閉じ時点の変換。`to_world`（シャッター開）から
+/// レイの時刻で補間するアニメーション変換にして、回転・スケール・せん断を含む一般のアフィン変換のモーションブラーにする
+/// （極分解 + 四元数 slerp。[`crate::transform::AnimatedTransform`]）。特異・鏡像（行列式が負）の変換は補間できないので
+/// 警告して静止のままにする。面光源のインスタンスは光源サンプリングが時刻を見ない位置を使うので動かせない（警告して静止）。
+fn apply_end_transform(el: &Element, world: &mut World, inst_id: usize, is_emitter: bool) {
+    let Some(end_el) = el.children.iter().find(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end")) else { return };
+    if is_emitter {
+        warn("to_world_end on an area-light shape is unsupported (the light would not move); ignored");
+        return;
+    }
+    if !world.set_instance_end_transform(inst_id, parse_transform(end_el)) {
+        warn("to_world / to_world_end is singular, mirrored (negative determinant) or not decomposable; the shape stays static");
     }
 }
 
@@ -827,7 +891,7 @@ struct MtlState {
     /// 同じ OBJ を何度も配置するとき、解析と BVH 構築を 1 回にしてメッシュを共有する。
     /// `xform` と材質はインスタンス側（`mat_override`）なのでキーに入れない。MTL 経路（`parse_obj_with_mtl`）は
     /// 三角形に焼き込む `mat_id` が形状ごとに積む材質で決まるので共有しない。`load_scene_from_str` 1 回ぶんのローカル状態
-    obj_cache: std::collections::HashMap<(PathBuf, bool), usize>,
+    obj_cache: std::collections::HashMap<(PathBuf, Option<PathBuf>, bool), usize>,
 }
 
 /// `usemtl` の材質を `mat_id` に振り直しつつ、OBJ を 1 メッシュのままインスタンス配置する。
@@ -911,10 +975,7 @@ fn parse_obj_with_mtl(
         t.mat_id += base;
     }
 
-    let xform = el
-        .child_tag("transform")
-        .map(parse_transform)
-        .unwrap_or_else(Transform::identity);
+    let xform = shape_to_world(el);
     // アルファを持つ材質があれば、三角形ごとにマスク添字を振る（メッシュ内で同じ Arc は 1 つに畳む）
     if alphas.iter().any(|a| a.is_some()) {
         let mut masks: Vec<Arc<AlphaMask>> = Vec::new();
@@ -932,9 +993,11 @@ fn parse_obj_with_mtl(
             });
         }
         let tri_alpha: Vec<(u16, f32)> = mesh.tris.iter().map(|t| mat_slot[t.mat_id - base]).collect();
-        world.add_mesh_data_instance_with_alpha(mesh, masks, tri_alpha, xform);
+        let id = world.add_mesh_data_instance_with_alpha(mesh, masks, tri_alpha, xform);
+        apply_end_transform(el, world, id, false);
     } else {
-        world.add_mesh_data_instance(mesh, xform, None);
+        let id = world.add_mesh_data_instance(mesh, xform, None);
+        apply_end_transform(el, world, id, false);
     }
 }
 
@@ -2632,5 +2695,146 @@ mod tests {
         let s = warned(r#"<shape type="sphere"><bsdf type="diffuse"/><emitter type="point"><rgb name="intensity" value="5"/></emitter></shape>"#, "inside a <shape>");
         assert!(s.world.delta_lights().is_empty());
         assert!(s.mats[0].emitted().is_none());
+    }
+
+    // ---- モーション（to_world_end / filename_end / shutter）----
+
+    const END_TRANSFORM: &str = r#"<transform name="to_world_end"><translate x="3" y="0" z="0"/></transform>"#;
+
+    fn motion_dir(tag: &str) -> PathBuf {
+        let dir = share_dir(tag);
+        // a.obj と同じトポロジーで、頂点が +x に 2 動いた閉側
+        std::fs::write(dir.join("a_end.obj"), "v 2 0 0\nv 3 0 0\nv 2 1 0\nvn 0 0 1\nvn 0 1 0\nvn 1 0 0\nf 1//1 2//2 3//3\n").unwrap();
+        // トポロジー不一致（頂点数が違う）
+        std::fs::write(dir.join("bad_end.obj"), "v 2 0 0\nv 3 0 0\nv 2 1 0\nv 9 9 9\nf 1 2 3\n").unwrap();
+        dir
+    }
+
+    fn hit_at(scene: &Scene, x: f64, y: f64, time: f64) -> bool {
+        scene.world.hit(Ray { o: Vec3::new(x, y, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time }, 0.0, 1e30).is_some()
+    }
+
+    /// `to_world_end` を読み、`time` で補間する。`to_world` と `to_world_end` の記述順は問わず、名前で区別する。
+    #[test]
+    fn to_world_end_animates_the_instance() {
+        let dir = motion_dir("anim");
+        let (scene, w) = capture_warnings(|| {
+            share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, END_TRANSFORM))
+        });
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(scene.world.instances()[0].anim.is_some());
+        for (time, dx) in [(0.0, 0.0), (0.5, 1.5), (1.0, 3.0)] {
+            assert!(hit_at(&scene, 0.2 + dx, 0.2, time), "time {time}");
+            assert!(!hit_at(&scene, 0.2 + dx + 1.0, 0.2, time));
+        }
+        // to_world_end を先に書いても、to_world は名前で選ばれる
+        let xml = format!(
+            r#"<shape type="obj"><string name="filename" value="a.obj"/>{}<transform name="to_world"><translate x="10" y="0" z="0"/></transform>{}</shape>"#,
+            END_TRANSFORM, DIFFUSE_A
+        );
+        let scene = share_scene(&dir, &xml);
+        assert!(hit_at(&scene, 10.2, 0.2, 0.0) && hit_at(&scene, 0.2 + 3.0, 0.2, 1.0), "to_world=(10,0,0) → end=(3,0,0)");
+        // 動かない形状は従来どおり
+        let scene = share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, ""));
+        assert!(scene.world.instances()[0].anim.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 頂点モーション（`filename_end`）と `to_world_end` の併用、メッシュ共有のキー、不正入力。
+    #[test]
+    fn filename_end_vertex_motion_and_cache_key() {
+        let dir = motion_dir("vert");
+        let end = r#"<string name="filename_end" value="a_end.obj"/>"#;
+        // 頂点モーション単独
+        let scene = share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, end));
+        assert!(hit_at(&scene, 0.2, 0.2, 0.0) && hit_at(&scene, 2.2, 0.2, 1.0) && !hit_at(&scene, 0.2, 0.2, 1.0));
+        // 併用: 頂点で +2、変換で +3 → 時刻 1 で x = 5
+        let both = format!("{end}{END_TRANSFORM}");
+        let scene = share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, &both));
+        assert!(hit_at(&scene, 0.2, 0.2, 0.0) && hit_at(&scene, 5.2, 0.2, 1.0) && !hit_at(&scene, 2.2, 0.2, 1.0) && !hit_at(&scene, 3.2, 0.2, 1.0));
+        // キー: 同じ a.obj でも filename_end の有無・違いは別メッシュ。同じ組は共有
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("a.obj", 3.0, DIFFUSE_A, end)));
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (2, 2), "静止版と動く版を共有しない");
+        assert!(hit_at(&scene, 3.2, 0.2, 0.0) && hit_at(&scene, 5.2, 0.2, 1.0), "動く側（x=3）は時刻 1 で頂点が +2");
+        assert!(hit_at(&scene, 0.2, 0.2, 1.0), "静止側は動かない");
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, end), obj_shape("a.obj", 5.0, DIFFUSE_B, end)));
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (1, 2), "同じ開・閉の組は共有する");
+        // 共有した側にもそれぞれの変換が効く（頂点モーションは共有、材質は override）
+        assert!(hit_at(&scene, 5.2, 0.2, 0.0) && hit_at(&scene, 7.2, 0.2, 1.0));
+        // トポロジー不一致: 警告してモーション無しで読む
+        let bad = r#"<string name="filename_end" value="bad_end.obj"/>"#;
+        let (scene, w) = capture_warnings(|| share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, bad)));
+        assert!(w.iter().any(|m| m.contains("vertex motion")), "{:?}", w);
+        assert!(hit_at(&scene, 0.2, 0.2, 0.0) && hit_at(&scene, 0.2, 0.2, 1.0), "静止として読まれる");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 退化ケース: 特異・鏡像の `to_world_end` は警告して静止、開と閉が同一・180° 回転は動く、面光源・球は警告して静止。
+    #[test]
+    fn to_world_end_degenerate_inputs() {
+        let dir = motion_dir("deg");
+        let warned = |end: &str, needle: &str| {
+            let (scene, w) = capture_warnings(|| share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, end)));
+            assert!(w.iter().any(|m| m.contains(needle)), "{needle}: {:?}", w);
+            scene
+        };
+        let singular = r#"<transform name="to_world_end"><scale x="1" y="0" z="1"/></transform>"#;
+        assert!(warned(singular, "singular").world.instances()[0].anim.is_none());
+        let mirror = r#"<transform name="to_world_end"><scale x="-1" y="1" z="1"/></transform>"#;
+        assert!(warned(mirror, "mirrored").world.instances()[0].anim.is_none());
+        // 開と閉が同一: 動く扱いだが位置は変わらない
+        let same = share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, r#"<transform name="to_world_end"/>"#));
+        assert!(same.world.instances()[0].anim.is_some());
+        assert!(hit_at(&same, 0.2, 0.2, 0.0) && hit_at(&same, 0.2, 0.2, 0.5) && hit_at(&same, 0.2, 0.2, 1.0));
+        // 180° 回転（z 軸まわり）: 時刻 1 で点対称の位置に三角形が来る。途中も抜け落ちない（三角形の重心付近が通る）
+        let flip = share_scene(&dir, &obj_shape("a.obj", 0.0, DIFFUSE_A, r#"<transform name="to_world_end"><rotate x="0" y="0" z="1" angle="180"/></transform>"#));
+        assert!(hit_at(&flip, 0.2, 0.2, 0.0) && hit_at(&flip, -0.2, -0.2, 1.0));
+        // 面光源
+        let emitter_xml = format!(r#"<shape type="obj"><string name="filename" value="a.obj"/>{}<emitter type="area"><rgb name="radiance" value="5"/></emitter></shape>"#, END_TRANSFORM);
+        let (scene, w) = capture_warnings(|| share_scene(&dir, &emitter_xml));
+        assert!(w.iter().any(|m| m.contains("area-light")), "{:?}", w);
+        assert!(scene.world.instances()[0].anim.is_none());
+        // 球
+        let sphere = format!(r#"<shape type="sphere"><bsdf type="diffuse"/>{}</shape>"#, END_TRANSFORM);
+        let (_, w) = capture_warnings(|| share_scene(&dir, &sphere));
+        assert!(w.iter().any(|m| m.contains("sphere")), "{:?}", w);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// シャッター時刻: 既定は 0 と 1、指定でカメラの time 範囲と掃過ボリュームが狭まる。open > close は入れ替え、
+    /// open == close は時刻固定（有効）、範囲外は [0, 1] に収める。
+    #[test]
+    fn sensor_shutter_times() {
+        let dir = motion_dir("shut");
+        let with_sensor = |props: &str| {
+            let xml = format!(
+                r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/>{props}</sensor>{}</scene>"#,
+                obj_shape("a.obj", 0.0, DIFFUSE_A, END_TRANSFORM)
+            );
+            capture_warnings(|| load_scene_from_str(&xml, &dir, &cfg(), (None, None)).unwrap().0)
+        };
+        let (s, w) = with_sensor("");
+        assert!(w.is_empty(), "{:?}", w);
+        assert_eq!(s.cam.shutter(), (0.0, 1.0));
+        let full = s.world.instances()[0].world_bounds;
+        let (s, _) = with_sensor(r#"<float name="shutter_open" value="0"/><float name="shutter_close" value="0.5"/>"#);
+        assert_eq!(s.cam.shutter(), (0.0, 0.5));
+        assert!(s.world.instances()[0].world_bounds.max.x < full.max.x - 1.0, "掃過ボリュームが狭まる");
+        let mut rng = Rng::new(3);
+        let max_t = (0..2000).map(|_| s.cam.ray(0.0, 0.0, &mut rng).time).fold(0.0, f64::max);
+        assert!(max_t <= 0.5 && max_t > 0.45, "{max_t}");
+        // 逆順: 入れ替え
+        let (s, w) = with_sensor(r#"<float name="shutter_open" value="0.8"/><float name="shutter_close" value="0.2"/>"#);
+        assert!(w.iter().any(|m| m.contains("swapped")));
+        assert_eq!(s.cam.shutter(), (0.2, 0.8));
+        // 同値: 有効（警告なし）、時刻固定
+        let (s, w) = with_sensor(r#"<float name="shutter_open" value="0.3"/><float name="shutter_close" value="0.3"/>"#);
+        assert!(w.is_empty(), "{:?}", w);
+        assert!((0..50).all(|_| s.cam.ray(0.0, 0.0, &mut rng).time == 0.3));
+        // 範囲外: 収める
+        let (s, w) = with_sensor(r#"<float name="shutter_open" value="-1"/><float name="shutter_close" value="4"/>"#);
+        assert!(w.iter().any(|m| m.contains("clamped")));
+        assert_eq!(s.cam.shutter(), (0.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

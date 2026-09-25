@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- モーションブラー: 左から、静止した箱・回転する箱・横切る箱（回転しながら）・変形するボール。
+     どれも同じ露光（シャッター開 → 閉）の間の動きで、静止した箱が比較の基準になる。
+
+     独自拡張（Mitsuba の標準には無い）:
+     - <transform name="to_world_end">: シャッター閉じ時点の変換。to_world（開）からレイの time で補間する。
+       回転・スケール・せん断を含む一般のアフィン変換に対応（極分解 + 四元数 slerp）。省略すると静止。
+     - <string name="filename_end">: 頂点モーション。開の OBJ（filename）と閉の OBJ を頂点ごとに補間する
+       （トポロジー一致が必要）。sample/motion_ball_*.obj は tools/gen_motion_ball.py で生成。
+       to_world_end と併用できる（ボールは頂点の変形と横移動の両方が効く）。
+     - <sensor> の shutter_open / shutter_close（0〜1、既定 0 と 1）。shutter_close を 0.5 にすると動きが半分になる。
+     面光源・球は動かせない（警告して静止）。 -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="8"/>
+    <integer name="rr_depth" value="4"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="256"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="1200"/>
+    <integer name="height" value="675"/>
+  </film>
+
+  <sensor type="perspective">
+    <float name="fov" value="38"/>
+    <string name="fov_axis" value="y"/>
+    <!-- <float name="shutter_open" value="0"/> <float name="shutter_close" value="1"/> -->
+    <transform name="to_world">
+      <lookat origin="0.2, 3.4, 7.2" target="0.2, 0.3, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 地面 -->
+  <shape type="rectangle">
+    <transform name="to_world"><rotate x="1" angle="-90"/><scale x="14" y="8" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.55, 0.55, 0.57"/></bsdf>
+  </shape>
+
+  <!-- 奥の壁 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0" y="3" z="-3.5"/><scale x="14" y="3" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.35, 0.36, 0.42"/></bsdf>
+  </shape>
+
+  <!-- 静止した箱（比較の基準） -->
+  <shape type="obj">
+    <string name="filename" value="cube.obj"/>
+    <transform name="to_world">
+      <translate x="-3.6" y="0.5" z="0"/><rotate y="1" angle="25"/>
+    </transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.8, 0.3, 0.25"/></bsdf>
+  </shape>
+
+  <!-- 回転する箱: その場で y 軸まわりに 100° 回る（少し傾けた軸） -->
+  <shape type="obj">
+    <string name="filename" value="cube.obj"/>
+    <transform name="to_world">
+      <translate x="-1.7" y="0.5" z="0"/><rotate x="0.15" y="1" z="0.1" angle="0"/>
+    </transform>
+    <transform name="to_world_end">
+      <translate x="-1.7" y="0.5" z="0"/><rotate x="0.15" y="1" z="0.1" angle="100"/>
+    </transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.9, 0.75, 0.25"/></bsdf>
+  </shape>
+
+  <!-- 横切る箱: 右へ 1.4（自分の幅の約 1.4 倍）動きながら 40° 回る -->
+  <shape type="obj">
+    <string name="filename" value="cube.obj"/>
+    <transform name="to_world">
+      <translate x="-0.5" y="0.5" z="0"/><rotate y="1" angle="10"/>
+    </transform>
+    <transform name="to_world_end">
+      <translate x="0.9" y="0.5" z="0"/><rotate y="1" angle="50"/>
+    </transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.3, 0.55, 0.8"/></bsdf>
+  </shape>
+
+  <!-- 変形するボール: 頂点モーション（潰れて伸びながら持ち上がる）+ 横移動 -->
+  <shape type="obj">
+    <string name="filename" value="motion_ball_open.obj"/>
+    <string name="filename_end" value="motion_ball_close.obj"/>
+    <transform name="to_world"><translate x="2.9" y="0.5" z="0"/></transform>
+    <transform name="to_world_end"><translate x="3.7" y="0.5" z="0"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.35, 0.7, 0.4"/></bsdf>
+  </shape>
+
+  <!-- 上方の面光源 -->
+  <shape type="rectangle">
+    <transform name="to_world">
+      <translate x="0.5" y="7" z="2"/><rotate x="1" angle="90"/><scale x="3" y="2" z="1"/>
+    </transform>
+    <emitter type="area"><rgb name="radiance" value="12, 12, 11"/></emitter>
+  </shape>
+</scene>

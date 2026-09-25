@@ -21,7 +21,7 @@ use crate::math::{cdf_search, gamma, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
 use crate::texture::AlphaMask;
-use crate::transform::Transform;
+use crate::transform::{AnimatedTransform, Transform};
 
 
 /// 三角形メッシュ（メッシュ単位の BVH 付き）。
@@ -303,7 +303,13 @@ pub struct Instance {
     pub mat_override: Option<usize>,
     /// ワールド空間の保守的な境界ボックス（メッシュの AABB の 8 頂点を変換し、変換の誤差上界ぶん広げたもの）。
     /// `World::hit` で、レイを物体空間へ変換する前の安価な棄却に使う。
+    /// **アニメーション変換のあるインスタンスでは、シャッター区間の全時刻の位置を含む掃過ボリューム**
+    /// （[`AnimatedTransform::swept_bounds`]。TLAS の葉の箱も同じ値を使うので、TLAS も掃過ボリュームで判定する）。
     pub world_bounds: Aabb,
+    /// 静止時（`xform` = シャッター開の変換）の `world_bounds`
+    pub static_bounds: Aabb,
+    /// アニメーション変換（シャッター開 `xform` → 閉）。`None` なら静止インスタンスで、従来と完全に同じ経路を通る
+    pub anim: Option<AnimatedTransform>,
 }
 
 /// 球のワールド空間の境界ボックス（中心 ± 半径）。球の交差判定の丸め誤差ぶんを見込んで少し広げる。
@@ -370,6 +376,8 @@ pub struct World {
     tlas: OnceLock<Option<Tlas>>,
     /// デルタ光源（点・平行・スポット）。`light_cdf` などの面光源の仕組みには**入れない**（[`DeltaLight`] 参照）
     delta_lights: Vec<DeltaLight>,
+    /// シャッター区間（アニメーション変換の掃過ボリュームを作るのに使う）
+    shutter: (f64, f64),
 }
 
 /// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、それ以外は球 `k - n_inst`
@@ -399,6 +407,7 @@ impl World {
             tri_light_id: std::collections::HashMap::new(),
             tlas: OnceLock::new(),
             delta_lights: Vec::new(),
+            shutter: (0.0, 1.0),
         }
     }
 
@@ -486,8 +495,49 @@ impl World {
         self.tlas = OnceLock::new();
         let inst_id = self.instances.len();
         let world_bounds = instance_world_bounds(&self.meshes[mesh_id], &xform);
-        self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds });
+        self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds, static_bounds: world_bounds, anim: None });
         inst_id
+    }
+
+    /// インスタンスにシャッター閉の変換 `end` を与え、レイの `time`（0 = 開 = `xform`、1 = 閉）で補間する
+    /// アニメーション変換にする。**開・閉のどちらかが特異・鏡像（det ≤ 0）・非有限、または極分解が収束しない
+    /// ときは `false` を返し、静止のまま**（呼び出し側が警告する）。`world_bounds` は現在のシャッター区間
+    /// （[`World::set_shutter`]、既定 [0, 1]）の掃過ボリュームになる。
+    pub fn set_instance_end_transform(&mut self, inst_id: usize, end: Transform) -> bool {
+        let inst = &self.instances[inst_id];
+        let Some(anim) = AnimatedTransform::new(inst.xform, end) else { return false };
+        self.tlas = OnceLock::new();
+        self.instances[inst_id].anim = Some(anim);
+        self.refresh_swept_bounds(inst_id);
+        true
+    }
+
+    /// カメラのシャッター区間 `[open, close]`（レイの `time` の範囲）。アニメーション変換のあるインスタンスの
+    /// 掃過ボリュームをこの区間で作り直す。頂点モーション（OBJ 2 枚）の鍵は time = 0 と 1 なので、区間は [0, 1] 内であること。
+    pub fn set_shutter(&mut self, open: f64, close: f64) {
+        self.tlas = OnceLock::new();
+        self.shutter = (open, close);
+        for id in 0..self.instances.len() {
+            if self.instances[id].anim.is_some() {
+                self.refresh_swept_bounds(id);
+            }
+        }
+    }
+
+    fn refresh_swept_bounds(&mut self, inst_id: usize) {
+        let (open, close) = self.shutter;
+        let inst = &self.instances[inst_id];
+        let Some(anim) = inst.anim else { return };
+        // メッシュ（頂点モーションを含む）の物体空間の境界球: ルート AABB の中心と半対角線
+        let bbox = self.meshes[inst.mesh_id].bvh.nodes.first().map(|n| n.bbox);
+        let bounds = match bbox {
+            Some(b) => {
+                let c = (b.min + b.max) * 0.5;
+                anim.swept_bounds(c, (b.max - c).len(), open, close)
+            }
+            None => inst.static_bounds,
+        };
+        self.instances[inst_id].world_bounds = bounds;
     }
 
     /// メッシュ構築（BVH 構築を含む）に費やした累計時間。
@@ -700,8 +750,18 @@ impl World {
             return None;
         }
 
-        let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
-        let d_obj_raw = inst.xform.apply_vec_inv(r.d);
+        // アニメーション変換のインスタンスだけ、レイの時刻で補間した変換を使う（静止は従来の `inst.xform`
+        // をそのまま参照するので、経路も演算も従来と同一 = バイト一致の根拠）
+        let anim_xf;
+        let xf: &Transform = match &inst.anim {
+            Some(a) => {
+                anim_xf = a.at(r.time);
+                &anim_xf
+            }
+            None => &inst.xform,
+        };
+        let (o_obj, o_err) = xf.apply_point_inv_with_error_linf(r.o);
+        let d_obj_raw = xf.apply_vec_inv(r.d);
         let d_len = d_obj_raw.len().max(1e-30); // Vec3::norm と同じ式（ビット一致）
         let d_obj = d_obj_raw / d_len; // stabilize
         // 物体空間へ写した原点には変換の丸め誤差 o_err が乗る。PBRT と同じく、原点をその誤差ぶん
@@ -725,7 +785,7 @@ impl World {
         let mut search_from = tmin_obj;
         for _ in 0..=INSTANCE_RETRY_LIMIT {
             let Some(h_obj) = mesh.hit(r_obj, search_from, tmax_obj) else { break };
-            let (p_world, p_error) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
+            let (p_world, p_error) = xf.apply_point_with_error(h_obj.p, h_obj.p_error);
 
             // r.d is normalized in Camera::ray()
             let t_world = (p_world - r.o).dot(r.d);
@@ -738,9 +798,9 @@ impl World {
                 // 法線は逆転置行列で変換する（非一様スケールでも面に垂直なまま）。
                 // 鏡像（負のスケール）を含む変換では逆転置が向きを反転させうるので、
                 // シェーディング法線は変換後の幾何法線と同じ側に揃え直す。
-                let ng = inst.xform.apply_normal(h_obj.ng);
+                let ng = xf.apply_normal(h_obj.ng);
                 let ns = if h_obj.is_smooth() {
-                    face_forward(inst.xform.apply_normal(h_obj.ns), ng)
+                    face_forward(xf.apply_normal(h_obj.ns), ng)
                 } else {
                     ng
                 };
@@ -833,8 +893,18 @@ impl World {
             _ => None,
         };
 
-        let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
-        let d_obj_raw = inst.xform.apply_vec_inv(r.d);
+        // アニメーション変換のインスタンスだけ、レイの時刻で補間した変換を使う（静止は従来の `inst.xform`
+        // をそのまま参照するので、経路も演算も従来と同一 = バイト一致の根拠）
+        let anim_xf;
+        let xf: &Transform = match &inst.anim {
+            Some(a) => {
+                anim_xf = a.at(r.time);
+                &anim_xf
+            }
+            None => &inst.xform,
+        };
+        let (o_obj, o_err) = xf.apply_point_inv_with_error_linf(r.o);
+        let d_obj_raw = xf.apply_vec_inv(r.d);
         let d_len = d_obj_raw.len().max(1e-30);
         let d_obj = d_obj_raw / d_len;
         let dt = d_obj.l1() * o_err;
@@ -848,7 +918,7 @@ impl World {
         let mut search_from = tmin_obj;
         for _ in 0..=INSTANCE_RETRY_LIMIT {
             let Some(h_obj) = mesh.occluded(r_obj, search_from, tmax_obj, skip_prim) else { break };
-            let (p_world, _) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
+            let (p_world, _) = xf.apply_point_with_error(h_obj.p, h_obj.p_error);
             let t_world = (p_world - r.o).dot(r.d);
             if t_world <= tmin {
                 search_from = h_obj.t.next_up();
@@ -871,7 +941,11 @@ impl World {
         let inst = self.instances.get(hit.inst_id?)?;
         let mesh = self.meshes.get(inst.mesh_id)?;
         let (dpdu, dpdv) = mesh.uv_derivatives(hit.prim_id, time)?;
-        Some((inst.xform.apply_vec(dpdu), inst.xform.apply_vec(dpdv)))
+        let xf = match &inst.anim {
+            Some(a) => a.at(time),
+            None => inst.xform,
+        };
+        Some((xf.apply_vec(dpdu), xf.apply_vec(dpdv)))
     }
 
     /// 発光マテリアルからライトサンプリング構造（CDF）を構築する。
@@ -3401,6 +3475,133 @@ mod tests {
         world.add_sphere(Sphere { c: Vec3::new(0.3, 0.2, 50.0), r: 0.5, mat_id: 0 });
         assert!(world.hit(r, 0.0, 1e30).is_some_and(|h| h.t < 9.0 + 1e-9 || h.mat_id == 0));
         assert_tlas_hit(&world.hit(r, 0.0, 1e30), &world.hit_linear(r, 0.0, 1e30), "after add");
+    }
+
+    // ---- アニメーション変換 ----
+
+    fn tri_mesh(k: f64) -> Vec<Triangle> {
+        vec![
+            Triangle::new_static(Vec3::new(-k, -k, -0.2), Vec3::new(k, -k, 0.2), Vec3::new(0.0, k, 0.0), 0),
+            Triangle::new_static(Vec3::new(-k, -k, 0.3), Vec3::new(k, -k, -0.3), Vec3::new(0.0, k, 0.4), 0),
+        ]
+    }
+
+    fn down_ray(x: f64, y: f64, time: f64) -> Ray {
+        Ray { o: Vec3::new(x, y, 20.0), d: Vec3::new(0.0, 0.0, -1.0), time }
+    }
+
+    /// `time = 0` で開の位置、`time = 1` で閉の位置、`time = 0.5` でちょうど中間に交差する（平行移動）。
+    #[test]
+    fn animated_instance_is_at_open_middle_and_close_positions() {
+        let mut world = World::new();
+        let id = world.add_mesh_instance(tri_mesh(0.5), Transform::translate(Vec3::new(-2.0, 0.0, 0.0)), None);
+        assert!(world.set_instance_end_transform(id, Transform::translate(Vec3::new(2.0, 1.0, 0.0))));
+        for (time, cx, cy) in [(0.0, -2.0, 0.0), (0.5, 0.0, 0.5), (1.0, 2.0, 1.0)] {
+            let h = world.hit(down_ray(cx, cy - 0.2, time), 0.0, 1e30).unwrap_or_else(|| panic!("time {time}: 当たるはず"));
+            assert!((h.p.x - cx).abs() < 1e-12 && (h.p.y - (cy - 0.2)).abs() < 1e-12, "time {time}: {:?}", h.p);
+            assert!(world.hit(down_ray(cx + 3.0, cy, time), 0.0, 1e30).is_none());
+        }
+        // 開の位置のままで時刻 1 を撃つと外れる（動いている）
+        assert!(world.hit(down_ray(-2.0, -0.2, 1.0), 0.0, 1e30).is_none());
+        // 遮蔽判定も同じ時刻の位置で判定する
+        let occ = |x: f64, y: f64, time: f64| world.occluded(down_ray(x, y, time), 0.0, 1e30, None);
+        assert!(occ(0.0, 0.3, 0.5) && !occ(0.0, 0.3, 0.0));
+    }
+
+    /// 掃過ボリュームの保守性: 回転・平行移動・非一様スケールのアニメーション変換に、ランダムなレイ × 時刻を
+    /// 2 万本投げ、箱で棄却する通常の経路と、箱の棄却を外した総当たり（箱を巨大にした同じワールド）が
+    /// ビット単位で一致する。取りこぼしがあれば保守的でない（TLAS の有無も両方: 24 個 = 閾値超）。
+    #[test]
+    fn swept_bounds_are_conservative_against_no_culling() {
+        for n_inst in [3usize, 24] {
+            let rng = std::cell::RefCell::new(Rng::new(31 + n_inst as u64));
+            let u = |a: f64, b: f64| a + (b - a) * rng.borrow_mut().next_f64();
+            let mut world = World::new();
+            for i in 0..n_inst {
+                let p0 = Vec3::new(u(-6.0, 6.0), u(-6.0, 6.0), u(-2.0, 2.0));
+                let p1 = Vec3::new(u(-6.0, 6.0), u(-6.0, 6.0), u(-2.0, 2.0));
+                let ax = Vec3::new(u(-1.0, 1.0), u(-1.0, 1.0), u(0.2, 1.0));
+                let s0 = u(0.3, 1.5);
+                let start = Transform::translate(p0).compose(Transform::rotate(ax, u(0.0, 360.0))).compose(Transform::scale(Vec3::new(s0, s0 * u(0.5, 2.0), s0)));
+                let end = Transform::translate(p1)
+                    .compose(Transform::rotate(Vec3::new(u(-1.0, 1.0), u(-1.0, 1.0), u(0.2, 1.0)), u(0.0, 360.0)))
+                    .compose(Transform::scale(Vec3::new(u(0.3, 2.5), u(0.3, 2.5), u(0.3, 2.5))));
+                let id = world.add_mesh_instance(tri_mesh(1.5), start, Some(i % 3));
+                assert!(world.set_instance_end_transform(id, end));
+            }
+            let mut reference = World::new();
+            reference.meshes = world.meshes.iter().map(|m| Mesh::new(m.tris.clone())).collect();
+            reference.instances = world.instances.clone();
+            let huge = Aabb { min: Vec3::new(-1e9, -1e9, -1e9), max: Vec3::new(1e9, 1e9, 1e9) };
+            for inst in &mut reference.instances {
+                inst.world_bounds = huge;
+            }
+            let mut hits = 0;
+            for _ in 0..20_000 {
+                let o = Vec3::new(u(-14.0, 14.0), u(-14.0, 14.0), u(-14.0, 14.0));
+                let d = uniform_sphere_dir(&mut rng.borrow_mut());
+                let r = Ray { o, d, time: u(0.0, 1.0) };
+                let (a, b) = (world.hit(r, 0.0, 1e30), reference.hit(r, 0.0, 1e30));
+                assert_eq!(a.is_some(), b.is_some(), "取りこぼし: t={:?} time={}", b.map(|h| h.t), r.time);
+                if let (Some(a), Some(b)) = (a, b) {
+                    hits += 1;
+                    assert_eq!((a.t.to_bits(), a.inst_id, a.prim_id), (b.t.to_bits(), b.inst_id, b.prim_id));
+                }
+                assert_eq!(world.occluded(r, 0.0, 30.0, None), reference.occluded(r, 0.0, 30.0, None));
+            }
+            assert!(hits > 200, "テストが自明でない程度に当たる: {hits}");
+        }
+    }
+
+    /// 頂点モーションとアニメーション変換の併用: どちらも効く。
+    #[test]
+    fn vertex_motion_and_animated_transform_combine() {
+        let tri = Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0);
+        let data = MeshData {
+            tris: vec![tri],
+            vn: Vec::new(),
+            tri_vn: Vec::new(),
+            uv: Vec::new(),
+            tri_uv: Vec::new(),
+            // 閉: 頂点が x に +2
+            motion: vec![[Vec3::new(2.0, 0.0, 0.0), Vec3::new(3.0, 0.0, 0.0), Vec3::new(2.0, 1.0, 0.0)]],
+        };
+        let mut world = World::new();
+        let id = world.add_mesh_data_instance(data, Transform::identity(), None);
+        // 変換は y に +5
+        assert!(world.set_instance_end_transform(id, Transform::translate(Vec3::new(0.0, 5.0, 0.0))));
+        for time in [0.0, 0.25, 0.5, 1.0] {
+            let (x, y) = (0.2 + 2.0 * time, 0.2 + 5.0 * time);
+            assert!(world.hit(down_ray(x, y, time), 0.0, 1e30).is_some(), "time {time}: 両方の動きを足した位置に当たる");
+            assert!(world.hit(down_ray(0.2, y, time), 0.0, 1e30).is_none() == (time > 0.0), "頂点モーションだけ無視した位置は外れる");
+            assert!(world.hit(down_ray(x, 0.2, time), 0.0, 1e30).is_none() == (time > 0.0), "変換のモーションだけ無視した位置は外れる");
+        }
+    }
+
+    /// アニメーション変換を持たないインスタンスは、他にアニメーションするインスタンスがあっても、単独のときとビット一致する
+    /// （静止は従来の経路: `anim` が `None`）。
+    #[test]
+    fn static_instance_is_bit_identical_next_to_animated_ones() {
+        let xf = Transform::translate(Vec3::new(0.3, 0.1, 0.0)).compose(Transform::rotate(Vec3::new(0.2, 1.0, 0.4), 33.0));
+        let mut alone = World::new();
+        alone.add_mesh_instance(tri_mesh(1.0), xf, None);
+        let mut mixed = World::new();
+        mixed.add_mesh_instance(tri_mesh(1.0), xf, None);
+        let other = mixed.add_mesh_instance(tri_mesh(1.0), Transform::translate(Vec3::new(5.0, 0.0, 0.0)), None);
+        assert!(mixed.set_instance_end_transform(other, Transform::translate(Vec3::new(9.0, 0.0, 0.0))));
+        assert!(mixed.instances()[0].anim.is_none());
+        let mut rng = Rng::new(4);
+        for _ in 0..3000 {
+            let r = Ray { o: Vec3::new(rng.next_f64() * 2.0 - 1.0, rng.next_f64() * 2.0 - 1.0, 9.0), d: Vec3::new(0.0, 0.0, -1.0), time: rng.next_f64() };
+            let (a, b) = (alone.hit(r, 0.0, 1e30), mixed.hit(r, 0.0, 1e30));
+            match (a, b) {
+                (Some(a), Some(b)) if b.inst_id == Some(0) => {
+                    assert_eq!((a.t.to_bits(), a.p.x.to_bits(), a.p_error.x.to_bits(), a.ng.z.to_bits()), (b.t.to_bits(), b.p.x.to_bits(), b.p_error.x.to_bits(), b.ng.z.to_bits()));
+                }
+                (Some(_), _) => panic!("静止インスタンスに当たらない"),
+                _ => {}
+            }
+        }
     }
 
 }
