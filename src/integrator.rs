@@ -25,7 +25,7 @@ use crate::ray::Ray;
 use crate::rng::Rng;
 use crate::normal_map::{orthonormalize, MapId, NormalMap};
 use crate::texture::Texture;
-use crate::world::World;
+use crate::world::{DeltaLight, World};
 
 /// デフォルトの空色を返す（環境マップ未使用時のフォールバック）。
 /// 方向の Y 成分で白〜青のグラデーションを線形補間する。
@@ -155,6 +155,12 @@ pub fn radiance(
                         );
                         accumulated_radiance = accumulated_radiance + contrib;
                     }
+                    // デルタ光源（乱数を引かない。0 個なら空回り）
+                    for dl in world.delta_lights() {
+                        let occluded = |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, None);
+                        let contrib = nee_delta_light_phase(occluded, dl, med, path_throughput, p, wo, ray.time);
+                        accumulated_radiance = accumulated_radiance + contrib;
+                    }
 
                     // Russian Roulette: 表面と完全に同じ規則（省くと光学的に厚い媒質で経路が終わらない）。
                     // `eta_scale` は変えない（η² 補償は透過専用）
@@ -261,6 +267,13 @@ pub fn radiance(
                     |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, Some((ls.inst_id, ls.prim_id))),
                     &mat, path_throughput, &hit, n, ng, ray, &ls, medium,
                 );
+                accumulated_radiance = accumulated_radiance + contrib;
+            }
+            // NEE: デルタ光源（点・平行・スポット）。乱数を引かず、MIS もしない（BSDF サンプリングでは当たらない）。
+            // 0 個ならループが空回りするだけで、乱数の消費列は変わらない
+            for dl in world.delta_lights() {
+                let occluded = |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, None);
+                let contrib = nee_delta_light(occluded, dl, &mat, path_throughput, &hit, n, ng, ray, medium);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
         }
@@ -571,6 +584,79 @@ fn nee_area_light_phase(
     let w = mis_weight(ls.pdf, f);
     let c = path_throughput.hadamard(ls.emit) * (f * w / ls.pdf);
     c.hadamard(transmittance).clamp_luminance(FIREFLY_CLAMP)
+}
+
+/// デルタ光源（点・平行・スポット）に対する表面の NEE。1 個ぶんの寄与を返す。
+///
+/// `contrib = throughput ⊙ f ⊙ value · cos`。**pdf で割らず、MIS 重みも掛けない**: デルタ光源は BSDF
+/// サンプリングでは絶対に当たらないので、MIS の相方がおらず重みは 1（掛けると暗くなる）。乱数は引かない。
+/// 表面 NEE と同じく、`ng` の裏向き・cos ≤ 0 は寄与 0、シャドウレイの始点は面の誤差の箱の外へずらす。
+/// 光源には幾何が無いので、遮蔽判定に光源自身の除外（skip）は無い。
+/// 終点は、**ずらした始点から**光源位置までの距離を測り直して決める（始点がずれるので `distance` を流用しない）。
+fn nee_delta_light(
+    occluded: impl Fn(Ray, f64) -> bool,
+    light: &DeltaLight,
+    mat: &Material,
+    path_throughput: Color,
+    hit: &Hit,
+    n: Vec3,
+    ng: Vec3,
+    ray: Ray,
+    medium: Option<&Medium>,
+) -> Color {
+    let Some(dh) = light.sample_at(hit.p) else { return Color::new(0.0, 0.0, 0.0) };
+    let wi = dh.wi;
+    let cos = n.dot(wi).max(0.0);
+    if cos <= 0.0 || wi.dot(ng) <= 0.0 {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let from = offset_ray_origin(hit.p, hit.p_error, hit.ng, wi);
+    let (dir, tmax) = match dh.position {
+        Some(pos) => {
+            let seg = pos - from;
+            let len = seg.len();
+            if !(len > 0.0) {
+                return Color::new(0.0, 0.0, 0.0);
+            }
+            (seg / len, len)
+        }
+        None => (wi, RAY_T_MAX),
+    };
+    let shadow = Ray { o: from, d: dir, time: ray.time };
+    if occluded(shadow, tmax) {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let (f, _pdf) = mat.eval((-ray.d).norm(), wi, n);
+    let mut c = path_throughput.hadamard(f).hadamard(dh.value) * cos;
+    if let Some(med) = medium {
+        c = c.hadamard(med.transmittance(shadow, 0.0, tmax));
+    }
+    c.clamp_luminance(FIREFLY_CLAMP)
+}
+
+/// 媒質散乱点 `p` からのデルタ光源 NEE。[`nee_delta_light`] との違いは他の `*_phase` と同じ: cos 項なし、
+/// 原点ずらしなし（`p` から直接撃つ）、裏面棄却なし、`f = hg_eval(wo·wi, g)`。MIS なし・乱数なし。
+fn nee_delta_light_phase(
+    occluded: impl Fn(Ray, f64) -> bool,
+    light: &DeltaLight,
+    med: &Medium,
+    path_throughput: Color,
+    p: Vec3,
+    wo: Vec3,
+    time: f64,
+) -> Color {
+    let Some(dh) = light.sample_at(p) else { return Color::new(0.0, 0.0, 0.0) };
+    let tmax = match dh.position {
+        Some(pos) => (pos - p).len(),
+        None => RAY_T_MAX,
+    };
+    let shadow = Ray { o: p, d: dh.wi, time };
+    if occluded(shadow, tmax) {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    let f = hg_eval(wo.dot(dh.wi), med.g);
+    let c = path_throughput.hadamard(dh.value) * f;
+    c.hadamard(med.transmittance(shadow, 0.0, tmax)).clamp_luminance(FIREFLY_CLAMP)
 }
 
 /// Power Heuristic (β=2) による MIS 重みを計算する。
@@ -1399,6 +1485,245 @@ mod tests {
         // 光源側の減衰を中心距離で近似しているぶん（σ·r ≈ 1.5%）を許容する
         assert!((mean[0] - exact).abs() < 5.0 * se[0] + 0.02 * exact, "{} ± {} vs {}", mean[0], se[0], exact);
     }
+    // ---- デルタ光源（点・平行・スポット）----
+
+    use crate::world::DeltaLight;
+
+    /// y = 0 の大きな平面（材質 0）だけのワールド。背景は黒（環境光 NEE は寄与 0）。
+    fn plane_world(lights: &[DeltaLight]) -> World {
+        plane_world_sized(lights, 200.0)
+    }
+
+    /// 半辺 `e` の平面。スケール不変のテストでは平面の大きさも一緒に変える（座標の大きさが誤差上界に効くため）。
+    fn plane_world_sized(lights: &[DeltaLight], e: f64) -> World {
+        use crate::geometry::Triangle;
+        use crate::transform::Transform;
+        let mut world = World::new();
+        let v = |x: f64, z: f64| Vec3::new(x, 0.0, z);
+        world.add_mesh_instance(
+            vec![
+                Triangle::new_static(v(-e, -e), v(e, e), v(e, -e), 0),
+                Triangle::new_static(v(-e, -e), v(-e, e), v(e, e), 0),
+            ],
+            Transform::identity(),
+            None,
+        );
+        for l in lights {
+            world.add_delta_light(*l);
+        }
+        world
+    }
+
+    const RHO: f64 = 0.6;
+    fn lambert() -> Vec<Material> {
+        vec![Material::Lambert { albedo: Color::new(RHO, RHO, RHO), albedo_tex: None }]
+    }
+    fn black_env() -> EnvMap {
+        EnvMap::constant(Color::new(0.0, 0.0, 0.0))
+    }
+
+    /// 平面上の点 `target` を斜め上から見たカメラレイの放射輝度（赤）。デルタ光源の NEE は乱数を引かないので決定的。
+    fn plane_radiance(world: &World, mats: &[Material], medium: Option<&Medium>, target: Vec3, from: Vec3) -> f64 {
+        let ray = Ray { o: from, d: (target - from).norm(), time: 0.0 };
+        let mut rng = Rng::new(1);
+        let env = black_env();
+        radiance(world, mats, &Surfaces::none(), Some(&env), medium, ray, &mut rng, PathLimits { max_depth: 3, rr_depth: 1000 }, None).r()
+    }
+
+    fn close(a: f64, b: f64, rel: f64) -> bool {
+        (a - b).abs() <= rel * b.abs().max(1e-300)
+    }
+
+    /// 点光源: 直下 ρ/π · I/h²、斜めの点 ρ/π · I/d² · cosθ に厳密一致。
+    #[test]
+    fn point_light_matches_analytic() {
+        let (h, i) = (2.0, 5.0);
+        let light = Vec3::new(0.0, h, 0.0);
+        let world = plane_world(&[DeltaLight::Point { position: light, intensity: Color::new(i, i, i) }]);
+        let mats = lambert();
+        let from = |t: Vec3| t + Vec3::new(-0.3, 1.0, -0.1);
+        let t0 = Vec3::new(0.0, 0.0, 0.0);
+        let got = plane_radiance(&world, &mats, None, t0, from(t0));
+        assert!(close(got, RHO / std::f64::consts::PI * i / (h * h), 1e-12), "{got}");
+        for t in [Vec3::new(2.0, 0.0, 1.0), Vec3::new(-3.0, 0.0, 0.5), Vec3::new(10.0, 0.0, -7.0)] {
+            let d2 = (light - t).dot(light - t);
+            let cos = h / d2.sqrt();
+            let want = RHO / std::f64::consts::PI * i / d2 * cos;
+            let got = plane_radiance(&world, &mats, None, t, from(t));
+            assert!(close(got, want, 1e-12), "{:?}: {} vs {}", t, got, want);
+        }
+        // 逆二乗則: 高さ 2 倍で 1/4
+        let world2 = plane_world(&[DeltaLight::Point { position: Vec3::new(0.0, 2.0 * h, 0.0), intensity: Color::new(i, i, i) }]);
+        let got2 = plane_radiance(&world2, &mats, None, t0, from(t0));
+        assert!(close(got2 / got, 0.25, 1e-12), "{}", got2 / got);
+    }
+
+    /// 平行光源: ρ/π · E · cosθ（距離に依らない）。
+    #[test]
+    fn directional_light_matches_analytic() {
+        let e = 3.0;
+        for deg in [0.0f64, 20.0, 45.0, 70.0] {
+            let th = deg.to_radians();
+            let dir = Vec3::new(-th.sin(), -th.cos(), 0.0); // 光の進む向き
+            let world = plane_world(&[DeltaLight::Directional { direction: dir * 5.0, irradiance: Color::new(e, e, e) }]);
+            let mats = lambert();
+            for t in [Vec3::new(0.0, 0.0, 0.0), Vec3::new(50.0, 0.0, 30.0)] {
+                let got = plane_radiance(&world, &mats, None, t, t + Vec3::new(-0.3, 1.0, -0.1));
+                let want = RHO / std::f64::consts::PI * e * th.cos();
+                assert!(close(got, want, 1e-12), "θ={} {:?}: {} vs {}", deg, t, got, want);
+            }
+        }
+    }
+
+    /// スポット: 軸上は点光源と一致、cutoff の外はちょうど 0、beam〜cutoff の間で単調に落ちて境界に飛びが無い。
+    #[test]
+    fn spot_light_falloff() {
+        let (h, i) = (2.0, 5.0);
+        let (cut, beam) = (30f64.to_radians(), 20f64.to_radians());
+        let pos = Vec3::new(0.0, h, 0.0);
+        let spot = DeltaLight::Spot { position: pos, direction: Vec3::new(0.0, -1.0, 0.0), intensity: Color::new(i, i, i), cutoff_angle: cut, beam_width: beam };
+        let point = DeltaLight::Point { position: pos, intensity: Color::new(i, i, i) };
+        let mats = lambert();
+        let (ws, wp) = (plane_world(&[spot]), plane_world(&[point]));
+        let t0 = Vec3::new(0.0, 0.0, 0.0);
+        let a = plane_radiance(&ws, &mats, None, t0, t0 + Vec3::new(-0.3, 1.0, -0.1));
+        let b = plane_radiance(&wp, &mats, None, t0, t0 + Vec3::new(-0.3, 1.0, -0.1));
+        assert_eq!(a.to_bits(), b.to_bits(), "軸上は点光源と同じ");
+        // 角度（軸からの角）を掃引して係数 = 値 / 点光源の値
+        let value_at = |deg: f64| {
+            let p = Vec3::new(h * deg.to_radians().tan(), 0.0, 0.0);
+            spot.sample_at(p).map_or(0.0, |x| x.value.r()) / point.sample_at(p).unwrap().value.r()
+        };
+        assert_eq!(value_at(35.0), 0.0);
+        assert_eq!(value_at(30.0), 0.0, "cutoff ちょうどは 0");
+        assert!(value_at(29.999) < 1e-6, "cutoff の直前はほぼ 0（飛びなし）: {}", value_at(29.999));
+        assert!(value_at(20.001) > 1.0 - 1e-6 && value_at(20.001) <= 1.0, "beam の直後はほぼ 1（飛びなし）");
+        assert_eq!(value_at(10.0), 1.0);
+        let mut prev = 1.0;
+        for k in 0..=100 {
+            let deg = 20.0 + 10.0 * k as f64 / 100.0;
+            let f = value_at(deg);
+            assert!(f <= prev + 1e-15, "単調に落ちる: {deg}° {f} > {prev}");
+            assert!((prev - f).abs() < 0.05, "刻みごとの飛びが小さい");
+            prev = f;
+        }
+        // 中間の係数は smoothstep(余弦)
+        let deg = 25.0f64;
+        let (cc, cb, ct) = (cut.cos(), beam.cos(), deg.to_radians().cos());
+        let t = (ct - cc) / (cb - cc);
+        assert!(close(value_at(deg), t * t * (3.0 - 2.0 * t), 1e-12));
+    }
+
+    /// 光源と点の間に板を挟むと寄与がちょうど 0。板が無ければ非 0。
+    #[test]
+    fn occluder_blocks_delta_lights() {
+        use crate::geometry::Triangle;
+        use crate::transform::Transform;
+        let mats = lambert();
+        let t0 = Vec3::new(0.0, 0.0, 0.0);
+        let from = Vec3::new(20.0, 0.2, 0.0); // 板の下をくぐる低い角度
+        let lights = [
+            DeltaLight::Point { position: Vec3::new(0.0, 2.0, 0.0), intensity: Color::new(5.0, 5.0, 5.0) },
+            DeltaLight::Directional { direction: Vec3::new(0.0, -1.0, 0.0), irradiance: Color::new(3.0, 3.0, 3.0) },
+        ];
+        for l in lights {
+            let mut world = plane_world(&[l]);
+            assert!(plane_radiance(&world, &mats, None, t0, from) > 0.1);
+            let v = |x: f64, z: f64| Vec3::new(x, 1.0, z);
+            world.add_mesh_instance(
+                vec![Triangle::new_static(v(-3.0, -3.0), v(3.0, -3.0), v(3.0, 3.0), 0), Triangle::new_static(v(-3.0, -3.0), v(3.0, 3.0), v(-3.0, 3.0), 0)],
+                Transform::identity(),
+                None,
+            );
+            assert_eq!(plane_radiance(&world, &mats, None, t0, from), 0.0, "{:?}", l);
+        }
+    }
+
+    /// スケール則。長さを k 倍すると点光源の d² が k² 倍になるので、同じ絵にするには強度 I を k² 倍にする
+    /// （放射照度 = I/d²）。平行光源は距離減衰が無いので放射照度 E はそのまま。
+    #[test]
+    fn delta_lights_scale_invariance() {
+        let mats = lambert();
+        let (h, i, e) = (2.0, 5.0, 3.0);
+        let base_t = Vec3::new(2.0, 0.0, 1.0);
+        let mk = |k: f64| {
+            plane_world_sized(&[
+                DeltaLight::Point { position: Vec3::new(0.0, h * k, 0.0), intensity: Color::new(i * k * k, i * k * k, i * k * k) },
+                DeltaLight::Directional { direction: Vec3::new(-0.3, -1.0, 0.2), irradiance: Color::new(e, e, e) },
+            ], 1e3 * k)
+        };
+        let want = plane_radiance(&mk(1.0), &mats, None, base_t, base_t + Vec3::new(-0.3, 1.0, -0.1));
+        for k in [1e-3, 1e3] {
+            let t = base_t * k;
+            let got = plane_radiance(&mk(k), &mats, None, t, t + Vec3::new(-0.3, 1.0, -0.1) * k);
+            assert!(close(got, want, 1e-9), "k={k}: {got} vs {want}");
+        }
+    }
+
+    /// 回帰: デルタ光源に MIS を掛けてはいけない。BSDF pdf が大きい粗い GGX でも、値は
+    /// `f · I/d² · cos`（`mat.eval` の f）にちょうど一致する。MIS 重み（<1）を掛けると暗くなり落ちる。
+    #[test]
+    fn delta_light_is_not_mis_weighted_on_rough_ggx() {
+        let mats = vec![Material::Ggx { albedo: Color::new(0.8, 0.8, 0.8), alpha: 0.9 }];
+        let (h, i) = (2.0, 5.0);
+        let light = Vec3::new(0.5, h, -0.3);
+        let world = plane_world(&[DeltaLight::Point { position: light, intensity: Color::new(i, i, i) }]);
+        let t = Vec3::new(0.0, 0.0, 0.0);
+        let from = t + Vec3::new(-0.4, 1.0, -0.2);
+        let ray = Ray { o: from, d: (t - from).norm(), time: 0.0 };
+        let wi = (light - t).norm();
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let (f, pdf) = mats[0].eval((-ray.d).norm(), wi, n);
+        assert!(pdf > 0.05, "MIS 重みが目立つほど pdf が大きい材質のはず: {pdf}");
+        let want = f.r() * i / (light - t).dot(light - t) * n.dot(wi);
+        let got = plane_radiance(&world, &mats, None, t, from);
+        assert!(close(got, want, 1e-12), "{got} vs {want}");
+    }
+
+    /// 参加媒質との併用: 霧（吸収のみ）の中の点光源は exp(-σt·d) ぶん減衰する。
+    /// 媒質の箱は評価点の真上（y ∈ [0.1, 2.5]）だけで、カメラレイは箱の下を通る（カメラ側は減衰しない）。
+    #[test]
+    fn delta_light_is_attenuated_by_the_medium() {
+        use crate::geometry::Aabb;
+        let (h, i, sigma) = (2.0, 5.0, 0.7);
+        let world = plane_world(&[DeltaLight::Point { position: Vec3::new(0.0, h, 0.0), intensity: Color::new(i, i, i) }]);
+        let mats = lambert();
+        let med = Medium {
+            sigma_t: Color::new(sigma, sigma, sigma),
+            albedo: Color::new(0.0, 0.0, 0.0),
+            g: 0.0,
+            bounds: Some(Aabb { min: Vec3::new(-0.5, 0.1, -0.5), max: Vec3::new(0.5, 2.5, 0.5) }),
+        };
+        let t = Vec3::new(0.0, 0.0, 0.0);
+        let from = Vec3::new(20.0, 0.01, 0.0);
+        let plain = plane_radiance(&world, &mats, None, t, from);
+        let fog = plane_radiance(&world, &mats, Some(&med), t, from);
+        // 影の光路は y = 0（の少し上）から光源 y = h まで。箱の中は y ∈ [0.1, h]
+        let want = plain * (-sigma * (h - 0.1)).exp();
+        assert!(close(fog, want, 1e-9), "{fog} vs {want}");
+    }
+
+    /// 媒質散乱点のデルタ NEE: `throughput · I/d² · hg · exp(-σt d)`（cos なし・MIS なし）、遮蔽で 0。
+    #[test]
+    fn delta_light_phase_nee_matches_analytic() {
+        let (i, sigma, g) = (5.0, 0.4, 0.5);
+        let pos = Vec3::new(0.0, 3.0, 0.0);
+        let light = DeltaLight::Point { position: pos, intensity: Color::new(i, i, i) };
+        let med = Medium { sigma_t: Color::new(sigma, sigma, sigma), albedo: Color::new(1.0, 1.0, 1.0), g, bounds: None };
+        let p = Vec3::new(1.0, 0.0, 0.5);
+        let wo = Vec3::new(0.2, -0.7, 0.4).norm();
+        let tp = Color::new(0.8, 0.8, 0.8);
+        let wi = (pos - p).norm();
+        let d = (pos - p).len();
+        let want = 0.8 * i / (d * d) * hg_eval(wo.dot(wi), g) * (-sigma * d).exp();
+        let got = nee_delta_light_phase(|_, _| false, &light, &med, tp, p, wo, 0.0).r();
+        assert!(close(got, want, 1e-12), "{got} vs {want}");
+        assert_eq!(nee_delta_light_phase(|_, _| true, &light, &med, tp, p, wo, 0.0).r(), 0.0);
+        // 平行光源: 距離減衰なし（無限遠までの透過率 = 0 になる無限媒質では 0）
+        let sun = DeltaLight::Directional { direction: Vec3::new(0.0, -1.0, 0.0), irradiance: Color::new(2.0, 2.0, 2.0) };
+        assert_eq!(nee_delta_light_phase(|_, _| false, &sun, &med, tp, p, wo, 0.0).r(), 0.0);
+    }
+
 }
 
 /// 法線マップ／バンプマップの配線テスト（Mitsuba のラッパー構文で作ったシーンを積分器に通す）。

@@ -368,6 +368,8 @@ pub struct World {
     /// トップレベル BVH（インスタンス + 球）。最初の交差判定で遅延構築し、ジオメトリを足すたびに捨てる。
     /// プリミティブが `TLAS_MIN_PRIMS` 未満なら `None`（従来どおり線形に総当たりする）
     tlas: OnceLock<Option<Tlas>>,
+    /// デルタ光源（点・平行・スポット）。`light_cdf` などの面光源の仕組みには**入れない**（[`DeltaLight`] 参照）
+    delta_lights: Vec<DeltaLight>,
 }
 
 /// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、それ以外は球 `k - n_inst`
@@ -396,7 +398,18 @@ impl World {
             mesh_build_time: std::time::Duration::ZERO,
             tri_light_id: std::collections::HashMap::new(),
             tlas: OnceLock::new(),
+            delta_lights: Vec::new(),
         }
+    }
+
+    /// デルタ光源を足す。面光源用の `light_cdf` / `sample_light` / `light_pdf` には影響しない。
+    pub fn add_delta_light(&mut self, light: DeltaLight) {
+        self.delta_lights.push(light);
+    }
+
+    /// デルタ光源の一覧。積分器の NEE が毎回すべてを順に評価する。
+    pub fn delta_lights(&self) -> &[DeltaLight] {
+        &self.delta_lights
     }
 
     /// 全ジオメトリ（球と、変換後のメッシュインスタンス）のワールド空間の境界ボックス。
@@ -1233,6 +1246,82 @@ pub struct LightInfo {
     pub weight: f64,
     /// この光源上の任意の点（シャッター区間全体）の成分ごとの誤差上界（`build_lights` で事前計算）
     pub p_error: Vec3,
+}
+
+/// デルタ光源: 発光が面積ゼロに集中した光源（点・平行・スポット）。
+///
+/// 方向の確率密度が Dirac のデルタなので有限の立体角 pdf として書けず、次の性質を持つ:
+/// - BSDF サンプリングでは絶対に当たらない → **MIS を適用しない**（NEE の寄与に重み 1 で足す。pdf でも割らない）
+/// - 幾何を持たないので `light_pdf` の対象ではない（[`Light`] とは別の型にして、`inst_id: None` = 球という
+///   既存の暗黙の約束に紛れ込ませない）
+///
+/// **面光源の CDF に入れず、NEE のたびに全部を順に評価する**: 面積ゼロなので「サンプリング」が要らず
+/// （乱数を引かない）、CDF に入れても選択の分散が増えるだけ。デルタ光源が 0 個ならループが空回りするだけで
+/// 乱数の消費列が変わらない。光源が数個の想定で、多数（数百〜）あるシーンでは NEE が光源数に比例して重くなる
+/// （その規模は想定外）。
+#[derive(Clone, Copy, Debug)]
+pub enum DeltaLight {
+    /// 点光源。`intensity` は放射強度 I [W/sr]。距離 d の点での放射照度は I/d²
+    Point { position: Vec3, intensity: Color },
+    /// 平行光源（太陽）。`direction` は光の進む向き（光源 → シーン）。`irradiance` は光に垂直な面での
+    /// 放射照度 E [W/m²]。距離減衰なし
+    Directional { direction: Vec3, irradiance: Color },
+    /// スポットライト。`direction` は光軸（光の進む向き）。光軸からの角度が `cutoff_angle`（ラジアン）以上で 0、
+    /// `beam_width` 以内は減衰なし、その間は余弦に対する smoothstep で滑らかに落ちる（Mitsuba 3 の spot と同じ規約:
+    /// `t = (cosθ − cos(cutoff)) / (cos(beam) − cos(cutoff))`、係数 `t²(3 − 2t)`）。`beam_width <= cutoff_angle`
+    Spot { position: Vec3, direction: Vec3, intensity: Color, cutoff_angle: f64, beam_width: f64 },
+}
+
+/// [`DeltaLight::sample_at`] の結果。
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaLightHit {
+    /// 評価点から光源へ向かう単位ベクトル
+    pub wi: Vec3,
+    /// 光源の位置（平行光源は `None`）。シャドウレイの終点は、原点をずらした後にここまでの距離を測り直して決める
+    pub position: Option<Vec3>,
+    /// 評価点に届く放射照度に相当する量（点・スポット: `I·falloff/d²`、平行: `E`）。BSDF と cos を掛ければ寄与になる
+    pub value: Color,
+}
+
+impl DeltaLight {
+    /// 評価点 `p` から見たこの光源。寄与 0（スポットの外・距離 0）なら `None`。乱数は引かない。
+    pub fn sample_at(&self, p: Vec3) -> Option<DeltaLightHit> {
+        match *self {
+            DeltaLight::Point { position, intensity } => Self::point_like(p, position, intensity),
+            DeltaLight::Directional { direction, irradiance } => {
+                Some(DeltaLightHit { wi: -direction.norm(), position: None, value: irradiance })
+            }
+            DeltaLight::Spot { position, direction, intensity, cutoff_angle, beam_width } => {
+                let to = position - p;
+                let d2 = to.dot(to);
+                if !(d2 > 0.0) {
+                    return None;
+                }
+                let wi = to / d2.sqrt();
+                // 光軸と「光源から評価点への向き（-wi）」のなす角の余弦
+                let cos_theta = (-wi).dot(direction.norm());
+                let (cos_cut, cos_beam) = (cutoff_angle.cos(), beam_width.cos());
+                let falloff = if cos_theta <= cos_cut {
+                    return None;
+                } else if cos_theta >= cos_beam {
+                    1.0
+                } else {
+                    let t = (cos_theta - cos_cut) / (cos_beam - cos_cut);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                Self::point_like(p, position, intensity * falloff)
+            }
+        }
+    }
+
+    fn point_like(p: Vec3, position: Vec3, intensity: Color) -> Option<DeltaLightHit> {
+        let to = position - p;
+        let d2 = to.dot(to);
+        if !(d2 > 0.0) {
+            return None;
+        }
+        Some(DeltaLightHit { wi: to / d2.sqrt(), position: Some(position), value: intensity / d2 })
+    }
 }
 
 #[derive(Clone, Copy)]
