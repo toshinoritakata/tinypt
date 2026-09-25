@@ -28,6 +28,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
 use crate::config::RenderConfig;
+use crate::geometry::Aabb;
+use crate::medium::Medium;
 use crate::env::EnvMap;
 use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
@@ -319,6 +321,8 @@ pub fn load_scene_from_str(
     let mut mat_maps: Vec<Option<MapId>> = Vec::new();
     let mut cam: Option<Camera> = None;
     let mut env: Option<EnvMap> = None;
+    let mut medium: Option<Medium> = None;
+    let mut seen_medium = false;
 
     for child in &root.children {
         match child.tag.as_str() {
@@ -336,6 +340,15 @@ pub fn load_scene_from_str(
             "emitter" => {
                 if let Some(e) = parse_scene_emitter(child, base_dir) {
                     env = Some(e);
+                }
+            }
+            // シーン直下の medium は空間全体（または bounds）に広がる一様媒質。最初の 1 つだけ使う
+            "medium" => {
+                if seen_medium {
+                    warn("more than one <medium>; only the first is used");
+                } else {
+                    seen_medium = true;
+                    medium = parse_medium(child);
                 }
             }
             // レンダリング設定ブロックは無視（このレンダラーは CLI で制御する）
@@ -370,7 +383,7 @@ pub fn load_scene_from_str(
         mesh_build: world.mesh_build_time(),
         texture_load: TEXTURE_LOAD_TIME.with(|c| c.get()),
     };
-    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env, medium: None, load_stats }, settings))
+    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env, medium, load_stats }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
@@ -413,6 +426,63 @@ pub fn referenced_files(xml: &str, base_dir: &Path) -> io::Result<Vec<PathBuf>> 
 
 /// シーン直下の `<emitter>`（環境マップ）を `EnvMap` にマップする。
 /// `envmap`（ファイル）と `constant`（定数色）に対応。`scale` を放射輝度に乗算する。
+/// `<float>` 単値（グレー）と `<rgb>` / `<srgb>` の両方を受ける色プロパティ。
+fn color_or_float(el: &Element, name: &str) -> Option<Color> {
+    el.color(name).or_else(|| el.float(name).map(|v| Color::new(v, v, v)))
+}
+
+/// シーン直下の `<medium type="homogeneous">` を一様媒質にする。不正な指定は警告して既定値にフォールバックする。
+///
+/// **`bounds_min` / `bounds_max`（媒質の存在範囲の AABB）は tinypt の独自拡張**（標準の Mitsuba に無い。
+/// Mitsuba は媒質を形状の interior/exterior に付けるが、その方式は未対応）。省略すると空間全体に広がる。
+/// `Dielectric` の `absorption` と同じ位置づけの拡張。
+fn parse_medium(el: &Element) -> Option<Medium> {
+    if el.typ() != "homogeneous" {
+        warn(&format!("unsupported medium type '{}', ignored", el.typ()));
+        return None;
+    }
+    let mut sigma_t = color_or_float(el, "sigma_t").unwrap_or(Color::new(1.0, 1.0, 1.0));
+    if sigma_t.r() < 0.0 || sigma_t.g() < 0.0 || sigma_t.b() < 0.0 {
+        warn("medium sigma_t must be >= 0; negative components set to 0");
+        sigma_t = Color::new(sigma_t.r().max(0.0), sigma_t.g().max(0.0), sigma_t.b().max(0.0));
+    }
+    let mut albedo = color_or_float(el, "albedo").unwrap_or(Color::new(1.0, 1.0, 1.0));
+    if [albedo.r(), albedo.g(), albedo.b()].iter().any(|&a| !(0.0..=1.0).contains(&a)) {
+        warn("medium albedo must be within [0, 1]; clamped");
+        albedo = albedo.clamp01();
+    }
+    let mut g = 0.0;
+    if let Some(ph) = el.child_tag("phase") {
+        match ph.typ() {
+            "hg" => {
+                g = ph.float("g").unwrap_or(0.0);
+                if !(g > -1.0 && g < 1.0) {
+                    warn(&format!("phase g = {} must be within (-1, 1); clamped to +-0.99", g));
+                    g = if g.is_nan() { 0.0 } else { g.clamp(-0.99, 0.99) };
+                }
+            }
+            "isotropic" => {}
+            other => warn(&format!("unsupported phase type '{}'; using isotropic", other)),
+        }
+    }
+    let bounds = match (el.point("bounds_min"), el.point("bounds_max")) {
+        (Some(lo), Some(hi)) => {
+            if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
+                warn("medium bounds_min exceeds bounds_max; treating the medium as unbounded");
+                None
+            } else {
+                Some(Aabb { min: lo, max: hi })
+            }
+        }
+        (None, None) => None,
+        _ => {
+            warn("medium needs both bounds_min and bounds_max; treating the medium as unbounded");
+            None
+        }
+    };
+    Some(Medium { sigma_t, albedo, g, bounds })
+}
+
 fn parse_scene_emitter(el: &Element, base_dir: &Path) -> Option<EnvMap> {
     if el.child_tag("transform").is_some() {
         warn("envmap to_world rotation is unsupported; ignored");
@@ -550,6 +620,10 @@ fn parse_shape(
     normal_maps: &mut Vec<NormalMap>,
     mtl_state: &mut MtlState,
 ) {
+    // 形状の内側に閉じ込める媒質（interior media）は未対応。誤解を生まないよう明示して読み飛ばす
+    if el.child_tag("medium").is_some() {
+        warn("<medium> inside a <shape> is unsupported (interior media); skipped. Put it directly under <scene>");
+    }
     // OBJ で `<bsdf>` も `<emitter>` も無く、`use_mtl` が false でなければ MTL から材質を作る。
     // `<bsdf>` 指定があれば従来どおり全体を上書きする（既存シーンの見た目・出力を保つ）。
     if el.typ() == "obj"
@@ -2136,5 +2210,104 @@ mod tests {
             assert_eq!(s.normal_maps.len(), 2, "種別違いが同じ登録を共有した");
         });
     }
-}
 
+    // ---- <medium> ----
+
+    fn medium_scene(body: &str) -> (Scene, Vec<String>) {
+        let xml = format!(
+            r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor>{}</scene>"#,
+            body
+        );
+        capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0)
+    }
+
+    #[test]
+    fn medium_reads_all_properties() {
+        let (scene, warnings) = medium_scene(
+            r#"<medium type="homogeneous">
+                 <rgb name="sigma_t" value="0.1, 0.5, 2.0"/>
+                 <rgb name="albedo" value="0.9, 0.5, 0.2"/>
+                 <phase type="hg"><float name="g" value="0.3"/></phase>
+                 <point name="bounds_min" x="-5" y="0" z="-4"/>
+                 <point name="bounds_max" x="5" y="6" z="4"/>
+               </medium>"#,
+        );
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        let m = scene.medium.expect("medium");
+        assert_eq!((m.sigma_t.r(), m.sigma_t.g(), m.sigma_t.b()), (0.1, 0.5, 2.0));
+        assert_eq!((m.albedo.r(), m.albedo.g(), m.albedo.b()), (0.9, 0.5, 0.2));
+        assert_eq!(m.g, 0.3);
+        let b = m.bounds.expect("bounds");
+        assert_eq!((b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z), (-5.0, 0.0, -4.0, 5.0, 6.0, 4.0));
+    }
+
+    #[test]
+    fn medium_defaults_and_float_values() {
+        // float 単値、albedo・phase・bounds 省略
+        let (scene, warnings) = medium_scene(
+            r#"<medium type="homogeneous"><float name="sigma_t" value="0.05"/></medium>"#,
+        );
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        let m = scene.medium.unwrap();
+        assert_eq!((m.sigma_t.r(), m.sigma_t.g(), m.sigma_t.b()), (0.05, 0.05, 0.05));
+        assert_eq!((m.albedo.r(), m.albedo.g(), m.albedo.b()), (1.0, 1.0, 1.0));
+        assert_eq!(m.g, 0.0);
+        assert!(m.bounds.is_none());
+        // rgb 単値（"0.05" の 1 成分）と float の albedo、hg で g 省略・isotropic
+        let (scene, _) = medium_scene(
+            r#"<medium type="homogeneous"><rgb name="sigma_t" value="0.05"/><float name="albedo" value="0.5"/>
+                 <phase type="hg"/></medium>"#,
+        );
+        let m = scene.medium.unwrap();
+        assert_eq!(m.albedo.g(), 0.5);
+        assert_eq!(m.g, 0.0);
+        let (scene, warnings) = medium_scene(
+            r#"<medium type="homogeneous"><phase type="isotropic"/></medium>"#,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(scene.medium.unwrap().g, 0.0);
+        // medium 無し
+        assert!(medium_scene("").0.medium.is_none());
+    }
+
+    #[test]
+    fn medium_invalid_input_warns_and_does_not_crash() {
+        let warned = |body: &str, needle: &str| {
+            let (scene, w) = medium_scene(body);
+            assert!(w.iter().any(|m| m.contains(needle)), "{needle}: {:?}", w);
+            scene
+        };
+        // type 不正: 媒質なし
+        assert!(warned(r#"<medium type="heterogeneous"/>"#, "medium type").medium.is_none());
+        // phase 不正: 等方扱い
+        let s = warned(r#"<medium type="homogeneous"><phase type="rayleigh"/></medium>"#, "phase type");
+        assert_eq!(s.medium.unwrap().g, 0.0);
+        // bounds 片側だけ / min > max: 無限扱い
+        let one = r#"<medium type="homogeneous"><point name="bounds_min" x="0" y="0" z="0"/></medium>"#;
+        assert!(warned(one, "bounds").medium.unwrap().bounds.is_none());
+        let inv = r#"<medium type="homogeneous"><point name="bounds_min" x="1" y="0" z="0"/>
+                       <point name="bounds_max" x="0" y="1" z="1"/></medium>"#;
+        assert!(warned(inv, "bounds_min exceeds").medium.unwrap().bounds.is_none());
+        // 複数: 最初のものを使う
+        let two = r#"<medium type="homogeneous"><float name="sigma_t" value="1"/></medium>
+                     <medium type="homogeneous"><float name="sigma_t" value="2"/></medium>"#;
+        assert_eq!(warned(two, "more than one").medium.unwrap().sigma_t.r(), 1.0);
+        // 範囲外の値は補正
+        let bad = r#"<medium type="homogeneous"><float name="sigma_t" value="-1"/><float name="albedo" value="2"/>
+                       <phase type="hg"><float name="g" value="1.5"/></phase></medium>"#;
+        let m = warned(bad, "sigma_t").medium.unwrap();
+        assert_eq!(m.sigma_t.r(), 0.0);
+        assert_eq!(m.albedo.r(), 1.0);
+        assert_eq!(m.g, 0.99);
+    }
+
+    #[test]
+    fn medium_inside_shape_warns_and_is_skipped() {
+        let (scene, warnings) = medium_scene(
+            r#"<shape type="sphere"><bsdf type="diffuse"/>
+                 <medium name="interior" type="homogeneous"><float name="sigma_t" value="1"/></medium></shape>"#,
+        );
+        assert!(warnings.iter().any(|w| w.contains("inside a <shape>")), "{:?}", warnings);
+        assert!(scene.medium.is_none());
+    }
+}

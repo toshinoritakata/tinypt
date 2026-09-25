@@ -10,6 +10,9 @@ Rust 製のモンテカルロパストレーサー。
 <td width="33%"><a href="docs/images/showcase_default.png"><img src="docs/images/showcase_default.png" alt="default.xml"></a><br>組み込みマテリアルサンプル (拡散・金属・GGX・ガラス)。2048spp、1200x675、デノイズあり。<a href="sample/default.xml"><code>sample/default.xml</code></a></td>
 <td width="33%"><a href="docs/images/showcase_rungholt.png"><img src="docs/images/showcase_rungholt.png" alt="Rungholt"></a><br>Rungholt (6,704,264 三角形)。512spp、1200x675、デノイズあり。<a href="sample/rungholt.xml"><code>sample/rungholt.xml</code></a></td>
 </tr>
+<tr>
+<td width="34%"><a href="docs/images/showcase_fog.png"><img src="docs/images/showcase_fog.png" alt="fog.xml"></a><br>参加媒質 (霧) と天井のスリットからのゴッドレイ。2048spp、1200x675、デノイズあり。<a href="sample/fog.xml"><code>sample/fog.xml</code></a></td>
+</tr>
 </table>
 
 Sponza と Rungholt は外部モデル ([取得方法](#外部ベンチマークモデル-sponza--rungholt))。
@@ -22,6 +25,7 @@ Sponza Atrium は CC BY 3.0 / © 2010 Frank Meinl, Crytek。Rungholt は CC BY 3
 - **スムーズシェーディング**: OBJ の頂点法線を補間 ([詳細](#スムーズシェーディング-法線の補間))
 - **テクスチャ**: ビットマップテクスチャ (UV バイリニア、sRGB デコード) ([詳細](#テクスチャ))
 - **マテリアル**: ランバート拡散・完全鏡面金属・GGX マイクロファセット・誘電体 (ガラス)・面光源 ([詳細](#マテリアル))
+- **参加媒質**: 一様な霧・煙 (σt・アルベド・Henyey-Greenstein の g・任意の AABB 範囲)。チャンネル MIS 付きの距離サンプリング、媒質散乱点での NEE ([詳細](#参加媒質))
 - **Multiple Importance Sampling (MIS)** + **Next Event Estimation (NEE)** による分散低減
 - **層化サンプリング**: ピクセル内のジッターと NEE の光源サンプリングを √spp × √spp の格子に層化。同じ spp で分散が 23〜39% 下がる (平均は変わらない)
 - **Firefly クランプ**: 寄与単位・輝度ベース (閾値 50)。発光体/背景ヒットと NEE のすべての寄与に適用し、MIS の両側で同じ上限になる (バイアスあり)
@@ -254,6 +258,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<bsdf>` | `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric`・`thindielectric`・`roughdielectric` (いずれも `Dielectric`、独自拡張の `absorption` 対応) / `twosided`。未知の型は警告して `diffuse` にフォールバック |
 | `<emitter type="area">` | `radiance` (shape に付随する面光源) |
 | `<emitter type="envmap"\|"constant">` | 環境マップ (`filename` / `radiance`、`scale` 対応。等距離円筒図法、テクセル中心基準の双線形補間) |
+| `<medium type="homogeneous">` | シーン直下に 1 つ。`sigma_t` / `albedo` / `<phase>` / `bounds_min`・`bounds_max` (独自拡張) ([詳細](#参加媒質)) |
 | `<film>` / `<sampler>` / `<integrator>` | 解像度 / `sample_count` / `max_depth`・`rr_depth` (Mitsuba と同じパス長の意味: `max_depth` 1 = 直接見える発光体のみ、2 = 直接照明まで、-1 = 無制限。組み込みシーンの既定は `max_depth` 9・`rr_depth` 4) |
 
 - **色**: `<rgb>` はリニア、`<srgb>` は sRGB (ガンマ展開)。
@@ -263,6 +268,27 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。ただし `<default>` と `<rfilter>` は**警告なし**で無視される。
 - スペクトルや `<default>`/`$param` 置換、環境マップの `to_world` 回転は未対応。`$param` に依存するシーンでも警告は出ない。
 
+### 参加媒質
+
+シーン直下に `<medium>` を 1 つ書くと、一様な霧・煙を置ける (`sample/fog.xml`)。
+
+```xml
+<medium type="homogeneous">
+  <rgb name="sigma_t" value="0.05"/>          <!-- 消衰係数 (1/長さ)。<float> 単値も可 -->
+  <rgb name="albedo" value="0.9"/>            <!-- 単一散乱アルベド。省略時 1 (吸収なし) -->
+  <phase type="hg"><float name="g" value="0.3"/></phase>   <!-- 省略時は等方。g > 0 で前方散乱 -->
+  <!-- 独自拡張。省略すると空間全体に広がる -->
+  <point name="bounds_min" x="-5" y="0" z="-5"/>
+  <point name="bounds_max" x="5" y="5" z="5"/>
+</medium>
+```
+
+- `bounds_min` / `bounds_max` は tinypt の独自拡張 (標準の Mitsuba に無い)。**両方揃ったときだけ**有効で、片方だけ・min > max のときは警告して無限に広がる扱いになる。
+- **`bounds` を省くと媒質は無限に広がり、σt が正なら背景 (環境マップ・空) は見えなくなる**。物理的には正しいが意図しないことが多いので、範囲を付けるか σt を小さくすること。
+- **媒質を使うときは `<integrator>` の `max_depth` を上げること**。媒質での散乱も 1 頂点と数えるので、既定の 9 では濃い霧でエネルギーが足りず暗くなる (`sample/fog.xml` は 32)。
+- 未対応: 形状の内側に閉じ込める媒質 (`<shape>` 内の `<medium>` は警告して無視)、不均質媒質、発光媒質。`Dielectric` の `absorption` は散乱の無い簡易版で、この媒質とは独立。
+- 媒質が無いシーンの出力は、媒質サポートの導入前とビット単位で同じ。
+
 ### サンプル
 
 | ファイル | 内容 |
@@ -271,6 +297,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/mesh.xml` | OBJ メッシュ (立方体) + transform/instance |
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
 | `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
+| `sample/fog.xml` | 天井のスリットから差し込む光がつくるゴッドレイ (光の筋)。部屋の中を霧 (`<medium>`) で満たす ([詳細](#参加媒質)) |
 | `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
 | `sample/sponza.xml` | Crytek Sponza (262,267 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |
 | `sample/rungholt.xml` | Rungholt (6,704,264 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |

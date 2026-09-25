@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 参加媒質（霧）のサンプル: 天井のスリットから差し込む光がつくるゴッドレイ（光の筋）。
+     部屋は sample/cornell.xml と同じ x∈[-1,1], y∈[0,2], z∈[-1,2.6]（手前 z=+2.6 は開口。カメラ z=2.5 は部屋の内側で、霧の中にある）。
+     天井は 4 枚の帯で、その隙間 3 本がスリット。光源は天井の上（y=3.2）にあり、スリットを通った光だけが
+     部屋に入る。部屋の中だけを bounds で囲った一様媒質（前方散乱寄りの HG）で満たしているので、
+     光が通る道筋が筋として見える。
+
+     <medium> は Mitsuba の同名要素の一部（homogeneous）に対応する。bounds_min / bounds_max は
+     tinypt の独自拡張で、省略すると媒質は空間全体に広がる（背景が見えなくなるので、通常は範囲を付ける）。
+     媒質があるとパスが長くなるので max_depth を上げてある（既定の 9 では濃い霧で暗くなる）。
+
+     推奨: tinypt --scene sample/fog.xml -o fog.ppm -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="32"/>
+    <integer name="rr_depth" value="5"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="256"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="1200"/>
+    <integer name="height" value="675"/>
+  </film>
+
+  <sensor type="perspective">
+    <float name="fov" value="55"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0, 1, 2.5" target="0, 0.95, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 霧: 部屋の中だけ。σt = 0.3 /単位長、アルベド 0.95、前方散乱 g = 0.5 -->
+  <medium type="homogeneous">
+    <rgb name="sigma_t" value="0.3"/>
+    <rgb name="albedo" value="0.95"/>
+    <phase type="hg"><float name="g" value="0.5"/></phase>
+    <point name="bounds_min" x="-1" y="0" z="-1"/>
+    <point name="bounds_max" x="1" y="2" z="2.6"/>
+  </medium>
+
+  <!-- 床 y=0 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0" y="0" z="0.8"/><rotate x="1" angle="-90"/><scale x="1" y="1.8" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+
+  <!-- 奥の壁 z=-1 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0" y="1" z="-1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+
+  <!-- 左の壁（赤） x=-1 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="-1" y="1" z="0.8"/><rotate y="1" angle="90"/><scale x="1.8" y="1" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.63, 0.065, 0.05"/></bsdf>
+  </shape>
+
+  <!-- 右の壁（緑） x=1 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="1" y="1" z="0.8"/><rotate y="1" angle="-90"/><scale x="1.8" y="1" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.14, 0.45, 0.091"/></bsdf>
+  </shape>
+
+  <!-- 天井 y=2: 4 枚の帯。隙間（x ∈ [-0.65,-0.45], [-0.1,0.1], [0.45,0.65]）がスリット -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="-0.825" y="2" z="0.8"/><rotate x="1" angle="90"/><scale x="0.175" y="1.8" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="-0.275" y="2" z="0.8"/><rotate x="1" angle="90"/><scale x="0.175" y="1.8" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0.275" y="2" z="0.8"/><rotate x="1" angle="90"/><scale x="0.175" y="1.8" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0.825" y="2" z="0.8"/><rotate x="1" angle="90"/><scale x="0.175" y="1.8" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+
+  <!-- 光の筋を遮る箱（白） -->
+  <shape type="cube">
+    <transform name="to_world">
+      <translate x="-0.3" y="0.4" z="-0.2"/><rotate y="1" angle="18"/><scale x="0.25" y="0.4" z="0.25"/>
+    </transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.725, 0.71, 0.68"/></bsdf>
+  </shape>
+
+  <!-- 天井の上の面光源（下向き）。やや右にずらして筋を斜めにする -->
+  <shape type="rectangle">
+    <transform name="to_world">
+      <translate x="0.9" y="3.2" z="0"/><rotate x="1" angle="90"/><scale x="0.3" y="0.6" z="1"/>
+    </transform>
+    <emitter type="area"><rgb name="radiance" value="60, 55, 45"/></emitter>
+  </shape>
+</scene>
