@@ -13,6 +13,9 @@ Rust 製のモンテカルロパストレーサー。
 <tr>
 <td width="34%"><a href="docs/images/showcase_fog.png"><img src="docs/images/showcase_fog.png" alt="fog.xml"></a><br>参加媒質 (霧) と天井のスリットからのゴッドレイ。2048spp、1200x675、デノイズあり。<a href="sample/fog.xml"><code>sample/fog.xml</code></a></td>
 </tr>
+<tr>
+<td width="34%"><a href="docs/images/showcase_spotlight.png"><img src="docs/images/showcase_spotlight.png" alt="spotlight.xml"></a><br>スポットライト 2 灯と薄い霧 (デルタ光源)。2048spp、1200x675、デノイズあり。<a href="sample/spotlight.xml"><code>sample/spotlight.xml</code></a></td>
+</tr>
 </table>
 
 Sponza と Rungholt は外部モデル ([取得方法](#外部ベンチマークモデル-sponza--rungholt))。
@@ -26,6 +29,7 @@ Sponza Atrium は CC BY 3.0 / © 2010 Frank Meinl, Crytek。Rungholt は CC BY 3
 - **テクスチャ**: ビットマップテクスチャ (UV バイリニア、sRGB デコード) ([詳細](#テクスチャ))
 - **マテリアル**: ランバート拡散・完全鏡面金属・GGX マイクロファセット・誘電体 (ガラス)・面光源 ([詳細](#マテリアル))
 - **参加媒質**: 一様な霧・煙 (σt・アルベド・Henyey-Greenstein の g・任意の AABB 範囲)。チャンネル MIS 付きの距離サンプリング、媒質散乱点での NEE ([詳細](#参加媒質))
+- **デルタ光源**: 点・平行・スポットライト。NEE で全灯を評価し MIS なし・乱数なし ([詳細](#デルタ光源))
 - **Multiple Importance Sampling (MIS)** + **Next Event Estimation (NEE)** による分散低減
 - **層化サンプリング**: ピクセル内のジッターと NEE の光源サンプリングを √spp × √spp の格子に層化。同じ spp で分散が 23〜39% 下がる (平均は変わらない)
 - **Firefly クランプ**: 寄与単位・輝度ベース (閾値 50)。発光体/背景ヒットと NEE のすべての寄与に適用し、MIS の両側で同じ上限になる (バイアスあり)
@@ -258,6 +262,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<bsdf>` | `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric`・`thindielectric`・`roughdielectric` (いずれも `Dielectric`、独自拡張の `absorption` 対応) / `twosided`。未知の型は警告して `diffuse` にフォールバック |
 | `<emitter type="area">` | `radiance` (shape に付随する面光源) |
 | `<emitter type="envmap"\|"constant">` | 環境マップ (`filename` / `radiance`、`scale` 対応。等距離円筒図法、テクセル中心基準の双線形補間) |
+| `<emitter type="point"\|"directional"\|"spot">` | シーン直下のデルタ光源 (複数可)。`position` / `direction` 直書きは独自拡張 ([詳細](#デルタ光源)) |
 | `<medium type="homogeneous">` | シーン直下に 1 つ。`sigma_t` / `albedo` / `<phase>` / `bounds_min`・`bounds_max` (独自拡張) ([詳細](#参加媒質)) |
 | `<film>` / `<sampler>` / `<integrator>` | 解像度 / `sample_count` / `max_depth`・`rr_depth` (Mitsuba と同じパス長の意味: `max_depth` 1 = 直接見える発光体のみ、2 = 直接照明まで、-1 = 無制限。組み込みシーンの既定は `max_depth` 9・`rr_depth` 4) |
 
@@ -289,6 +294,38 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - 未対応: 形状の内側に閉じ込める媒質 (`<shape>` 内の `<medium>` は警告して無視)、不均質媒質、発光媒質。`Dielectric` の `absorption` は散乱の無い簡易版で、この媒質とは独立。
 - 媒質が無いシーンの出力は、媒質サポートの導入前とビット単位で同じ。
 
+### デルタ光源
+
+シーン直下に `<emitter type="point" | "directional" | "spot">` を書くと、面積を持たない光源を置ける (`sample/spotlight.xml`)。複数置ける (環境マップと違って 1 個制限は無い)。
+
+```xml
+<emitter type="point">
+  <point name="position" x="0" y="2" z="0"/>
+  <rgb name="intensity" value="10"/>          <!-- 放射強度 I [W/sr]。<float> 単値も可 -->
+</emitter>
+
+<emitter type="directional">
+  <vector name="direction" x="-0.3" y="-1" z="-0.2"/>   <!-- 光の進む向き (光源→シーン) -->
+  <rgb name="irradiance" value="3"/>                     <!-- 光に垂直な面の放射照度 E -->
+</emitter>
+
+<emitter type="spot">
+  <point name="position" x="0" y="3" z="0"/>
+  <vector name="direction" x="0" y="-1" z="0"/>
+  <rgb name="intensity" value="80"/>
+  <float name="cutoff_angle" value="25"/>     <!-- 度。省略時 20 -->
+  <float name="beam_width" value="18"/>       <!-- 度。省略時 cutoff_angle × 3/4 -->
+</emitter>
+```
+
+- **`position` / `direction` を直接書く形は tinypt の独自拡張** (Mitsuba の point / spot は `to_world` で位置と向きを与える)。
+- スポットの減衰は Mitsuba 3 と同じ: `cutoff_angle` 以上で 0、`beam_width` 以内は減衰なし、その間は**角度に対して線形**。
+- **デルタ光源自体は画面に写らない** (幾何が無いため)。光源の位置に見える発光体が欲しければ別に面光源を置く。
+- 面光源と違い、光源側のサンプリングが無いので乱数を引かず、直接照明のノイズが小さい。MIS は使わない (BSDF サンプリングでは当たりようがない)。光源の数に比例して NEE が重くなるので、数灯を想定している。
+- スケール: シーンを k 倍するなら、点・スポットの `intensity` は k² 倍 (放射照度 = I/d²)、平行光源の `irradiance` はそのまま。
+- 参加媒質と併用でき、霧の中では光の円錐が見える。**媒質を使うときは `max_depth` を上げること** ([参加媒質](#参加媒質))。
+- 不正値 (零方向・範囲外の角度・`beam_width` > `cutoff_angle`・負の強度) は警告して補正か無視。`<shape>` の中に書いた点・平行・スポットは警告して無視。
+
 ### サンプル
 
 | ファイル | 内容 |
@@ -297,6 +334,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/mesh.xml` | OBJ メッシュ (立方体) + transform/instance |
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
 | `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
+| `sample/spotlight.xml` | スポットライト 2 灯 + 薄い霧。光の円錐と球・箱の影。光源は写らない ([詳細](#デルタ光源)) |
 | `sample/fog.xml` | 天井のスリットから差し込む光がつくるゴッドレイ (光の筋)。部屋の中を霧 (`<medium>`) で満たす ([詳細](#参加媒質)) |
 | `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
 | `sample/sponza.xml` | Crytek Sponza (262,267 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |

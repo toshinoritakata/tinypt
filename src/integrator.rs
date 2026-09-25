@@ -1596,8 +1596,8 @@ mod tests {
         };
         assert_eq!(value_at(35.0), 0.0);
         assert_eq!(value_at(30.0), 0.0, "cutoff ちょうどは 0");
-        assert!(value_at(29.999) < 1e-6, "cutoff の直前はほぼ 0（飛びなし）: {}", value_at(29.999));
-        assert!(value_at(20.001) > 1.0 - 1e-6 && value_at(20.001) <= 1.0, "beam の直後はほぼ 1（飛びなし）");
+        assert!(value_at(29.999) < 1e-3, "cutoff の直前はほぼ 0（飛びなし）: {}", value_at(29.999));
+        assert!(value_at(20.001) > 1.0 - 1e-3 && value_at(20.001) <= 1.0, "beam の直後はほぼ 1（飛びなし）");
         assert_eq!(value_at(10.0), 1.0);
         let mut prev = 1.0;
         for k in 0..=100 {
@@ -1607,11 +1607,11 @@ mod tests {
             assert!((prev - f).abs() < 0.05, "刻みごとの飛びが小さい");
             prev = f;
         }
-        // 中間の係数は smoothstep(余弦)
-        let deg = 25.0f64;
-        let (cc, cb, ct) = (cut.cos(), beam.cos(), deg.to_radians().cos());
-        let t = (ct - cc) / (cb - cc);
-        assert!(close(value_at(deg), t * t * (3.0 - 2.0 * t), 1e-12));
+        // 中間の係数は角度に対して線形（Mitsuba 3 の spot: (cutoff − θ)/(cutoff − beam)）
+        for deg in [21.0f64, 25.0, 29.0] {
+            let want = (cut - deg.to_radians()) / (cut - beam);
+            assert!(close(value_at(deg), want, 1e-12), "{deg}°: {} vs {want}", value_at(deg));
+        }
     }
 
     /// 光源と点の間に板を挟むと寄与がちょうど 0。板が無ければ非 0。

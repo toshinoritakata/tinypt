@@ -1266,9 +1266,10 @@ pub enum DeltaLight {
     /// 平行光源（太陽）。`direction` は光の進む向き（光源 → シーン）。`irradiance` は光に垂直な面での
     /// 放射照度 E [W/m²]。距離減衰なし
     Directional { direction: Vec3, irradiance: Color },
-    /// スポットライト。`direction` は光軸（光の進む向き）。光軸からの角度が `cutoff_angle`（ラジアン）以上で 0、
-    /// `beam_width` 以内は減衰なし、その間は余弦に対する smoothstep で滑らかに落ちる（Mitsuba 3 の spot と同じ規約:
-    /// `t = (cosθ − cos(cutoff)) / (cos(beam) − cos(cutoff))`、係数 `t²(3 − 2t)`）。`beam_width <= cutoff_angle`
+    /// スポットライト。`direction` は光軸（光の進む向き）。光軸からの角度 θ が `cutoff_angle`（ラジアン）以上で 0、
+    /// `beam_width` 以内は減衰なし、その間は **θ に対して線形**に落ちる: 係数 = `(cutoff − θ)/(cutoff − beam)`。
+    /// Mitsuba 3 の spot（`src/emitters/spot.cpp` の `falloff_curve`）と同じ規約で、ソースで確認済み。
+    /// （PBRT v4 の spot は余弦上の smoothstep で、曲線が異なる。）`beam_width <= cutoff_angle`
     Spot { position: Vec3, direction: Vec3, intensity: Color, cutoff_angle: f64, beam_width: f64 },
 }
 
@@ -1306,8 +1307,8 @@ impl DeltaLight {
                 } else if cos_theta >= cos_beam {
                     1.0
                 } else {
-                    let t = (cos_theta - cos_cut) / (cos_beam - cos_cut);
-                    t * t * (3.0 - 2.0 * t)
+                    // Mitsuba 3: 角度に対する線形の傾斜（cos ではなく acos で測る）
+                    (cutoff_angle - cos_theta.min(1.0).acos()) / (cutoff_angle - beam_width)
                 };
                 Self::point_like(p, position, intensity * falloff)
             }

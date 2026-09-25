@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- スポットライト + 霧: 暗い部屋に 2 灯のスポットライト（暖色と寒色）を当て、光の円錐と、箱・球の影を見せる。
+     sample/fog.xml（天井のスリットから差す面光源の筋）と違い、光源は幾何を持たないデルタ光源
+     （<emitter type="spot">）。**スポットライト自体は画面に写らない**（面積が無いので。光源の位置に発光体は置いていない）。
+
+     <emitter type="point" | "directional" | "spot"> はシーン直下に書き、複数置ける。position / direction を直接
+     書く形は tinypt の独自拡張（Mitsuba は to_world で与える）。spot の角度は度で、cutoff_angle の外は 0、
+     beam_width の内は減衰なし、その間は角度に対して線形に落ちる（Mitsuba 3 と同じ）。
+     霧（<medium>）は円錐が見える程度に薄くしてあり、範囲は bounds（tinypt の独自拡張）で部屋の中に限る。
+     媒質があるので max_depth を上げてある。
+
+     推奨: tinypt --scene sample/spotlight.xml -o spotlight.ppm -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="24"/>
+    <integer name="rr_depth" value="5"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="256"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="1200"/>
+    <integer name="height" value="675"/>
+  </film>
+
+  <sensor type="perspective">
+    <float name="fov" value="45"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0, 1.7, 6.2" target="0, 0.9, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <medium type="homogeneous">
+    <rgb name="sigma_t" value="0.12"/>
+    <rgb name="albedo" value="0.9"/>
+    <phase type="hg"><float name="g" value="0.4"/></phase>
+    <point name="bounds_min" x="-7" y="0" z="-4"/>
+    <point name="bounds_max" x="7" y="6" z="7"/>
+  </medium>
+
+  <!-- 床 -->
+  <shape type="rectangle">
+    <transform name="to_world"><rotate x="1" angle="-90"/><scale x="7" y="6" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.6, 0.6, 0.62"/></bsdf>
+  </shape>
+  <!-- 奥の壁 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0" y="3" z="-4"/><scale x="7" y="3" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.5, 0.5, 0.52"/></bsdf>
+  </shape>
+
+  <!-- 球と箱 -->
+  <shape type="sphere">
+    <point name="center" x="-0.7" y="0.6" z="0"/>
+    <float name="radius" value="0.6"/>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.75, 0.3, 0.25"/></bsdf>
+  </shape>
+  <shape type="cube">
+    <transform name="to_world"><translate x="1.0" y="0.45" z="-0.5"/><rotate y="1" angle="25"/><scale x="0.45" y="0.45" z="0.45"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.3, 0.5, 0.75"/></bsdf>
+  </shape>
+
+  <!-- スポットライト 2 灯（暖色・寒色）。intensity は放射強度 [W/sr] -->
+  <emitter type="spot">
+    <point name="position" x="-2.5" y="4.2" z="2.0"/>
+    <vector name="direction" x="0.37990" y="-0.82311" z="-0.42211"/>
+    <rgb name="intensity" value="140, 115, 80"/>
+    <float name="cutoff_angle" value="22"/>
+    <float name="beam_width" value="14"/>
+  </emitter>
+  <emitter type="spot">
+    <point name="position" x="2.8" y="4.2" z="1.0"/>
+    <vector name="direction" x="-0.40910" y="-0.86126" z="-0.30144"/>
+    <rgb name="intensity" value="70, 100, 150"/>
+    <float name="cutoff_angle" value="20"/>
+    <float name="beam_width" value="12"/>
+  </emitter>
+</scene>

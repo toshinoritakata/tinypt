@@ -30,6 +30,7 @@ use quick_xml::reader::Reader;
 use crate::config::RenderConfig;
 use crate::geometry::Aabb;
 use crate::medium::Medium;
+use crate::world::DeltaLight;
 use crate::env::EnvMap;
 use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
@@ -120,6 +121,16 @@ impl Element {
     /// `point` プロパティ（`x`/`y`/`z` 属性または `value="x,y,z"`）。
     fn point(&self, name: &str) -> Option<Vec3> {
         let e = self.prop("point", name)?;
+        if let (Some(x), Some(y), Some(z)) = (e.attr("x"), e.attr("y"), e.attr("z")) {
+            Some(Vec3::new(parse_f64(x)?, parse_f64(y)?, parse_f64(z)?))
+        } else {
+            parse_vec3(e.attr("value")?)
+        }
+    }
+
+    /// `vector` プロパティ（`x`/`y`/`z` 属性または `value="x,y,z"`）。
+    fn vector(&self, name: &str) -> Option<Vec3> {
+        let e = self.prop("vector", name)?;
         if let (Some(x), Some(y), Some(z)) = (e.attr("x"), e.attr("y"), e.attr("z")) {
             Some(Vec3::new(parse_f64(x)?, parse_f64(y)?, parse_f64(z)?))
         } else {
@@ -322,6 +333,7 @@ pub fn load_scene_from_str(
     let mut cam: Option<Camera> = None;
     let mut env: Option<EnvMap> = None;
     let mut medium: Option<Medium> = None;
+    let mut delta_lights: Vec<DeltaLight> = Vec::new();
     let mut seen_medium = false;
 
     for child in &root.children {
@@ -336,12 +348,20 @@ pub fn load_scene_from_str(
             "shape" => parse_shape(
                 child, base_dir, &mut world, &mut mats, &mut mat_maps, &mut textures, &mut normal_maps, &mut mtl_state,
             ),
-            // シーン直下の emitter は環境マップ（envmap / constant）
-            "emitter" => {
-                if let Some(e) = parse_scene_emitter(child, base_dir) {
-                    env = Some(e);
+            // シーン直下の emitter は `type` で振り分ける: point / directional / spot はデルタ光源（複数置ける）、
+            // それ以外（envmap / constant / 未知の型）は従来どおり環境マップ（1 個。未知の型は警告）
+            "emitter" => match child.typ() {
+                "point" | "directional" | "spot" => {
+                    if let Some(l) = parse_delta_emitter(child) {
+                        delta_lights.push(l);
+                    }
                 }
-            }
+                _ => {
+                    if let Some(e) = parse_scene_emitter(child, base_dir) {
+                        env = Some(e);
+                    }
+                }
+            },
             // シーン直下の medium は空間全体（または bounds）に広がる一様媒質。最初の 1 つだけ使う
             "medium" => {
                 if seen_medium {
@@ -372,6 +392,9 @@ pub fn load_scene_from_str(
     // （未指定だと integrator が手続き的な sky() を返し、開いたシーンに環境光が漏れ込むため）
     let env = Some(env.unwrap_or_else(|| EnvMap::constant(Color::new(0.0, 0.0, 0.0))));
 
+    for l in delta_lights {
+        world.add_delta_light(l);
+    }
     world.build_lights(&mats);
     // マップを持つ材質が 1 つも無ければテーブルを空にする（積分器は空テーブルなら何も引かない）
     if mat_maps.iter().all(|m| m.is_none()) {
@@ -481,6 +504,62 @@ fn parse_medium(el: &Element) -> Option<Medium> {
         }
     };
     Some(Medium { sigma_t, albedo, g, bounds })
+}
+
+/// 形状に付随する面光源（`<emitter type="area">`）。点・平行・スポットは幾何を持たないので形状の中では
+/// 意味を成さない（シーン直下に書く）。そのような子は警告して無かったことにする。
+fn shape_emitter(el: &Element) -> Option<&Element> {
+    el.children.iter().find(|c| c.tag == "emitter" && !matches!(c.typ(), "point" | "directional" | "spot"))
+}
+
+/// シーン直下の `<emitter type="point" | "directional" | "spot">` をデルタ光源にする。不正な指定は警告して補正か無視。
+///
+/// **`position` / `direction` を直接書く形は tinypt の独自拡張**（Mitsuba の spot / point は `to_world` で位置と向きを
+/// 与える。`Dielectric` の `absorption`、媒質の `bounds_min/max` と同じ扱い）。`intensity` / `irradiance` は
+/// `<rgb>` と `<float>` の両方を受ける。角度は度。
+fn parse_delta_emitter(el: &Element) -> Option<DeltaLight> {
+    let kind = el.typ();
+    let radiance_name = if kind == "directional" { "irradiance" } else { "intensity" };
+    let mut value = color_or_float(el, radiance_name).unwrap_or(Color::new(1.0, 1.0, 1.0));
+    if value.r() < 0.0 || value.g() < 0.0 || value.b() < 0.0 {
+        warn(&format!("{} emitter {} must be >= 0; negative components set to 0", kind, radiance_name));
+        value = Color::new(value.r().max(0.0), value.g().max(0.0), value.b().max(0.0));
+    }
+    let direction = || -> Option<Vec3> {
+        let d = el.vector("direction").unwrap_or(Vec3::new(0.0, -1.0, 0.0));
+        if !(d.len() > 0.0) || !d.len().is_finite() {
+            warn(&format!("{} emitter direction is zero or not finite; light ignored", kind));
+            None
+        } else {
+            Some(d.norm())
+        }
+    };
+    let position = || el.point("position").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+    match kind {
+        "point" => Some(DeltaLight::Point { position: position(), intensity: value }),
+        "directional" => Some(DeltaLight::Directional { direction: direction()?, irradiance: value }),
+        _ => {
+            let direction = direction()?;
+            let mut cutoff = el.float("cutoff_angle").unwrap_or(20.0);
+            if !(cutoff > 0.0 && cutoff <= 90.0) {
+                warn(&format!("spot cutoff_angle {} is outside (0, 90]; using 20", cutoff));
+                cutoff = 20.0;
+            }
+            // Mitsuba の既定: beam_width = cutoff_angle × 3/4
+            let mut beam = el.float("beam_width").unwrap_or(cutoff * 0.75);
+            if !(beam > 0.0 && beam <= cutoff) {
+                warn(&format!("spot beam_width {} must be within (0, cutoff_angle]; using cutoff_angle", beam));
+                beam = cutoff;
+            }
+            Some(DeltaLight::Spot {
+                position: position(),
+                direction,
+                intensity: value,
+                cutoff_angle: cutoff.to_radians(),
+                beam_width: beam.to_radians(),
+            })
+        }
+    }
 }
 
 fn parse_scene_emitter(el: &Element, base_dir: &Path) -> Option<EnvMap> {
@@ -620,6 +699,9 @@ fn parse_shape(
     normal_maps: &mut Vec<NormalMap>,
     mtl_state: &mut MtlState,
 ) {
+    if el.children.iter().any(|c| c.tag == "emitter" && matches!(c.typ(), "point" | "directional" | "spot")) {
+        warn("point / directional / spot <emitter> inside a <shape> is unsupported (they have no geometry); skipped. Put it directly under <scene>");
+    }
     // 形状の内側に閉じ込める媒質（interior media）は未対応。誤解を生まないよう明示して読み飛ばす
     if el.child_tag("medium").is_some() {
         warn("<medium> inside a <shape> is unsupported (interior media); skipped. Put it directly under <scene>");
@@ -628,14 +710,14 @@ fn parse_shape(
     // `<bsdf>` 指定があれば従来どおり全体を上書きする（既存シーンの見た目・出力を保つ）。
     if el.typ() == "obj"
         && el.child_tag("bsdf").is_none()
-        && el.child_tag("emitter").is_none()
+        && shape_emitter(el).is_none()
         && el.boolean_or("use_mtl", true)
     {
         parse_obj_with_mtl(el, base_dir, world, mats, mat_maps, textures, normal_maps, mtl_state);
         return;
     }
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
-    let (mat, map) = if let Some(em) = el.child_tag("emitter") {
+    let (mat, map) = if let Some(em) = shape_emitter(el) {
         (parse_emitter(em), None)
     } else if let Some(b) = el.child_tag("bsdf") {
         parse_bsdf(b, base_dir, textures, normal_maps)
@@ -2437,5 +2519,118 @@ mod tests {
             assert_eq!(hit.mat_id, i);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- デルタ光源（<emitter type="point" | "directional" | "spot">）----
+
+    #[test]
+    fn delta_emitters_read_all_properties() {
+        let (scene, warnings) = medium_scene(
+            r#"<emitter type="point"><point name="position" x="1" y="2" z="3"/><rgb name="intensity" value="10, 20, 30"/></emitter>
+               <emitter type="directional"><vector name="direction" x="0" y="-2" z="0"/><float name="irradiance" value="3"/></emitter>
+               <emitter type="spot"><point name="position" x="0" y="3" z="0"/><vector name="direction" x="0" y="-1" z="0"/>
+                 <rgb name="intensity" value="80"/><float name="cutoff_angle" value="25"/><float name="beam_width" value="18"/></emitter>"#,
+        );
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        let l = scene.world.delta_lights();
+        assert_eq!(l.len(), 3);
+        match l[0] {
+            DeltaLight::Point { position, intensity } => {
+                assert_eq!((position.x, position.y, position.z), (1.0, 2.0, 3.0));
+                assert_eq!((intensity.r(), intensity.g(), intensity.b()), (10.0, 20.0, 30.0));
+            }
+            _ => panic!("{:?}", l[0]),
+        }
+        match l[1] {
+            DeltaLight::Directional { direction, irradiance } => {
+                assert_eq!((direction.x, direction.y, direction.z), (0.0, -1.0, 0.0), "正規化される");
+                assert_eq!(irradiance.g(), 3.0);
+            }
+            _ => panic!("{:?}", l[1]),
+        }
+        match l[2] {
+            DeltaLight::Spot { intensity, cutoff_angle, beam_width, .. } => {
+                assert_eq!(intensity.b(), 80.0);
+                assert!((cutoff_angle - 25f64.to_radians()).abs() < 1e-15 && (beam_width - 18f64.to_radians()).abs() < 1e-15);
+            }
+            _ => panic!("{:?}", l[2]),
+        }
+    }
+
+    #[test]
+    fn delta_emitter_defaults() {
+        let (scene, warnings) = medium_scene(r#"<emitter type="spot"><rgb name="intensity" value="5"/></emitter><emitter type="point"/>"#);
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        match scene.world.delta_lights()[0] {
+            DeltaLight::Spot { position, direction, cutoff_angle, beam_width, .. } => {
+                assert_eq!((position.x, position.y, position.z), (0.0, 0.0, 0.0));
+                assert_eq!(direction.y, -1.0);
+                assert!((cutoff_angle - 20f64.to_radians()).abs() < 1e-15, "cutoff 既定 20°");
+                assert!((beam_width - 15f64.to_radians()).abs() < 1e-15, "beam 既定は cutoff × 3/4");
+            }
+            l => panic!("{:?}", l),
+        }
+    }
+
+    /// 既存の環境 emitter の挙動は変わらない（`constant` / `envmap` は従来どおり環境、1 個は最後のもの、
+    /// 未知の型は警告）。デルタ光源は環境を触らず、複数置ける。
+    #[test]
+    fn env_emitters_are_unchanged_and_coexist_with_delta_lights() {
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let (scene, w) = medium_scene(r#"<emitter type="constant"><rgb name="radiance" value="0.25"/></emitter>"#);
+        assert!(w.is_empty());
+        assert_eq!(scene.env.as_ref().unwrap().sample(up).r(), 0.25);
+        assert!(scene.world.delta_lights().is_empty());
+        // デルタ光源が混ざっても環境は変わらない。点光源 2 個
+        let (scene, w) = medium_scene(
+            r#"<emitter type="point"><rgb name="intensity" value="1"/></emitter>
+               <emitter type="constant"><rgb name="radiance" value="0.25"/></emitter>
+               <emitter type="point"><rgb name="intensity" value="2"/></emitter>"#,
+        );
+        assert!(w.is_empty(), "{:?}", w);
+        assert_eq!(scene.env.as_ref().unwrap().sample(up).r(), 0.25);
+        assert_eq!(scene.world.delta_lights().len(), 2);
+        // 未知の型は従来どおり警告して無視（環境は黒のまま）
+        let (scene, w) = medium_scene(r#"<emitter type="projector"/>"#);
+        assert!(w.iter().any(|m| m.contains("unsupported scene emitter type")), "{:?}", w);
+        assert_eq!(scene.env.as_ref().unwrap().sample(up).r(), 0.0);
+        assert!(scene.world.delta_lights().is_empty());
+    }
+
+    #[test]
+    fn delta_emitter_invalid_input_warns_and_does_not_crash() {
+        let warned = |body: &str, needle: &str| {
+            let (scene, w) = medium_scene(body);
+            assert!(w.iter().any(|m| m.contains(needle)), "{needle}: {:?}", w);
+            scene
+        };
+        // 零方向: その光源を無視
+        let s = warned(r#"<emitter type="directional"><vector name="direction" x="0" y="0" z="0"/></emitter>"#, "direction");
+        assert!(s.world.delta_lights().is_empty());
+        let s = warned(r#"<emitter type="spot"><vector name="direction" x="0" y="0" z="0"/></emitter>"#, "direction");
+        assert!(s.world.delta_lights().is_empty());
+        // 角度の範囲外は既定へ、beam > cutoff は cutoff に丸める
+        for bad in ["0", "-5", "120"] {
+            let s = warned(&format!(r#"<emitter type="spot"><float name="cutoff_angle" value="{bad}"/></emitter>"#), "cutoff_angle");
+            match s.world.delta_lights()[0] {
+                DeltaLight::Spot { cutoff_angle, .. } => assert!((cutoff_angle - 20f64.to_radians()).abs() < 1e-15),
+                l => panic!("{:?}", l),
+            }
+        }
+        let s = warned(r#"<emitter type="spot"><float name="cutoff_angle" value="20"/><float name="beam_width" value="30"/></emitter>"#, "beam_width");
+        match s.world.delta_lights()[0] {
+            DeltaLight::Spot { cutoff_angle, beam_width, .. } => assert_eq!(cutoff_angle, beam_width),
+            l => panic!("{:?}", l),
+        }
+        // 負の強度は 0 に
+        let s = warned(r#"<emitter type="point"><rgb name="intensity" value="-1, 2, 3"/></emitter>"#, "must be >= 0");
+        match s.world.delta_lights()[0] {
+            DeltaLight::Point { intensity, .. } => assert_eq!((intensity.r(), intensity.g()), (0.0, 2.0)),
+            l => panic!("{:?}", l),
+        }
+        // 形状の中: 警告して無視（形状は拡散のまま残り、光源にはならない）
+        let s = warned(r#"<shape type="sphere"><bsdf type="diffuse"/><emitter type="point"><rgb name="intensity" value="5"/></emitter></shape>"#, "inside a <shape>");
+        assert!(s.world.delta_lights().is_empty());
+        assert!(s.mats[0].emitted().is_none());
     }
 }
