@@ -10,7 +10,8 @@
 //! サンプリングし（参照点が球の内部か表面から丸め誤差の距離以内なら表面積一様）、三角形光源は表面積一様。
 //! PDF は `Light::pdf_omega` に一本化され、`sample_light` と `light_pdf` が共有する。
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::{Arc, OnceLock};
 
 use crate::bvh::Bvh;
 use crate::geometry::{face_forward, Aabb, Hit, Sphere, Triangle, TriangleSource};
@@ -305,6 +306,13 @@ pub struct Instance {
     pub world_bounds: Aabb,
 }
 
+/// 球のワールド空間の境界ボックス（中心 ± 半径）。球の交差判定の丸め誤差ぶんを見込んで少し広げる。
+fn sphere_world_bounds(s: &Sphere) -> Aabb {
+    let pad = s.r * 1e-9 + gamma(8) * (s.c.x.abs().max(s.c.y.abs()).max(s.c.z.abs()) + s.r);
+    let e = Vec3::new(s.r + pad, s.r + pad, s.r + pad);
+    Aabb::empty().grow(s.c - e).grow(s.c + e)
+}
+
 /// メッシュを `xform` で配置したインスタンスの、ワールド空間の保守的な境界ボックス。
 fn instance_world_bounds(mesh: &Mesh, xform: &Transform) -> Aabb {
     let mut b = Aabb::empty();
@@ -357,7 +365,22 @@ pub struct World {
     mesh_build_time: std::time::Duration,
     /// (インスタンス ID, メッシュ内三角形 ID) → lights 上の ID。
     tri_light_id: std::collections::HashMap<(usize, usize), usize>,
+    /// トップレベル BVH（インスタンス + 球）。最初の交差判定で遅延構築し、ジオメトリを足すたびに捨てる。
+    /// プリミティブが `TLAS_MIN_PRIMS` 未満なら `None`（従来どおり線形に総当たりする）
+    tlas: OnceLock<Option<Tlas>>,
 }
+
+/// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、それ以外は球 `k - n_inst`
+/// （線形総当たりの走査順「インスタンス → 球」と同じ通し番号で、同値の t のタイブレークにも使う）。
+struct Tlas {
+    bvh: Bvh,
+    n_inst: usize,
+    n_sph: usize,
+}
+
+/// この数以上のプリミティブ（インスタンス + 球）があるときだけ TLAS を使う。少数では総当たりのほうが速い
+/// （決め方は tlas_report.md 参照）。
+const TLAS_MIN_PRIMS: usize = 20;
 
 impl World {
     /// 空のワールドを生成する。
@@ -372,6 +395,7 @@ impl World {
             sphere_light_id: Vec::new(),
             mesh_build_time: std::time::Duration::ZERO,
             tri_light_id: std::collections::HashMap::new(),
+            tlas: OnceLock::new(),
         }
     }
 
@@ -401,6 +425,7 @@ impl World {
 
     /// 球プリミティブを追加し、その `World::spheres` 上のインデックスを返す。
     pub fn add_sphere(&mut self, sphere: Sphere) -> usize {
+        self.tlas = OnceLock::new();
         let idx = self.spheres.len();
         self.spheres.push(sphere);
         idx
@@ -445,6 +470,7 @@ impl World {
     /// 同じ OBJ を何度も配置するとき、メッシュを作り直さずに共有するための入口。材質を変えたいときは
     /// `mat_override` を使う（インスタンス側の属性なので、メッシュを共有したまま材質だけ違えられる）。
     pub fn add_instance_of(&mut self, mesh_id: usize, xform: Transform, mat_override: Option<usize>) -> usize {
+        self.tlas = OnceLock::new();
         let inst_id = self.instances.len();
         let world_bounds = instance_world_bounds(&self.meshes[mesh_id], &xform);
         self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds });
@@ -497,86 +523,139 @@ impl World {
         &self.lights
     }
 
+    /// トップレベル BVH（あれば）。最初の呼び出しで構築する。プリミティブが少ない、または構築後に
+    /// ジオメトリが増えて古くなっているときは `None`（呼び出し側は線形に総当たりする）。
+    fn tlas(&self) -> Option<&Tlas> {
+        let n_prims = self.instances.len() + self.spheres.len();
+        if n_prims < TLAS_MIN_PRIMS {
+            return None;
+        }
+        let t = self
+            .tlas
+            .get_or_init(|| {
+                let mut bounds: Vec<Aabb> = Vec::with_capacity(n_prims);
+                bounds.extend(self.instances.iter().map(|i| i.world_bounds));
+                bounds.extend(self.spheres.iter().map(sphere_world_bounds));
+                Some(Tlas { bvh: Bvh::build_from_bounds(&bounds, 1), n_inst: self.instances.len(), n_sph: self.spheres.len() })
+            })
+            .as_ref()?;
+        (t.n_inst == self.instances.len() && t.n_sph == self.spheres.len()).then_some(t)
+    }
+
+    /// TLAS を深さ優先で辿り、葉のプリミティブ番号ごとに `visit(k)` を呼ぶ（`k` は [`Tlas`] の通し番号）。
+    /// ノードの箱は「インスタンスの境界」と同じ判定（区間 `(min(tmin, 0), tmax·(1+1e-9))`）で棄却する。
+    /// `tmax` は呼び出し側が `visit` の中で縮められる（最近接探索）。`visit` が true を返したら打ち切る（any-hit）。
+    fn tlas_traverse(tlas: &Tlas, r: Ray, tmin: f64, tmax: &Cell<f64>, mut visit: impl FnMut(usize) -> bool) {
+        let nodes = &tlas.bvh.nodes;
+        if nodes.is_empty() {
+            return;
+        }
+        let inv = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
+        let tmin_box = tmin.min(0.0);
+        let mut stack = [0i32; 64];
+        let mut heap: Vec<i32> = Vec::new();
+        let mut sp = 1usize;
+        loop {
+            let nid = if let Some(v) = heap.pop() {
+                v
+            } else if sp > 0 {
+                sp -= 1;
+                stack[sp]
+            } else {
+                break;
+            };
+            let n = &nodes[nid as usize];
+            let tmax_box = tmax.get() * (1.0 + 1e-9);
+            if !n.bbox.hit_inv(r, inv, tmin_box, tmax_box) {
+                continue;
+            }
+            if n.left == -1 && n.right == -1 {
+                let start = n.start as usize;
+                for &k in &tlas.bvh.indices[start..start + n.count as usize] {
+                    if visit(k) {
+                        return;
+                    }
+                }
+                continue;
+            }
+            // 近い子を後に積む（LIFO で先に処理される）
+            let (a_id, b_id) = (n.left, n.right);
+            let a = nodes[a_id as usize].bbox.hit_range_inv(r, inv, tmin_box, tmax_box);
+            let b = nodes[b_id as usize].bbox.hit_range_inv(r, inv, tmin_box, tmax_box);
+            let order: [Option<i32>; 2] = match (a, b) {
+                (Some((a0, _)), Some((b0, _))) => if a0 <= b0 { [Some(b_id), Some(a_id)] } else { [Some(a_id), Some(b_id)] },
+                (Some(_), None) => [Some(a_id), None],
+                (None, Some(_)) => [Some(b_id), None],
+                (None, None) => [None, None],
+            };
+            for id in order.into_iter().flatten() {
+                // ヒープを使い始めたら、以後はヒープだけに積む（スタック配列は 64 段で足りなければ移す）
+                if heap.is_empty() && sp < stack.len() {
+                    stack[sp] = id;
+                    sp += 1;
+                } else {
+                    if heap.is_empty() {
+                        heap.extend_from_slice(&stack[..sp]);
+                        sp = 0;
+                    }
+                    heap.push(id);
+                }
+            }
+        }
+    }
+
     /// ワールド内の全ジオメトリに対するレイ交差判定。
     ///
     /// インスタンスのレイはオブジェクト空間に変換してからメッシュ BVH でテストし、
     /// ヒット結果をワールド空間に戻す。球はワールド空間で直接テストする。
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        if let Some(tlas) = self.tlas() {
+            let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
+            // トップレベル BVH 経由。線形総当たり（下）と同じ結果を返す: 最近接を採り、t が完全に同値のときは
+            // 総当たりの走査順（インスタンス → 球、添字の小さい方）が勝つように通し番号 `k` で決める
+            let closest = Cell::new(tmax);
+            let mut best: Option<Hit> = None;
+            let mut best_k = usize::MAX;
+            Self::tlas_traverse(tlas, r, tmin, &closest, |k| {
+                let c = closest.get();
+                if k < tlas.n_inst {
+                    if let Some(h) = self.hit_instance(k, r, inv_d, tmin, c, k < best_k) {
+                        closest.set(h.t);
+                        best = Some(h);
+                        best_k = k;
+                    }
+                } else {
+                    let idx = k - tlas.n_inst;
+                    // 同値タイで勝てる（添字が小さい）ときだけ、区間の上端をわずかに広げて t == closest の交差を拾う
+                    let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
+                    if let Some(mut h) = self.spheres[idx].hit(r, tmin, hi) {
+                        if h.t < c || (h.t == c && k < best_k) {
+                            h.prim_id = idx;
+                            closest.set(h.t);
+                            best = Some(h);
+                            best_k = k;
+                        }
+                    }
+                }
+                false
+            });
+            return best;
+        }
+        self.hit_linear(r, tmin, tmax)
+    }
+
+    /// 線形総当たり版の [`World::hit`]（インスタンス → 球の順）。プリミティブが少ないときの本体で、
+    /// TLAS 経由の結果と一致するべき基準でもある（テストが比較する）。
+    fn hit_linear(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
         let mut closest = tmax;
         let mut best: Option<Hit> = None;
 
         // Instances: ray -> object space
-        let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
-        for (inst_id, inst) in self.instances.iter().enumerate() {
-            let mesh = match self.meshes.get(inst.mesh_id) {
-                Some(m) => m,
-                None => continue,
-            };
-            // ワールド空間の境界ボックスで先に棄却する（物体空間への変換と誤差計算を省く）。箱は保守的で、
-            // スラブ判定も遠い側を広げてあるので、ここで棄却されるインスタンスに当たるレイは無い
-            if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), closest * (1.0 + 1e-9)) {
-                continue;
-            }
-
-            let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
-            let d_obj_raw = inst.xform.apply_vec_inv(r.d);
-            let d_len = d_obj_raw.len().max(1e-30); // Vec3::norm と同じ式（ビット一致）
-            let d_obj = d_obj_raw / d_len; // stabilize
-            // 物体空間へ写した原点には変換の丸め誤差 o_err が乗る。PBRT と同じく、原点をその誤差ぶん
-            // レイ方向に進めておく（真の原点がどこにあっても、進めた原点より手前にある）。ワールド空間で
-            // 面の誤差の箱の外へずらしてある原点は、物体空間でも元の面より先に出るので自己交差しない。
-            // 進めた距離 dt のぶん物体空間の t は小さくなるが、採否はワールド空間の t で決めるので影響しない。
-            let dt = d_obj.l1() * o_err;
-            let r_obj = Ray { o: o_obj + d_obj * dt, d: d_obj, time: r.time };
-
-            // ワールド空間の区間 (tmin, closest) を物体空間に写す。|r.d| = 1 なので t_obj = t_world·|A⁻¹d|。
-            // 丸めで境界上の候補を落とさないよう、両端とも相対 1e-9 だけ外側に広げる（採否は下の
-            // ワールド空間 t 判定が決めるので、広げても結果は変わらない）。tmin も同じく写す: 写さないと
-            // 拡大インスタンスでは近い面を取りこぼし（t_obj < tmin）、縮小インスタンスでは自己交差回避の
-            // 帯の中の面を BVH が返してしまう。
-            let tmin_obj = tmin * d_len * (1.0 - 1e-9);
-            let tmax_obj = closest * d_len * (1.0 + 1e-9);
-
-            // Object-space BVH。ワールド空間の判定で「近すぎる」（t_world <= tmin）と却下された場合は、
-            // 丸めで帯の内側に入った面なので、その面より先から同じインスタンスを探し直す（奥の面を
-            // 取りこぼさないため）。同一平面に重なった面が帯に多数あっても止まるよう回数を制限する。
-            let mut search_from = tmin_obj;
-            for _ in 0..=INSTANCE_RETRY_LIMIT {
-                let Some(h_obj) = mesh.hit(r_obj, search_from, tmax_obj) else { break };
-                let (p_world, p_error) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
-
-                // r.d is normalized in Camera::ray()
-                let t_world = (p_world - r.o).dot(r.d);
-                if t_world <= tmin {
-                    search_from = h_obj.t.next_up();
-                    continue;
-                }
-                if t_world < closest {
-                    closest = t_world;
-                    let mat_id = inst.mat_override.unwrap_or(h_obj.mat_id);
-                    // 法線は逆転置行列で変換する（非一様スケールでも面に垂直なまま）。
-                    // 鏡像（負のスケール）を含む変換では逆転置が向きを反転させうるので、
-                    // シェーディング法線は変換後の幾何法線と同じ側に揃え直す。
-                    let ng = inst.xform.apply_normal(h_obj.ng);
-                    let ns = if h_obj.is_smooth() {
-                        face_forward(inst.xform.apply_normal(h_obj.ns), ng)
-                    } else {
-                        ng
-                    };
-                    best = Some(Hit {
-                        t: t_world,
-                        p: p_world,
-                        ng,
-                        ns,
-                        mat_id,
-                        prim_id: h_obj.prim_id,
-                        inst_id: Some(inst_id),
-                        p_error,
-                        bary: h_obj.bary,
-                        uv: h_obj.uv,
-                    });
-                }
-                break;
+        for inst_id in 0..self.instances.len() {
+            if let Some(h) = self.hit_instance(inst_id, r, inv_d, tmin, closest, false) {
+                closest = h.t;
+                best = Some(h);
             }
         }
 
@@ -592,6 +671,84 @@ impl World {
         best
     }
 
+    /// インスタンス `inst_id` に対する最近接交差の候補。ワールド空間の `t` が `closest` より小さいもの
+    /// （`tie_ok` なら `closest` と同値でもよい）だけを返す。物体空間への変換・tmin 写像・自己交差時の再探索・
+    /// 誤差上界は従来の [`World::hit`] のループ本体そのまま（TLAS の葉と線形総当たりの両方から呼ばれる）。
+    #[inline(always)]
+    fn hit_instance(&self, inst_id: usize, r: Ray, inv_d: Vec3, tmin: f64, closest: f64, tie_ok: bool) -> Option<Hit> {
+        let inst = &self.instances[inst_id];
+        let mesh = match self.meshes.get(inst.mesh_id) {
+            Some(m) => m,
+            None => return None,
+        };
+        // ワールド空間の境界ボックスで先に棄却する（物体空間への変換と誤差計算を省く）。箱は保守的で、
+        // スラブ判定も遠い側を広げてあるので、ここで棄却されるインスタンスに当たるレイは無い
+        if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), closest * (1.0 + 1e-9)) {
+            return None;
+        }
+
+        let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
+        let d_obj_raw = inst.xform.apply_vec_inv(r.d);
+        let d_len = d_obj_raw.len().max(1e-30); // Vec3::norm と同じ式（ビット一致）
+        let d_obj = d_obj_raw / d_len; // stabilize
+        // 物体空間へ写した原点には変換の丸め誤差 o_err が乗る。PBRT と同じく、原点をその誤差ぶん
+        // レイ方向に進めておく（真の原点がどこにあっても、進めた原点より手前にある）。ワールド空間で
+        // 面の誤差の箱の外へずらしてある原点は、物体空間でも元の面より先に出るので自己交差しない。
+        // 進めた距離 dt のぶん物体空間の t は小さくなるが、採否はワールド空間の t で決めるので影響しない。
+        let dt = d_obj.l1() * o_err;
+        let r_obj = Ray { o: o_obj + d_obj * dt, d: d_obj, time: r.time };
+
+        // ワールド空間の区間 (tmin, closest) を物体空間に写す。|r.d| = 1 なので t_obj = t_world·|A⁻¹d|。
+        // 丸めで境界上の候補を落とさないよう、両端とも相対 1e-9 だけ外側に広げる（採否は下の
+        // ワールド空間 t 判定が決めるので、広げても結果は変わらない）。tmin も同じく写す: 写さないと
+        // 拡大インスタンスでは近い面を取りこぼし（t_obj < tmin）、縮小インスタンスでは自己交差回避の
+        // 帯の中の面を BVH が返してしまう。
+        let tmin_obj = tmin * d_len * (1.0 - 1e-9);
+        let tmax_obj = closest * d_len * (1.0 + 1e-9);
+
+        // Object-space BVH。ワールド空間の判定で「近すぎる」（t_world <= tmin）と却下された場合は、
+        // 丸めで帯の内側に入った面なので、その面より先から同じインスタンスを探し直す（奥の面を
+        // 取りこぼさないため）。同一平面に重なった面が帯に多数あっても止まるよう回数を制限する。
+        let mut search_from = tmin_obj;
+        for _ in 0..=INSTANCE_RETRY_LIMIT {
+            let Some(h_obj) = mesh.hit(r_obj, search_from, tmax_obj) else { break };
+            let (p_world, p_error) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
+
+            // r.d is normalized in Camera::ray()
+            let t_world = (p_world - r.o).dot(r.d);
+            if t_world <= tmin {
+                search_from = h_obj.t.next_up();
+                continue;
+            }
+            if t_world < closest || (tie_ok && t_world == closest) {
+                let mat_id = inst.mat_override.unwrap_or(h_obj.mat_id);
+                // 法線は逆転置行列で変換する（非一様スケールでも面に垂直なまま）。
+                // 鏡像（負のスケール）を含む変換では逆転置が向きを反転させうるので、
+                // シェーディング法線は変換後の幾何法線と同じ側に揃え直す。
+                let ng = inst.xform.apply_normal(h_obj.ng);
+                let ns = if h_obj.is_smooth() {
+                    face_forward(inst.xform.apply_normal(h_obj.ns), ng)
+                } else {
+                    ng
+                };
+                return Some(Hit {
+                    t: t_world,
+                    p: p_world,
+                    ng,
+                    ns,
+                    mat_id,
+                    prim_id: h_obj.prim_id,
+                    inst_id: Some(inst_id),
+                    p_error,
+                    bary: h_obj.bary,
+                    uv: h_obj.uv,
+                });
+            }
+            break;
+        }
+        None
+    }
+
     /// シャドウレイの遮蔽判定（any-hit）。`hit` と違い「最近接」ではなく「(tmin, tmax) に採用できる
     /// 交差が 1 つでもあるか」だけを返す。見つかり次第、残りのインスタンス・球は調べずに打ち切る。
     ///
@@ -605,46 +762,31 @@ impl World {
     /// 規律に従う（水密交差・スケール不変を壊さない）。アルファマスクの透明判定は [`Mesh::occluded`] に
     /// 委譲する。
     pub fn occluded(&self, r: Ray, tmin: f64, tmax: f64, skip: Option<(Option<usize>, usize)>) -> bool {
+        if let Some(tlas) = self.tlas() {
+            let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
+            // any-hit なので探索順は結果に影響しない（`tmax` は縮めない）
+            let tmax_cell = Cell::new(tmax);
+            let mut found = false;
+            Self::tlas_traverse(tlas, r, tmin, &tmax_cell, |k| {
+                found = if k < tlas.n_inst {
+                    self.occluded_instance(k, r, inv_d, tmin, tmax, skip)
+                } else {
+                    let idx = k - tlas.n_inst;
+                    skip != Some((None, idx)) && self.spheres[idx].hit(r, tmin, tmax).is_some()
+                };
+                found
+            });
+            return found;
+        }
+        self.occluded_linear(r, tmin, tmax, skip)
+    }
+
+    /// 線形総当たり版の [`World::occluded`]。
+    fn occluded_linear(&self, r: Ray, tmin: f64, tmax: f64, skip: Option<(Option<usize>, usize)>) -> bool {
         let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
-        for (inst_id, inst) in self.instances.iter().enumerate() {
-            let mesh = match self.meshes.get(inst.mesh_id) {
-                Some(m) => m,
-                None => continue,
-            };
-            if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), tmax * (1.0 + 1e-9)) {
-                continue;
-            }
-            // このインスタンスが光源自身を含むなら、そのメッシュ内三角形番号を渡して除外する
-            let skip_prim = match skip {
-                Some((Some(light_inst), prim)) if light_inst == inst_id => Some(prim),
-                _ => None,
-            };
-
-            let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
-            let d_obj_raw = inst.xform.apply_vec_inv(r.d);
-            let d_len = d_obj_raw.len().max(1e-30);
-            let d_obj = d_obj_raw / d_len;
-            let dt = d_obj.l1() * o_err;
-            let r_obj = Ray { o: o_obj + d_obj * dt, d: d_obj, time: r.time };
-
-            // `World::hit` と同じ理由でどちらの端も相対 1e-9 だけ外側に広げる（採否はワールド空間 t が決める）。
-            // `tmax` は `closest` のように縮めない（any-hit なので他インスタンスの結果と比べる必要が無い）。
-            let tmin_obj = tmin * d_len * (1.0 - 1e-9);
-            let tmax_obj = tmax * d_len * (1.0 + 1e-9);
-
-            let mut search_from = tmin_obj;
-            for _ in 0..=INSTANCE_RETRY_LIMIT {
-                let Some(h_obj) = mesh.occluded(r_obj, search_from, tmax_obj, skip_prim) else { break };
-                let (p_world, _) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
-                let t_world = (p_world - r.o).dot(r.d);
-                if t_world <= tmin {
-                    search_from = h_obj.t.next_up();
-                    continue;
-                }
-                if t_world < tmax {
-                    return true;
-                }
-                break;
+        for inst_id in 0..self.instances.len() {
+            if self.occluded_instance(inst_id, r, inv_d, tmin, tmax, skip) {
+                return true;
             }
         }
 
@@ -658,6 +800,52 @@ impl World {
             }
         }
 
+        false
+    }
+
+    /// インスタンス `inst_id` が `(tmin, tmax)` の遮蔽になるか（[`World::occluded`] のループ本体そのまま）。
+    #[inline(always)]
+    fn occluded_instance(&self, inst_id: usize, r: Ray, inv_d: Vec3, tmin: f64, tmax: f64, skip: Option<(Option<usize>, usize)>) -> bool {
+        let inst = &self.instances[inst_id];
+        let mesh = match self.meshes.get(inst.mesh_id) {
+            Some(m) => m,
+            None => return false,
+        };
+        if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), tmax * (1.0 + 1e-9)) {
+            return false;
+        }
+        // このインスタンスが光源自身を含むなら、そのメッシュ内三角形番号を渡して除外する
+        let skip_prim = match skip {
+            Some((Some(light_inst), prim)) if light_inst == inst_id => Some(prim),
+            _ => None,
+        };
+
+        let (o_obj, o_err) = inst.xform.apply_point_inv_with_error_linf(r.o);
+        let d_obj_raw = inst.xform.apply_vec_inv(r.d);
+        let d_len = d_obj_raw.len().max(1e-30);
+        let d_obj = d_obj_raw / d_len;
+        let dt = d_obj.l1() * o_err;
+        let r_obj = Ray { o: o_obj + d_obj * dt, d: d_obj, time: r.time };
+
+        // `World::hit` と同じ理由でどちらの端も相対 1e-9 だけ外側に広げる（採否はワールド空間 t が決める）。
+        // `tmax` は `closest` のように縮めない（any-hit なので他インスタンスの結果と比べる必要が無い）。
+        let tmin_obj = tmin * d_len * (1.0 - 1e-9);
+        let tmax_obj = tmax * d_len * (1.0 + 1e-9);
+
+        let mut search_from = tmin_obj;
+        for _ in 0..=INSTANCE_RETRY_LIMIT {
+            let Some(h_obj) = mesh.occluded(r_obj, search_from, tmax_obj, skip_prim) else { break };
+            let (p_world, _) = inst.xform.apply_point_with_error(h_obj.p, h_obj.p_error);
+            let t_world = (p_world - r.o).dot(r.d);
+            if t_world <= tmin {
+                search_from = h_obj.t.next_up();
+                continue;
+            }
+            if t_world < tmax {
+                return true;
+            }
+            break;
+        }
         false
     }
 
@@ -3034,6 +3222,97 @@ mod tests {
         assert!(checked > 300, "ヒットが少なすぎる ({})", checked);
         assert!(smooth_hits > checked / 2, "補間が効いているヒットが少なすぎる（テストが空回り）");
     }
+    // ---- トップレベル BVH（TLAS）----
+
+    /// 乱数のインスタンス（大小・回転・非一様スケール・同じ位置の重なりを含む）と球からなるワールド。
+    fn random_tlas_world(n_inst: usize, n_sph: usize, seed: u64, same_place: bool) -> World {
+        let mut rng = Rng::new(seed);
+        let mut u = |a: f64, b: f64| a + (b - a) * rng.next_f64();
+        let mut world = World::new();
+        let tri = |k: f64| vec![
+            Triangle::new_static(Vec3::new(-k, -k, 0.0), Vec3::new(k, -k, 0.0), Vec3::new(0.0, k, 0.5), 0),
+            Triangle::new_static(Vec3::new(-k, -k, 0.5), Vec3::new(k, -k, 0.5), Vec3::new(0.0, k, 0.0), 0),
+        ];
+        world.add_mesh_instance(tri(1.0), Transform::identity(), None);
+        let cube_like = world.instance_mesh_id(0);
+        for i in 0..n_inst {
+            let (p, sc) = if same_place {
+                (Vec3::new(0.0, 0.0, 0.0), 1.0)
+            } else if i % 5 == 0 {
+                (Vec3::new(u(-30.0, 30.0), u(-30.0, 30.0), u(-30.0, 30.0)), u(20.0, 60.0)) // 巨大
+            } else if i % 5 == 1 {
+                (Vec3::new(u(-8.0, 8.0), u(-8.0, 8.0), u(-8.0, 8.0)), u(1e-4, 1e-3)) // 極小
+            } else {
+                (Vec3::new(u(-8.0, 8.0), u(-8.0, 8.0), u(-8.0, 8.0)), u(0.3, 2.0))
+            };
+            let x = Transform::translate(p).compose(
+                Transform::rotate(Vec3::new(u(-1.0, 1.0), u(-1.0, 1.0), u(0.1, 1.0)), u(0.0, 360.0))
+                    .compose(Transform::scale(Vec3::new(sc, sc * u(0.5, 1.5), sc))),
+            );
+            world.add_instance_of(cube_like, x, Some(i % 3));
+        }
+        for j in 0..n_sph {
+            let (c, r) = if same_place { (Vec3::new(0.0, 0.0, 0.0), 1.0) } else { (Vec3::new(u(-8.0, 8.0), u(-8.0, 8.0), u(-8.0, 8.0)), u(0.05, 2.0)) };
+            world.add_sphere(Sphere { c, r, mat_id: j % 4 });
+        }
+        world
+    }
+
+    fn assert_tlas_hit(a: &Option<Hit>, b: &Option<Hit>, what: &str) {
+        match (a, b) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                assert_eq!(a.t.to_bits(), b.t.to_bits(), "{what}: t");
+                assert_eq!((a.inst_id, a.prim_id, a.mat_id), (b.inst_id, b.prim_id, b.mat_id), "{what}: ids");
+                assert_eq!((a.p.x.to_bits(), a.ng.z.to_bits(), a.uv.0.to_bits()), (b.p.x.to_bits(), b.ng.z.to_bits(), b.uv.0.to_bits()), "{what}: geometry");
+            }
+            _ => panic!("{what}: {:?} vs {:?}", a.map(|h| h.t), b.map(|h| h.t)),
+        }
+    }
+
+    /// TLAS 経由の `hit` / `occluded` は線形総当たりと完全に一致する（t のビットまで、`inst_id`・`prim_id`・`mat_id` も）。
+    #[test]
+    fn tlas_matches_linear_bruteforce() {
+        let mut rng = Rng::new(99);
+        for (n_inst, n_sph, same) in [(30, 30, false), (60, 0, false), (0, 60, false), (25, 5, false), (40, 40, true), (1, 30, false)] {
+            let world = random_tlas_world(n_inst, n_sph, 7 + n_inst as u64, same);
+            assert!(world.tlas().is_some(), "{} prims で TLAS が使われるはず", n_inst + n_sph + 1);
+            for k in 0..3000 {
+                let o = Vec3::new(rng.next_f64() * 40.0 - 20.0, rng.next_f64() * 40.0 - 20.0, rng.next_f64() * 40.0 - 20.0);
+                let d = uniform_sphere_dir(&mut rng);
+                let r = Ray { o, d, time: 0.0 };
+                let tmin = if k % 7 == 0 { 1e-3 } else { 0.0 };
+                let tmax = if k % 5 == 0 { 15.0 } else { 1e30 };
+                let what = format!("case ({n_inst},{n_sph},{same}) ray {k}");
+                assert_tlas_hit(&world.hit(r, tmin, tmax), &world.hit_linear(r, tmin, tmax), &what);
+                for skip in [None, Some((None, 0usize)), Some((Some(1usize), 0usize))] {
+                    assert_eq!(world.occluded(r, tmin, tmax, skip), world.occluded_linear(r, tmin, tmax, skip), "{what}: occluded {:?}", skip);
+                }
+            }
+        }
+    }
+
+    /// 退化ケース: 空、インスタンスだけ／球だけ、1 個だけ、しきい値の前後。どれも落ちず線形と一致する。
+    #[test]
+    fn tlas_degenerate_worlds() {
+        let r = Ray { o: Vec3::new(0.3, 0.2, 9.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        let empty = World::new();
+        assert!(empty.hit(r, 0.0, 1e30).is_none() && !empty.occluded(r, 0.0, 1e30, None));
+        for (ni, ns) in [(0, 1), (1, 0), (1, 1), (0, TLAS_MIN_PRIMS - 1), (0, TLAS_MIN_PRIMS), (0, TLAS_MIN_PRIMS + 1), (TLAS_MIN_PRIMS, 0)] {
+            let world = random_tlas_world(ni, ns, 3, false);
+            let used = world.tlas().is_some();
+            assert_eq!(used, ni + ns + 1 >= TLAS_MIN_PRIMS, "({ni},{ns})");
+            assert_tlas_hit(&world.hit(r, 0.0, 1e30), &world.hit_linear(r, 0.0, 1e30), "degenerate");
+            assert_eq!(world.occluded(r, 0.0, 1e30, None), world.occluded_linear(r, 0.0, 1e30, None));
+        }
+        // 構築後にジオメトリを足しても古い TLAS を使わない（足した球にも当たる）
+        let mut world = random_tlas_world(TLAS_MIN_PRIMS, 0, 5, false);
+        let _ = world.hit(r, 0.0, 1e30);
+        world.add_sphere(Sphere { c: Vec3::new(0.3, 0.2, 50.0), r: 0.5, mat_id: 0 });
+        assert!(world.hit(r, 0.0, 1e30).is_some_and(|h| h.t < 9.0 + 1e-9 || h.mat_id == 0));
+        assert_tlas_hit(&world.hit(r, 0.0, 1e30), &world.hit_linear(r, 0.0, 1e30), "after add");
+    }
+
 }
 
 /// クロージャの所要時間を測って `(結果, 経過)` を返す（構築時間の内訳表示用）。
@@ -3041,4 +3320,5 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
     let t0 = std::time::Instant::now();
     let v = f();
     (v, t0.elapsed())
+
 }

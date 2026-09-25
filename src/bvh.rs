@@ -323,16 +323,22 @@ impl Bvh {
     /// を通るので、テストで「逐次 = `build_with_threads(tris, 1)`」「並列 = `build_with_threads(tris, N)`」
     /// を比較できる。
     fn build_with_threads(src: TriangleSource<'_>, threads: usize) -> Self {
-        let mut indices: Vec<usize> = (0..src.len()).collect();
-
         let tri_bounds: Vec<Aabb> = (0..src.len()).map(|ti| src.bounds(ti)).collect();
-        let tri_centroids: Vec<Vec3> = tri_bounds.iter().map(|b| b.centroid()).collect();
+        Self::build_from_bounds(&tri_bounds, threads)
+    }
+
+    /// プリミティブごとの AABB だけから BVH を作る共通ビルダー（binned SAH・並列部分木構築）。
+    /// プリミティブの種類には依存しない: 三角形用（[`Bvh::build`]）と、`World` のトップレベル BVH
+    /// （インスタンスと球の境界）が同じ実装を共有する。リーフの `indices` は `bounds` の添字。
+    pub(crate) fn build_from_bounds(bounds: &[Aabb], threads: usize) -> Self {
+        let mut indices: Vec<usize> = (0..bounds.len()).collect();
+        let centroids: Vec<Vec3> = bounds.iter().map(|b| b.centroid()).collect();
 
         let nodes = if indices.is_empty() {
             Vec::new()
         } else {
             let depth_budget = parallel_depth_budget(threads, indices.len());
-            build_range(&mut indices, 0, &tri_bounds, &tri_centroids, depth_budget)
+            build_range(&mut indices, 0, bounds, &centroids, depth_budget)
         };
         Self { nodes, indices }
     }
