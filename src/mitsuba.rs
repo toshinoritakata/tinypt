@@ -661,8 +661,11 @@ fn parse_sensor(el: &Element, aspect: f64) -> Camera {
         }
     };
 
-    let (eye, target, up) = el
-        .child_tag("transform")
+    // to_world は名前で選ぶ（`to_world_end` を先に書いても取り違えない）
+    let sensor_transform = |name_ok: fn(Option<&str>) -> bool| {
+        el.children.iter().find(|c| c.tag == "transform" && name_ok(c.attr("name")))
+    };
+    let (eye, target, up) = sensor_transform(|n| matches!(n, None | Some("to_world")))
         .and_then(|t| t.child_tag("lookat"))
         .and_then(parse_lookat)
         .unwrap_or((
@@ -695,6 +698,17 @@ fn parse_sensor(el: &Element, aspect: f64) -> Camera {
         close = close.clamp(0.0, 1.0);
     }
     cam.set_shutter(open, close);
+    // 独自拡張: シャッター閉じ時点のカメラ姿勢（`<lookat>` のみ）。補間できなければ警告して静止のまま
+    if let Some(end_el) = sensor_transform(|n| n == Some("to_world_end")) {
+        match end_el.child_tag("lookat").and_then(parse_lookat) {
+            Some((e, t, u)) => {
+                if !cam.set_end_pose(e, t, u) {
+                    warn("sensor to_world_end is degenerate (e.g. `up` parallel to the view direction); the camera stays static");
+                }
+            }
+            None => warn("sensor to_world_end needs a <lookat>; the camera stays static"),
+        }
+    }
     cam
 }
 
@@ -2838,5 +2852,53 @@ mod tests {
         assert!(w.iter().any(|m| m.contains("clamped")));
         assert_eq!(s.cam.shutter(), (0.0, 1.0));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- カメラのモーション（sensor の to_world_end）----
+
+    fn sensor_scene(inner: &str) -> (Scene, Vec<String>) {
+        let xml = format!(r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/>{inner}</sensor></scene>"#);
+        let (r, w) = capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0);
+        (r, w)
+    }
+    fn eye_at(scene: &mut Scene, t: f64) -> Vec3 {
+        scene.cam.set_shutter(t, t);
+        scene.cam.ray(0.0, 0.0, &mut crate::rng::Rng::new(0)).o
+    }
+    const CAM_START: &str = r#"<transform name="to_world"><lookat origin="4, 1, 0" target="0, 0, 0" up="0, 1, 0"/></transform>"#;
+    const CAM_END: &str = r#"<transform name="to_world_end"><lookat origin="0, 1, -4" target="0, 0, 0" up="0, 1, 0"/></transform>"#;
+
+    /// `to_world_end` の `<lookat>` を読み、`to_world` との記述順は問わない。閉じ時刻でカメラは閉の位置、開で開の位置。
+    #[test]
+    fn sensor_to_world_end_animates_the_camera() {
+        for inner in [format!("{CAM_START}{CAM_END}"), format!("{CAM_END}{CAM_START}")] {
+            let (mut s, w) = sensor_scene(&inner);
+            assert!(w.is_empty(), "{w:?}");
+            assert!((eye_at(&mut s, 0.0) - Vec3::new(4.0, 1.0, 0.0)).len() < 1e-12);
+            assert!((eye_at(&mut s, 1.0) - Vec3::new(0.0, 1.0, -4.0)).len() < 1e-12);
+            // 弧の中点（半径 4 の xz、高さ 1）
+            let mid = eye_at(&mut s, 0.5);
+            assert!((mid - Vec3::new(4.0 * 0.5f64.sqrt(), 1.0, -4.0 * 0.5f64.sqrt())).len() < 1e-9, "{mid:?}");
+        }
+        // 無い場合は静止（警告なし）
+        let (mut s, w) = sensor_scene(CAM_START);
+        assert!(w.is_empty());
+        assert!((eye_at(&mut s, 1.0) - Vec3::new(4.0, 1.0, 0.0)).len() < 1e-12);
+    }
+
+    /// `<lookat>` 以外の書き方・退化した姿勢は警告して静止（壊れない）。
+    #[test]
+    fn sensor_to_world_end_bad_input_warns_and_stays_static() {
+        for end in [
+            r#"<transform name="to_world_end"><translate x="1" y="0" z="0"/></transform>"#,
+            r#"<transform name="to_world_end"/>"#,
+            r#"<transform name="to_world_end"><lookat origin="0, 4, 0" target="0, 0, 0" up="0, 1, 0"/></transform>"#,
+            r#"<transform name="to_world_end"><lookat origin="0, 1, 0" target="0, 1, 0" up="0, 1, 0"/></transform>"#,
+        ] {
+            let (mut s, w) = sensor_scene(&format!("{CAM_START}{end}"));
+            assert_eq!(w.iter().filter(|m| m.contains("to_world_end")).count(), 1, "{end}: {w:?}");
+            let e = eye_at(&mut s, 1.0);
+            assert!((e - Vec3::new(4.0, 1.0, 0.0)).len() < 1e-12 && e.x.is_finite(), "{end}");
+        }
     }
 }

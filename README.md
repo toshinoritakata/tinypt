@@ -6,6 +6,9 @@ Rust 製のモンテカルロパストレーサー。
 
 <table>
 <tr>
+<td colspan="3"><a href="docs/images/showcase_all.png"><img src="docs/images/showcase_all.png" alt="showcase.xml"></a><br>全機能の複合サンプル: パラメトリック形状・メッシュ共有・各種マテリアル・色/法線/バンプ/アルファのマップ・環境マップ・面光源・点/平行/スポット光源・参加媒質・モーションブラー・被写界深度。2048spp、1200x675、デノイズあり。<a href="sample/showcase.xml"><code>sample/showcase.xml</code></a></td>
+</tr>
+<tr>
 <td width="34%"><a href="docs/images/showcase_sponza_textured.png"><img src="docs/images/showcase_sponza_textured.png" alt="Sponza (textured)"></a><br>Crytek Sponza (262,267 三角形、テクスチャ + アルファマスク + バンプマップ)。512spp、1200x675、デノイズあり。<a href="sample/sponza_textured.xml"><code>sample/sponza_textured.xml</code></a></td>
 <td width="33%"><a href="docs/images/showcase_default.png"><img src="docs/images/showcase_default.png" alt="default.xml"></a><br>組み込みマテリアルサンプル (拡散・金属・GGX・ガラス)。2048spp、1200x675、デノイズあり。<a href="sample/default.xml"><code>sample/default.xml</code></a></td>
 <td width="33%"><a href="docs/images/showcase_rungholt.png"><img src="docs/images/showcase_rungholt.png" alt="Rungholt"></a><br>Rungholt (6,704,264 三角形)。512spp、1200x675、デノイズあり。<a href="sample/rungholt.xml"><code>sample/rungholt.xml</code></a></td>
@@ -271,7 +274,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 
 | 要素 | 対応内容 |
 |---|---|
-| `<sensor type="perspective">` | `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance` (DOF、焦点は視線に垂直な平面) |
+| `<sensor type="perspective">` | `fov` / `fov_axis` / `to_world`(`lookat`) / `to_world_end`(`lookat`、独自拡張: カメラのモーションブラー、[詳細](#モーションブラー)) / `aperture_radius` / `focus_distance` (DOF、焦点は視線に垂直な平面) |
 | `<shape type="sphere">` | `center` / `radius` |
 | `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` + `face_normals` (下記) |
 | `<shape type="rectangle"\|"cube"\|"disk">` | Mitsuba 正準形メッシュ + `to_world` |
@@ -364,8 +367,14 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 <sensor type="perspective">
   <float name="shutter_open" value="0"/>     <!-- 既定 0、[0, 1] -->
   <float name="shutter_close" value="1"/>    <!-- 既定 1。0.5 にすると動きが半分になる -->
+  <transform name="to_world">     <lookat origin="6.4, 3.15, 0" target="0, 0.55, 0" up="0, 1, 0"/></transform>
+  <transform name="to_world_end"> <lookat origin="6.2, 3.15, 1.6" target="0, 0.55, 0" up="0, 1, 0"/></transform>  <!-- 独自拡張。省略で静止 -->
 </sensor>
 ```
+
+- **カメラも動かせる** (`<sensor>` の `to_world_end`、`<lookat>` のみ)。シャッター開 (`to_world`) と閉の 2 姿勢を、形状と同じ `AnimatedTransform` (極分解 + 四元数 slerp) でレイごとに補間する。姿勢は「ワールド → カメラ」の変換として持つので、対象のまわりの旋回ではカメラ位置が**弧**を描く (弦を横切らない)。レンズ (被写界深度) のサンプリングも補間後の姿勢で行うので、ボケは動きに追従する。
+- **固定されるもの**: `fov` / `focus_distance` / `aperture_radius` は動かない (ズーム・フォーカス送りは未対応)。`to_world_end` が `<lookat>` でない・`up` と視線が平行などで補間できないときは警告して静止。
+- `to_world_end` を書かない (静止カメラの) シーンは出力がビット単位で変わらない。
 
 - `to_world_end` は回転・スケール・せん断を含む**一般のアフィン変換**に対応する。行列を直接補間すると回転が縮むので、読み込み時に極分解 (`A = R·S`) して、平行移動は線形・回転は四元数 slerp・伸縮は成分ごとに線形補間する。省略した形状は静止で、従来と出力がビット単位で同じ。
 - `to_world_end` と `filename_end` は**併用できる** (頂点の変形と変換の動きが両方効く)。
@@ -378,6 +387,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 
 | ファイル | 内容 |
 |---|---|
+| `sample/showcase.xml` | **全機能の複合サンプル**。外部モデル不要 (テクスチャは `tools/gen_showcase_textures.py` で生成済みのものを同梱) |
 | `sample/default.xml` | 組み込みデフォルトシーン相当 (地面 + 球4個 + 球光源、背景は黒) |
 | `sample/mesh.xml` | OBJ メッシュ (立方体) + transform/instance |
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |

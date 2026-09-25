@@ -49,6 +49,12 @@ impl Transform {
         }
     }
 
+    /// 線形部 `A`。
+    pub fn linear(&self) -> Mat3 { self.a }
+
+    /// 平行移動 `t`。
+    pub fn translation(&self) -> Vec3 { self.t }
+
     /// 恒等変換。
     pub fn identity() -> Self {
         Self::from_affine(Mat3::identity(), Vec3::new(0.0, 0.0, 0.0))
