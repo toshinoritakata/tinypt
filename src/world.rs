@@ -438,6 +438,13 @@ impl World {
     fn add_mesh(&mut self, mesh: Mesh, xform: Transform, mat_override: Option<usize>) -> usize {
         let mesh_id = self.meshes.len();
         self.meshes.push(mesh);
+        self.add_instance_of(mesh_id, xform, mat_override)
+    }
+
+    /// 既存のメッシュ `mesh_id`（三角形配列と BVH）の新しいインスタンスを足し、インスタンス ID を返す。
+    /// 同じ OBJ を何度も配置するとき、メッシュを作り直さずに共有するための入口。材質を変えたいときは
+    /// `mat_override` を使う（インスタンス側の属性なので、メッシュを共有したまま材質だけ違えられる）。
+    pub fn add_instance_of(&mut self, mesh_id: usize, xform: Transform, mat_override: Option<usize>) -> usize {
         let inst_id = self.instances.len();
         let world_bounds = instance_world_bounds(&self.meshes[mesh_id], &xform);
         self.instances.push(Instance { mesh_id, xform, mat_override, world_bounds });
@@ -450,6 +457,19 @@ impl World {
     }
 
     /// 全インスタンス展開後の三角形数（表示用。インスタンスごとにメッシュの三角形数を足す）。
+    /// インスタンス `inst_id` が参照するメッシュの ID（`add_mesh_*` が返すのはインスタンス ID なので、
+    /// 共有用にメッシュ ID が要る呼び出し側はこれで引く。既存 API のシグネチャを変えないための手段）。
+    pub fn instance_mesh_id(&self, inst_id: usize) -> usize {
+        self.instances[inst_id].mesh_id
+    }
+    /// メッシュ（三角形配列 + BVH）の数。同じ OBJ を共有していれば、インスタンス数より少ない。
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
+    }
+    /// インスタンスの数。
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
     pub fn triangle_count(&self) -> usize {
         self.instances
             .iter()

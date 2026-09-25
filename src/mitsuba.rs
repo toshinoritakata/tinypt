@@ -650,6 +650,8 @@ fn parse_shape(
     // 既定は false（= OBJ に頂点法線があれば補間する）。パラメトリック形状は元から
     // 頂点法線を持たないので、この指定があっても結果は変わらない。
     let face_normals = el.boolean_or("face_normals", false);
+    // OBJ をメッシュキャッシュに登録するときのキー（キャッシュミスで読んだときだけ Some）
+    let mut cache_key: Option<(PathBuf, bool)> = None;
     let mesh: MeshData = match el.typ() {
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
@@ -673,6 +675,17 @@ fn parse_shape(
                 }
             };
             let resolved = resolve_path(base_dir, filename);
+            let key = (std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone()), face_normals);
+            // 同じ OBJ（同じ face_normals）が既に読まれていれば、メッシュを共有してインスタンスだけ足す。
+            // 最初のメッシュには最初の形状の mat_id が焼き込まれているので、材質は必ず mat_override で与える
+            // （`Hit.mat_id` と面光源の判定は mat_override を見る）
+            if let Some(&mesh_id) = mtl_state.obj_cache.get(&key) {
+                let xform = el.child_tag("transform").map(parse_transform).unwrap_or_else(Transform::identity);
+                push_material(mats, mat_maps, mat, map);
+                world.add_instance_of(mesh_id, xform, Some(mat_id));
+                return;
+            }
+            cache_key = Some(key);
             match timed_obj(|| load_obj_mesh(resolved.to_string_lossy().as_ref(), mat_id)) {
                 Ok(m) => if face_normals { m.into_flat() } else { m },
                 Err(e) => {
@@ -693,7 +706,10 @@ fn parse_shape(
         .map(parse_transform)
         .unwrap_or_else(Transform::identity);
     push_material(mats, mat_maps, mat, map);
-    world.add_mesh_data_instance(mesh, xform, None);
+    let inst_id = world.add_mesh_data_instance(mesh, xform, None);
+    if let Some(key) = cache_key {
+        mtl_state.obj_cache.insert(key, world.instance_mesh_id(inst_id));
+    }
 }
 
 /// 材質を `mats` に積む**唯一の入口**。`mat_maps` は常に `mats` と同じ長さに保つ
@@ -725,6 +741,11 @@ struct MtlState {
     map_cache: std::collections::HashMap<(PathBuf, MapKind, u64), Option<MapId>>,
     /// 定数の `d < 1`（マスク無し）を無視する警告を出したか（シーンで 1 回だけ）
     warned_alpha: bool,
+    /// 読み込み済みの OBJ メッシュ（`<bsdf>` 指定の経路だけ）。キー = (解決後の絶対パス, `face_normals`)、値 = メッシュ ID。
+    /// 同じ OBJ を何度も配置するとき、解析と BVH 構築を 1 回にしてメッシュを共有する。
+    /// `xform` と材質はインスタンス側（`mat_override`）なのでキーに入れない。MTL 経路（`parse_obj_with_mtl`）は
+    /// 三角形に焼き込む `mat_id` が形状ごとに積む材質で決まるので共有しない。`load_scene_from_str` 1 回ぶんのローカル状態
+    obj_cache: std::collections::HashMap<(PathBuf, bool), usize>,
 }
 
 /// `usemtl` の材質を `mat_id` に振り直しつつ、OBJ を 1 メッシュのままインスタンス配置する。
@@ -2309,5 +2330,112 @@ mod tests {
         );
         assert!(warnings.iter().any(|w| w.contains("inside a <shape>")), "{:?}", warnings);
         assert!(scene.medium.is_none());
+    }
+
+    // ---- 同じ OBJ のメッシュ共有 ----
+
+    fn share_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("tinypt_share_{}_{}_{}", tag, std::process::id(), C.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 三角形 (0,0,0)-(1,0,0)-(0,1,0)（頂点法線付き）
+        std::fs::write(dir.join("a.obj"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nvn 0 1 0\nvn 1 0 0\nf 1//1 2//2 3//3\n").unwrap();
+        std::fs::write(dir.join("b.obj"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        dir
+    }
+
+    fn obj_shape(file: &str, x: f64, bsdf: &str, extra: &str) -> String {
+        format!(
+            r#"<shape type="obj"><string name="filename" value="{file}"/>{extra}
+                 <transform name="to_world"><translate x="{x}" y="0" z="0"/></transform>{bsdf}</shape>"#
+        )
+    }
+    const DIFFUSE_A: &str = r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.1"/></bsdf>"#;
+    const DIFFUSE_B: &str = r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.9"/></bsdf>"#;
+
+    fn share_scene(dir: &Path, shapes: &str) -> Scene {
+        let xml = format!(r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor>{}</scene>"#, shapes);
+        load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
+    }
+
+    /// 同じ OBJ を何度置いても、メッシュは 1 つでインスタンスが増える。材質は形状ごとに正しく効く。
+    #[test]
+    fn same_obj_shares_one_mesh_and_keeps_per_instance_materials() {
+        let dir = share_dir("same");
+        let shapes: String = (0..3)
+            .map(|i| obj_shape("a.obj", 3.0 * i as f64, if i == 1 { DIFFUSE_B } else { DIFFUSE_A }, ""))
+            .collect();
+        let scene = share_scene(&dir, &shapes);
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (1, 3));
+        assert_eq!(scene.mats.len(), 3, "材質は形状ごとに 1 つ");
+        for i in 0..3 {
+            let ray = Ray { o: Vec3::new(0.2 + 3.0 * i as f64, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+            let hit = scene.world.hit(ray, 0.0, 1e30).expect("hit");
+            assert_eq!(hit.mat_id, i, "インスタンス {} の材質", i);
+            assert_eq!(hit.inst_id, Some(i));
+        }
+        // 配置（xform）はインスタンスごと: 隣のインスタンスの位置には当たらない
+        let miss = Ray { o: Vec3::new(1.5, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        assert!(scene.world.hit(miss, 0.0, 1e30).is_none());
+        // パスの綴りが違っても（./a.obj）同じファイルなら共有する
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("./a.obj", 3.0, DIFFUSE_A, "")));
+        assert_eq!(scene.world.mesh_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 共有してはいけないものは共有しない: 別ファイル、`face_normals` の違い。
+    #[test]
+    fn different_obj_or_normal_handling_is_not_shared() {
+        let dir = share_dir("diff");
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("b.obj", 3.0, DIFFUSE_A, "")));
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (2, 2));
+        let fn_true = r#"<boolean name="face_normals" value="true"/>"#;
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("a.obj", 3.0, DIFFUSE_A, fn_true)));
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (2, 2), "face_normals が違えば別メッシュ");
+        // face_normals=true 同士は共有する
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, fn_true), obj_shape("a.obj", 3.0, DIFFUSE_A, fn_true)));
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (1, 2));
+        // 頂点法線の扱いが実際に違う: 共有されなかった 2 つで陰影法線が違う（補間法線 vs 面法線）
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("a.obj", 3.0, DIFFUSE_A, fn_true)));
+        let hit_at = |x: f64| scene.world.hit(Ray { o: Vec3::new(x + 0.2, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+        assert!((hit_at(0.0).ns - hit_at(0.0).ng).len() > 1e-3, "補間法線は面法線と違う");
+        assert!((hit_at(3.0).ns - hit_at(3.0).ng).len() < 1e-12, "face_normals は ns = ng");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 共有したメッシュでも、面光源かどうかは形状（材質）ごとに決まる。
+    #[test]
+    fn shared_mesh_emitter_is_per_instance() {
+        let dir = share_dir("emit");
+        let emitter = r#"<emitter type="area"><rgb name="radiance" value="5"/></emitter>"#;
+        // 1 つ目は通常の拡散、2 つ目（共有）だけが面光源
+        let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("a.obj", 3.0, "", emitter)));
+        assert_eq!(scene.world.mesh_count(), 1);
+        let ray = |x: f64| Ray { o: Vec3::new(x + 0.2, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        assert!(scene.mats[scene.world.hit(ray(0.0), 0.0, 1e30).unwrap().mat_id].emitted().is_none());
+        assert!(scene.mats[scene.world.hit(ray(3.0), 0.0, 1e30).unwrap().mat_id].emitted().is_some());
+        let mut rng = crate::rng::Rng::new(1);
+        for _ in 0..50 {
+            let ls = scene.world.sample_light(&mut rng, 0.0, Vec3::new(1.0, 1.0, 3.0)).expect("light");
+            assert!(ls.position.x >= 3.0 - 1e-9 && ls.position.x <= 4.0 + 1e-9, "光源は 2 つ目のインスタンスだけ: {:?}", ls.position);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// MTL 経路（`<bsdf>` 無し）は形状ごとに材質を積み直して三角形に焼き込むので、共有しない（メッシュ 2 つ）。
+    #[test]
+    fn mtl_path_obj_is_not_shared() {
+        let dir = share_dir("mtl");
+        std::fs::write(dir.join("m.obj"), "mtllib m.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl A\nf 1 2 3\n").unwrap();
+        std::fs::write(dir.join("m.mtl"), "newmtl A\nKd 1 0 0\n").unwrap();
+        let shape = |x: f64| format!(r#"<shape type="obj"><string name="filename" value="m.obj"/><transform name="to_world"><translate x="{x}" y="0" z="0"/></transform></shape>"#);
+        let scene = share_scene(&dir, &format!("{}{}", shape(0.0), shape(3.0)));
+        assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (2, 2));
+        for i in 0..2 {
+            let hit = scene.world.hit(Ray { o: Vec3::new(0.2 + 3.0 * i as f64, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }, 0.0, 1e30).unwrap();
+            assert_eq!(hit.mat_id, i);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
