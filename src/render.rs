@@ -101,6 +101,12 @@ impl RenderProbe {
         f(&b.acc, &b.acc_w)
     }
 
+    /// [`with_buffers`](Self::with_buffers) に、そのバッファに含まれるタイル数も渡す（バッファとタイル数が食い違わない組）。
+    pub fn with_buffers_at<R>(&self, f: impl FnOnce(usize, &[Color], &[f64]) -> R) -> R {
+        let b = self.buffers.lock().unwrap();
+        f(self.tiles_done.load(Ordering::Relaxed), &b.acc, &b.acc_w)
+    }
+
     /// 完了したサンプルの総数（全画素の重みの合計。適応サンプリングでも正しい）。
     pub fn samples_done(&self) -> f64 {
         self.buffers.lock().unwrap().acc_w.iter().sum()
@@ -410,7 +416,9 @@ fn render_impl(
                 out.merge_tile(&r, w);
                 next_id += 1;
                 if let Some(p) = probe {
-                    p.buffers.lock().unwrap().merge_tile(&r, w);
+                    // タイル数はバッファと同じロックの中で更新する（`with_buffers_at` が組で読めるように）
+                    let mut b = p.buffers.lock().unwrap();
+                    b.merge_tile(&r, w);
                     p.tiles_done.store(next_id, Ordering::Relaxed);
                 }
 
@@ -734,7 +742,7 @@ mod tests {
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
     /// `RENDER_REVISION` は `Cargo.toml` の `version` から導出されるので、実質的には
     /// 「このハッシュを記録したときの `Cargo.toml` のバージョン」を数値で持っているのと同じ。
-    const GOLDEN_REVISION: u32 = 17000;
+    const GOLDEN_REVISION: u32 = 18000;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。

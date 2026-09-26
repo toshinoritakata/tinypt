@@ -26,6 +26,7 @@
 //! `TINYPT_VIEWER_SWITCH_AT_TILES=N` を足すと、完了を待たず N タイルで次へ切り替える。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -122,6 +123,19 @@ enum Snap {
 /// プレビュー（GL テクスチャ）に載せられる 1 辺の上限。GUI の解像度欄はこれ以下に丸める。
 const PREVIEW_MAX: usize = 8192;
 
+/// デノイズ済みプレビューの 1 世代。リニアの画素（トーンマップ前）で持つので、露出・トーンマップを
+/// 変えても作り直さずに `ppm_bytes` を通し直せる（CLI と同じ順序: resolve → denoise → ppm_bytes）。
+struct Dn {
+    /// この結果が元にした蓄積バッファのタイル数
+    tiles: usize,
+    pixels: Arc<Vec<Color>>,
+    /// どのジョブ（シーン・設定）の結果か。古いジョブの結果は捨てる
+    serial: u64,
+    /// 世代番号（テクスチャを作り直すかの判定用）
+    id: u64,
+    took: Duration,
+}
+
 /// A: 表示・保存の後処理（変えてもレンダーは続く）。
 #[derive(Clone, Copy, PartialEq)]
 struct View {
@@ -197,13 +211,26 @@ struct App {
     /// 検証フック: `TINYPT_VIEWER_EDIT`（B の欄を入れるだけ）と `TINYPT_VIEWER_SHOTS=N:path;…`
     /// （N タイルに達したらビューア自身のウィンドウを PNG に保存する。OS のスクリーンキャプチャは使わない）
     edit_hook: Option<String>,
+    /// プレビューをデノイズ済みで表示するか（保存時デノイズ `view.denoise` とは別の設定）
+    show_dn: bool,
+    dn: Option<Dn>,
+    dn_slot: Arc<Mutex<Option<Dn>>>,
+    dn_busy: Arc<AtomicBool>,
+    dn_last_end: Option<Instant>,
+    dn_last_took: Duration,
+    dn_counter: u64,
+    /// 現在のジョブの通し番号（`open_scene` ごとに増やす）
+    serial: u64,
+    /// 最後に作ったテクスチャの元（種別, 番号）と、その画素（8bit RGB。検証フックが書き出す）
+    shown_src: Option<(u8, u64)>,
+    shown_rgb: Vec<u8>,
+    dump_shown: Option<String>,
     shots: Vec<(usize, String)>,
     shot_path: Option<String>,
     overrides: Arc<CliOverrides>,
     job: Job,
     texture: Option<egui::TextureHandle>,
     /// 最後にテクスチャへ反映したタイル数（変化が無ければ作り直さない）
-    shown_tiles: Option<usize>,
     /// 直前に表示できていたレンダー（読み込みに失敗したときの保存・表示に使う）
     last: Option<(Arc<RenderProbe>, Arc<RenderConfig>)>,
     path_input: String,
@@ -239,6 +266,17 @@ impl App {
             view_hook_at: std::env::var("TINYPT_VIEWER_VIEW_AT_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             apply_hook: std::env::var("TINYPT_VIEWER_APPLY").ok(),
             edit_hook: std::env::var("TINYPT_VIEWER_EDIT").ok(),
+            show_dn: false,
+            dn: None,
+            dn_slot: Arc::new(Mutex::new(None)),
+            dn_busy: Arc::new(AtomicBool::new(false)),
+            dn_last_end: None,
+            dn_last_took: Duration::ZERO,
+            dn_counter: 0,
+            serial: 0,
+            shown_src: None,
+            shown_rgb: Vec::new(),
+            dump_shown: std::env::var("TINYPT_VIEWER_DUMP_SHOWN").ok(),
             shots: std::env::var("TINYPT_VIEWER_SHOTS")
                 .map(|v| {
                     v.split(';')
@@ -263,7 +301,6 @@ impl App {
             overrides,
             job,
             texture: None,
-            shown_tiles: None,
             message: String::new(),
             one_to_one: false,
             autosave: std::env::var("TINYPT_VIEWER_AUTOSAVE").ok(),
@@ -287,6 +324,9 @@ impl App {
         }
         self.message.clear();
         self.opts_synced = false;
+        self.serial += 1;
+        self.dn = None;
+        self.shown_src = None;
     }
 
     /// B の「適用」: 欄の値を丸めて検証し、スペックを上書きとして記録してからシーンを開き直す（= やり直し）。
@@ -323,6 +363,7 @@ impl App {
                 "exposure" => self.view.exposure = v.parse().ok().filter(|x: &f64| x.is_finite()).unwrap_or(self.view.exposure),
                 "tonemap" => self.view.tonemap = Tonemap::from_str(v).unwrap_or(self.view.tonemap),
                 "denoise" => self.view.denoise = v != "0",
+                "show" => self.show_dn = v != "0" && cfg!(feature = "oidn"),
                 "spp" => self.edit.spp = v.parse().unwrap_or(self.edit.spp),
                 "seed" => self.edit.seed = v.parse().unwrap_or(self.edit.seed),
                 "adaptive" => self.edit.adaptive = v != "0",
@@ -358,6 +399,12 @@ impl App {
             })
             .unwrap_or_default();
         self.scenes_dir = dir;
+    }
+
+    /// 画面（テクスチャ）に出ているのが、`tiles` 時点のデノイズ結果そのものか（現在の表示設定で）。
+    fn dn_on_screen(&self, tiles: usize) -> bool {
+        let key = (self.view.tonemap, self.view.exposure.to_bits());
+        self.dn.as_ref().is_some_and(|d| d.tiles == tiles && self.shown_src == Some((1, d.id)) && self.shown_view == Some(key))
     }
 
     fn snapshot(&self) -> Snap {
@@ -417,6 +464,40 @@ impl eframe::App for App {
                 self.apply_opts();
             }
         }
+        // デノイズ済みプレビュー: 結果の受け取り → 間引いて別スレッドで起動
+        if let Some(d) = self.dn_slot.lock().unwrap().take() {
+            self.dn_last_end = Some(Instant::now());
+            self.dn_last_took = d.took;
+            if d.serial == self.serial {
+                self.dn = Some(d);
+            }
+        }
+        if let (Snap::Live { probe, config, finished, .. }, true) = (&snap, self.show_dn && cfg!(feature = "oidn")) {
+            let cur = probe.tiles().0;
+            let have = self.dn.as_ref().map(|d| d.tiles);
+            if cur > 0 && have != Some(cur) && !self.dn_busy.load(Ordering::Relaxed) {
+                // 間引き: 前回の終了から max(1 秒, 直近の所要時間の 4 倍) あける（デノイズの CPU 占有を約 2 割以下に抑える）。
+                // 完了後の最後の 1 回だけは待たずに走らせる（最終結果が古いまま残らないように）
+                let interval = Duration::from_secs(1).max(self.dn_last_took * 4);
+                let due = *finished || self.dn_last_end.map_or(true, |t| t.elapsed() >= interval);
+                if due {
+                    self.dn_busy.store(true, Ordering::Relaxed);
+                    self.dn_counter += 1;
+                    let (probe, config, slot, busy) = (probe.clone(), config.clone(), self.dn_slot.clone(), self.dn_busy.clone());
+                    let (serial, id) = (self.serial, self.dn_counter);
+                    std::thread::spawn(move || {
+                        let t0 = Instant::now();
+                        // タイル数とバッファは同じロックの中で組で取る。CLI と同じ resolve_pixels → denoise_oidn
+                        let (tiles, px) = probe.with_buffers_at(|t, acc, w| (t, resolve_pixels(config.width, config.height, acc, w)));
+                        let px = denoise::denoise_oidn(&px, config.width, config.height);
+                        *slot.lock().unwrap() = Some(Dn { tiles, pixels: Arc::new(px), serial, id, took: t0.elapsed() });
+                        busy.store(false, Ordering::Relaxed);
+                    });
+                }
+            }
+        }
+
+        let finished_now = matches!(snap, Snap::Live { finished: true, .. });
         // 検証フック: スクリーンショット（要求 → 次のフレームで Event::Screenshot が届く）
         if let Some(path) = self.shot_path.clone() {
             let got = ctx.input(|i| {
@@ -432,7 +513,9 @@ impl eframe::App for App {
                 self.shot_path = None;
             }
         } else if let (Snap::Live { probe, .. }, Some((n, _))) = (&snap, self.shots.first()) {
-            if probe.tiles().0 >= *n {
+            let cur = probe.tiles().0;
+            let dn_ready = !(self.show_dn && finished_now) || self.dn_on_screen(cur);
+            if cur >= *n && dn_ready {
                 let (_, path) = self.shots.remove(0);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.shot_path = Some(path);
@@ -499,27 +582,43 @@ impl eframe::App for App {
                     self.cancel_at_tiles = None;
                 }
             }
-            if *finished {
+            // デノイズ表示中は、表示が最終タイル数に追いついてから保存する（検証フック用）
+            let dn_ready = !self.show_dn || self.dn_on_screen(probe.tiles().0);
+            if *finished && dn_ready && self.shown_src.is_some() {
                 if let Some(path) = self.autosave.take() {
                     self.save_path = path;
                     self.save(probe, config);
+                    if let Some(dump) = self.dump_shown.take() {
+                        let mut f = format!("P6\n{} {}\n255\n", config.width, config.height).into_bytes();
+                        f.extend_from_slice(&self.shown_rgb);
+                        let _ = std::fs::write(&dump, f);
+                    }
                 }
             }
         }
 
-        // 画像の更新: 進捗が進んだときだけ resolve → ppm_bytes（保存と同じ経路）でテクスチャを作り直す
+        // 画像の更新: 元（生の蓄積 / デノイズ済み）か (トーンマップ, 露出) が変わったときだけテクスチャを作り直す
         if let Snap::Live { probe, config, .. } = &snap {
-            let tiles = probe.tiles().0;
+            let dn_now = if self.show_dn { self.dn.as_ref() } else { None };
+            let src = match dn_now {
+                Some(d) => (1u8, d.id),
+                None => (0u8, probe.tiles().0 as u64),
+            };
             let view_key = (self.view.tonemap, self.view.exposure.to_bits());
             if config.width.max(config.height) > PREVIEW_MAX {
                 self.texture = None; // GL のテクスチャ上限を超える（進捗と保存は使える）
-            } else if self.shown_tiles != Some(tiles) || self.shown_view != Some(view_key) {
-                let pixels = resolved_pixels(probe, config, false);
+            } else if self.shown_src != Some(src) || self.shown_view != Some(view_key) {
+                // CLI と同じ順序: 蓄積 → resolve_pixels →（デノイズ）→ ppm_bytes（露出 + トーンマップ）
+                let pixels: Vec<Color> = match dn_now {
+                    Some(d) => d.pixels.as_ref().clone(),
+                    None => resolved_pixels(probe, config, false),
+                };
                 let settings = OutputSettings { exposure: self.view.exposure, tonemap: self.view.tonemap };
                 let rgb = ppm_bytes(config.width, config.height, &pixels, settings);
                 let img = egui::ColorImage::from_rgb([config.width, config.height], &rgb);
                 self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::NEAREST));
-                self.shown_tiles = Some(tiles);
+                self.shown_rgb = rgb;
+                self.shown_src = Some(src);
                 self.shown_view = Some(view_key);
             }
         }
@@ -614,7 +713,12 @@ impl eframe::App for App {
                 }
                 ui.label(&self.message);
             });
-            ui.weak("Preview is the raw accumulation — not denoised. Denoise (if enabled) is applied only when saving.");
+            let note = if self.show_dn {
+                "Preview: denoised (OIDN, throttled — see the age below). Saved file is denoised only if 'denoise on save' is on."
+            } else {
+                "Preview: raw accumulation. Denoise (if 'denoise on save' is on) is applied only when saving."
+            };
+            ui.weak(note);
         });
 
         egui::SidePanel::left("opts").resizable(false).default_width(230.0).show(ctx, |ui| {
@@ -638,9 +742,14 @@ impl eframe::App for App {
                 self.view.exposure = if prev.is_finite() { prev } else { 0.0 };
             }
             if cfg!(feature = "oidn") {
+                ui.checkbox(&mut self.show_dn, "show denoised preview");
+                ui.weak("(runs OIDN in the background, throttled)");
                 ui.checkbox(&mut self.view.denoise, "denoise on save");
-                ui.weak("(preview is never denoised)");
+                if self.show_dn != self.view.denoise {
+                    ui.colored_label(egui::Color32::from_rgb(230, 160, 70), "preview and saved file differ in denoising");
+                }
             } else {
+                ui.add_enabled(false, egui::Checkbox::new(&mut self.show_dn, "show denoised preview"));
                 ui.add_enabled(false, egui::Checkbox::new(&mut self.view.denoise, "denoise on save"));
                 ui.weak("built without the oidn feature");
             }
@@ -692,6 +801,33 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(tex) = &self.texture else { return };
             let [w, h] = tex.size();
+            // 常に 1 行出す（生 / デノイズで画像の位置がずれないように）。古さもここに出す
+            let cur = match &snap {
+                Snap::Live { probe, .. } => probe.tiles(),
+                _ => (0, 0),
+            };
+            let shown_dn = self.show_dn && self.dn.is_some();
+            if shown_dn {
+                let d = self.dn.as_ref().unwrap();
+                let lag = cur.0.saturating_sub(d.tiles);
+                let busy = self.dn_busy.load(Ordering::Relaxed);
+                let txt = format!(
+                    "DENOISED @ {}/{} tiles · render at {}/{}{} · denoise took {:.0} ms{}",
+                    d.tiles,
+                    cur.1,
+                    cur.0,
+                    cur.1,
+                    if lag == 0 { " · current".to_string() } else { format!(" · STALE by {lag} tiles") },
+                    d.took.as_secs_f64() * 1e3,
+                    if busy { " · denoising…" } else { "" }
+                );
+                let col = if lag == 0 { egui::Color32::from_rgb(120, 200, 120) } else { egui::Color32::from_rgb(230, 160, 70) };
+                ui.colored_label(col, txt);
+            } else if self.show_dn {
+                ui.colored_label(egui::Color32::from_rgb(230, 160, 70), format!("RAW @ {}/{} tiles · denoising… (first result pending)", cur.0, cur.1));
+            } else {
+                ui.label(format!("RAW @ {}/{} tiles", cur.0, cur.1));
+            }
             if self.one_to_one {
                 egui::ScrollArea::both().show(ui, |ui| {
                     ui.image((tex.id(), egui::vec2(w as f32, h as f32)));
