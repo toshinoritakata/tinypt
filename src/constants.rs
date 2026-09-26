@@ -123,6 +123,8 @@ pub mod bvh {
     /// 逐次構築に切り替える）。値の根拠は PERF-2 のレポート参照（Sponza 相当の数万三角形の
     /// シーンで並列化のオーバーヘッドが計測できなくなる値を実測で選んだ）。
     pub const PARALLEL_MIN_TRIS: usize = 50_000;
+    /// 走査用の広い BVH の分岐数（2 分木を畳んで作る。4 または 8。切り替えはこの 1 か所だけ）。
+    pub const WIDE_WIDTH: usize = 4;
 }
 
 /// UI / 進捗表示の定数。

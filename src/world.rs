@@ -341,8 +341,8 @@ fn moving_sphere_bounds(s: &Sphere, end: Vec3, shutter: (f64, f64)) -> Aabb {
 /// メッシュを `xform` で配置したインスタンスの、ワールド空間の保守的な境界ボックス。
 fn instance_world_bounds(mesh: &Mesh, xform: &Transform) -> Aabb {
     let mut b = Aabb::empty();
-    let Some(root) = mesh.bvh.nodes.first() else { return b };
-    let (lo, hi) = (root.bbox.min, root.bbox.max);
+    let Some(root) = mesh.bvh.root_bounds() else { return b };
+    let (lo, hi) = (root.min, root.max);
     let zero = Vec3::new(0.0, 0.0, 0.0);
     for k in 0..8 {
         let corner = Vec3::new(
@@ -456,8 +456,8 @@ impl World {
         }
         for inst in &self.instances {
             let Some(mesh) = self.meshes.get(inst.mesh_id) else { continue };
-            let Some(root) = mesh.bvh.nodes.first() else { continue };
-            let (lo, hi) = (root.bbox.min, root.bbox.max);
+            let Some(root) = mesh.bvh.root_bounds() else { continue };
+            let (lo, hi) = (root.min, root.max);
             for k in 0..8 {
                 let corner = Vec3::new(
                     if k & 1 == 0 { lo.x } else { hi.x },
@@ -579,7 +579,7 @@ impl World {
         let inst = &self.instances[inst_id];
         let Some(anim) = inst.anim else { return };
         // メッシュ（頂点モーションを含む）の物体空間の境界球: ルート AABB の中心と半対角線
-        let bbox = self.meshes[inst.mesh_id].bvh.nodes.first().map(|n| n.bbox);
+        let bbox = self.meshes[inst.mesh_id].bvh.root_bounds();
         let bounds = match bbox {
             Some(b) => {
                 let c = (b.min + b.max) * 0.5;
@@ -661,63 +661,10 @@ impl World {
     /// TLAS を深さ優先で辿り、葉のプリミティブ番号ごとに `visit(k)` を呼ぶ（`k` は [`Tlas`] の通し番号）。
     /// ノードの箱は「インスタンスの境界」と同じ判定（区間 `(min(tmin, 0), tmax·(1+1e-9))`）で棄却する。
     /// `tmax` は呼び出し側が `visit` の中で縮められる（最近接探索）。`visit` が true を返したら打ち切る（any-hit）。
-    fn tlas_traverse(tlas: &Tlas, r: Ray, tmin: f64, tmax: &Cell<f64>, mut visit: impl FnMut(usize) -> bool) {
-        let nodes = &tlas.bvh.nodes;
-        if nodes.is_empty() {
-            return;
-        }
-        let inv = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
-        let tmin_box = tmin.min(0.0);
-        let mut stack = [0i32; 64];
-        let mut heap: Vec<i32> = Vec::new();
-        let mut sp = 1usize;
-        loop {
-            let nid = if let Some(v) = heap.pop() {
-                v
-            } else if sp > 0 {
-                sp -= 1;
-                stack[sp]
-            } else {
-                break;
-            };
-            let n = &nodes[nid as usize];
-            let tmax_box = tmax.get() * (1.0 + 1e-9);
-            if !n.bbox.hit_inv(r, inv, tmin_box, tmax_box) {
-                continue;
-            }
-            if n.left == -1 && n.right == -1 {
-                let start = n.start as usize;
-                for &k in &tlas.bvh.indices[start..start + n.count as usize] {
-                    if visit(k) {
-                        return;
-                    }
-                }
-                continue;
-            }
-            // 近い子を後に積む（LIFO で先に処理される）
-            let (a_id, b_id) = (n.left, n.right);
-            let a = nodes[a_id as usize].bbox.hit_range_inv(r, inv, tmin_box, tmax_box);
-            let b = nodes[b_id as usize].bbox.hit_range_inv(r, inv, tmin_box, tmax_box);
-            let order: [Option<i32>; 2] = match (a, b) {
-                (Some((a0, _)), Some((b0, _))) => if a0 <= b0 { [Some(b_id), Some(a_id)] } else { [Some(a_id), Some(b_id)] },
-                (Some(_), None) => [Some(a_id), None],
-                (None, Some(_)) => [Some(b_id), None],
-                (None, None) => [None, None],
-            };
-            for id in order.into_iter().flatten() {
-                // ヒープを使い始めたら、以後はヒープだけに積む（スタック配列は 64 段で足りなければ移す）
-                if heap.is_empty() && sp < stack.len() {
-                    stack[sp] = id;
-                    sp += 1;
-                } else {
-                    if heap.is_empty() {
-                        heap.extend_from_slice(&stack[..sp]);
-                        sp = 0;
-                    }
-                    heap.push(id);
-                }
-            }
-        }
+    fn tlas_traverse(tlas: &Tlas, r: Ray, tmin: f64, tmax: &Cell<f64>, visit: impl FnMut(usize) -> bool) {
+        // 広い BVH（[`crate::constants::bvh::WIDE_WIDTH`] 分木）で走査する。箱の判定区間は従来と同じ
+        // （`tmin.min(0.0)` から `tmax·(1 + 1e-9)`）。訪問順は 2 分木と違うが、同値 t は呼び出し側が添字で解決する
+        tlas.bvh.traverse_wide(r, tmin.min(0.0), tmax, visit);
     }
 
     /// ワールド内の全ジオメトリに対するレイ交差判定。

@@ -175,7 +175,7 @@ pub struct Aabb {
 
 /// スラブ法の遠い側の t に掛ける係数 1 + 2γ(3)（PBRT と同じ）。丸めで区間が縮んでレイが箱をすり抜けないようにする。
 /// 区間が空かどうかは `tmax < tmin`（等号を含まない）で判定し、厚さ 0 の平面の箱も通す。
-const SLAB_FAR_SCALE: f64 = 1.0 + 2.0 * f64::EPSILON * 0.5 * 3.0 / (1.0 - f64::EPSILON * 0.5 * 3.0);
+pub(crate) const SLAB_FAR_SCALE: f64 = 1.0 + 2.0 * f64::EPSILON * 0.5 * 3.0 / (1.0 - f64::EPSILON * 0.5 * 3.0);
 
 impl Aabb {
     /// 空の AABB を返す（min=+∞, max=-∞ で初期化）。

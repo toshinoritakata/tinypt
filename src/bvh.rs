@@ -10,7 +10,13 @@
 //! - リーフノードは最大 `LEAF_SIZE` 個の三角形を保持
 //! - トラバーサルはスタックベース（固定長 64 + ヒープフォールバック）
 
-use crate::constants::bvh::{LEAF_SIZE, PARALLEL_MIN_TRIS, SAH_BINS};
+use crate::constants::bvh::{LEAF_SIZE, PARALLEL_MIN_TRIS, SAH_BINS, WIDE_WIDTH};
+use crate::geometry::SLAB_FAR_SCALE;
+
+/// 最近接候補が見つかった後の区間の上端の広げ幅（相対）。同値 `t` の候補が、`t_scaled` と `tmax·det` の丸めで
+/// 採用判定に落ちないようにする（勝敗は `(t, 番号)` の比較だけで決まる）。丸め（数 ulp）より十分に大きく、
+/// 別の三角形の `t` とは区別できる大きさ。
+const TIE_SLACK: f64 = 1.0 + 1e-12;
 use crate::geometry::{Aabb, Hit, TriangleSource};
 use crate::math::Vec3;
 use crate::ray::Ray;
@@ -34,12 +40,66 @@ pub struct BvhNode {
     pub count: u32,
 }
 
+/// 走査スタックの要素: 親ノード `w` の子スロット `slot` と、積んだときの入口距離 `t0`。
+#[derive(Clone, Copy)]
+struct Entry {
+    t0: f64,
+    w: u32,
+    slot: u32,
+}
+
+impl WideNode {
+    /// 子スロット `i` の箱に対するスラブ判定。当たれば入口距離 `t0`。式は [`Aabb::hit_range_inv`] と同じ
+    /// （丸めまで同じにして、従来の 2 分木の走査と同じ棄却をする）。
+    #[inline(always)]
+    fn slot_entry(&self, i: usize, r: &Ray, inv: Vec3, mut tmin: f64, mut tmax: f64) -> Option<f64> {
+        let t0x = (self.min_x[i] - r.o.x) * inv.x;
+        let t1x = (self.max_x[i] - r.o.x) * inv.x;
+        tmin = tmin.max(t0x.min(t1x));
+        tmax = tmax.min(t0x.max(t1x) * SLAB_FAR_SCALE);
+        if tmax < tmin { return None; }
+        let t0y = (self.min_y[i] - r.o.y) * inv.y;
+        let t1y = (self.max_y[i] - r.o.y) * inv.y;
+        tmin = tmin.max(t0y.min(t1y));
+        tmax = tmax.min(t0y.max(t1y) * SLAB_FAR_SCALE);
+        if tmax < tmin { return None; }
+        let t0z = (self.min_z[i] - r.o.z) * inv.z;
+        let t1z = (self.max_z[i] - r.o.z) * inv.z;
+        tmin = tmin.max(t0z.min(t1z));
+        tmax = tmax.min(t0z.max(t1z) * SLAB_FAR_SCALE);
+        if tmax < tmin { return None; }
+        Some(tmin)
+    }
+}
+
 /// 三角形群に対する BVH（Bounding Volume Hierarchy）。
 pub struct Bvh {
-    /// 線形配列に格納された BVH ノード群
-    pub nodes: Vec<BvhNode>,
     /// リーフが参照する三角形インデックスの並び順
     pub indices: Vec<usize>,
+    /// 走査用の広い BVH（SAH で作った 2 分木を畳んだもの。2 分木そのものは畳んだ後に捨てる）
+    wide: Vec<WideNode>,
+    /// 全体の AABB（2 分木のルートの箱。`World` がインスタンスの境界を作るのに使う）
+    bounds: Option<Aabb>,
+}
+
+/// 広い BVH のノード（[`WIDE_WIDTH`] 個の子スロット）。**AABB は成分ごとにまとめた SoA**: 子の箱の判定は
+/// 「子 i の min.x, max.x, min.y, …」を i について並べて読むので、1 ノードぶんの箱が連続領域に収まり
+/// （W=4 で 6×32 B。ノード全体は 224 B）、SIMD に載せるときもそのままレーンに並ぶ。AoS（子ごとに 6 個の f64）
+/// だと同じ成分が飛び飛びになる。
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(32))]
+struct WideNode {
+    /// 使っているスロット数（`1..=WIDE_WIDTH`）。残りのスロットは見ない（空の箱を無限大で表すと 0 × ∞ が NaN になるので、個数で管理する）
+    n: u8,
+    min_x: [f64; WIDE_WIDTH],
+    min_y: [f64; WIDE_WIDTH],
+    min_z: [f64; WIDE_WIDTH],
+    max_x: [f64; WIDE_WIDTH],
+    max_y: [f64; WIDE_WIDTH],
+    max_z: [f64; WIDE_WIDTH],
+    /// `count[i] > 0`: リーフで、`child[i]` は `indices` 内の開始位置。`count[i] == 0`: 内部で、`child[i]` は子ノードの添字
+    child: [u32; WIDE_WIDTH],
+    count: [u8; WIDE_WIDTH],
 }
 
 /// 三角形範囲の AABB（`bbox`）と重心の AABB（`cbox`）。分割軸の選択・SAH のビン化の両方で使う。
@@ -301,6 +361,76 @@ fn parallel_depth_budget(threads: usize, n_tris: usize) -> usize {
     d
 }
 
+/// 2 分木 `nodes` を [`WIDE_WIDTH`] 分木に畳む。**分割ロジックには触れず**、できあがった 2 分木を上から畳むだけ:
+/// ノードの子を並べ、子の数が `WIDE_WIDTH` になるまで「コスト（表面積 × 三角形数）が最大の内部の子」を
+/// その 2 つの子で置き換える（貪欲。子が `WIDE_WIDTH` に満たないノードは、残りが全部リーフのとき）。
+/// 展開は元の左右の順を保つ。
+fn build_wide(nodes: &[BvhNode]) -> Vec<WideNode> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    // 各 2 分木ノードの三角形数（コストの見積もり）
+    let mut cnt = vec![0u32; nodes.len()];
+    fn fill(nodes: &[BvhNode], cnt: &mut [u32], i: usize) -> u32 {
+        let n = &nodes[i];
+        let c = if n.left == -1 { n.count } else { fill(nodes, cnt, n.left as usize) + fill(nodes, cnt, n.right as usize) };
+        cnt[i] = c;
+        c
+    }
+    fill(nodes, &mut cnt, 0);
+    let area = |i: usize| {
+        let e = nodes[i].bbox.extent();
+        2.0 * (e.x * e.y + e.y * e.z + e.z * e.x)
+    };
+
+    fn emit(nodes: &[BvhNode], cnt: &[u32], area: &dyn Fn(usize) -> f64, out: &mut Vec<WideNode>, root: usize) -> usize {
+        // 子の並び（2 分木のノード番号）。根がリーフなら 1 つだけ
+        let mut slots: Vec<usize> = if nodes[root].left == -1 { vec![root] } else { vec![nodes[root].left as usize, nodes[root].right as usize] };
+        while slots.len() < WIDE_WIDTH {
+            let mut best: Option<(usize, f64)> = None;
+            for (k, &s) in slots.iter().enumerate() {
+                if nodes[s].left != -1 {
+                    let cost = area(s) * cnt[s] as f64;
+                    if best.map_or(true, |(_, c)| cost > c) {
+                        best = Some((k, cost));
+                    }
+                }
+            }
+            let Some((k, _)) = best else { break };
+            let (l, r) = (nodes[slots[k]].left as usize, nodes[slots[k]].right as usize);
+            slots[k] = l;
+            slots.insert(k + 1, r);
+        }
+        let w = out.len();
+        let inf = f64::INFINITY;
+        out.push(WideNode {
+            n: slots.len() as u8,
+            min_x: [inf; WIDE_WIDTH], min_y: [inf; WIDE_WIDTH], min_z: [inf; WIDE_WIDTH],
+            max_x: [-inf; WIDE_WIDTH], max_y: [-inf; WIDE_WIDTH], max_z: [-inf; WIDE_WIDTH],
+            child: [0; WIDE_WIDTH], count: [0; WIDE_WIDTH],
+        });
+        for (k, &s) in slots.iter().enumerate() {
+            let b = nodes[s].bbox;
+            let node = &mut out[w];
+            node.min_x[k] = b.min.x; node.min_y[k] = b.min.y; node.min_z[k] = b.min.z;
+            node.max_x[k] = b.max.x; node.max_y[k] = b.max.y; node.max_z[k] = b.max.z;
+            if nodes[s].left == -1 {
+                node.child[k] = nodes[s].start;
+                debug_assert!(nodes[s].count as usize <= LEAF_SIZE && LEAF_SIZE < 256);
+                node.count[k] = nodes[s].count as u8;
+            } else {
+                let c = emit(nodes, cnt, area, out, s);
+                out[w].child[k] = c as u32;
+            }
+        }
+        w
+    }
+
+    let mut out = Vec::new();
+    emit(nodes, &cnt, &area, &mut out, 0);
+    out
+}
+
 impl Bvh {
     /// SAH を用いて三角形群から BVH を構築する。ワーカースレッド数は
     /// `std::thread::available_parallelism`（`render.rs` と同じ）に合わせる。
@@ -331,16 +461,28 @@ impl Bvh {
     /// プリミティブの種類には依存しない: 三角形用（[`Bvh::build`]）と、`World` のトップレベル BVH
     /// （インスタンスと球の境界）が同じ実装を共有する。リーフの `indices` は `bounds` の添字。
     pub(crate) fn build_from_bounds(bounds: &[Aabb], threads: usize) -> Self {
+        let (nodes, indices) = Self::build_binary(bounds, threads);
+        let wide = build_wide(&nodes);
+        Self { wide, indices, bounds: nodes.first().map(|n| n.bbox) }
+    }
+
+    /// SAH の 2 分木（ノード配列と、リーフが参照するプリミティブ番号の並び）。走査用の広い BVH は
+    /// これを畳んで作る（[`Bvh::build_from_bounds`]）。並列構築 = 逐次構築のビット一致をテストするために分けてある。
+    pub(crate) fn build_binary(bounds: &[Aabb], threads: usize) -> (Vec<BvhNode>, Vec<usize>) {
         let mut indices: Vec<usize> = (0..bounds.len()).collect();
         let centroids: Vec<Vec3> = bounds.iter().map(|b| b.centroid()).collect();
-
         let nodes = if indices.is_empty() {
             Vec::new()
         } else {
             let depth_budget = parallel_depth_budget(threads, indices.len());
             build_range(&mut indices, 0, bounds, &centroids, depth_budget)
         };
-        Self { nodes, indices }
+        (nodes, indices)
+    }
+
+    /// 全体の AABB（プリミティブが 0 個なら `None`）。
+    pub fn root_bounds(&self) -> Option<Aabb> {
+        self.bounds
     }
 
     /// BVH をトラバースしてレイとの最近接交差を返す。
@@ -351,12 +493,12 @@ impl Bvh {
         self.hit_filtered(src, r, tmin, tmax, |_, _, _| true)
     }
 
-    /// [`Bvh::hit`] に候補の採否判定を足したもの。`accept(三角形番号, u, v)` が false の交差は
-    /// **無かったことにして**探索を続ける（アルファマスクの透明部分）。
+    /// 広い BVH（[`WIDE_WIDTH`] 分木）での最近接探索。子のスラブ判定は 1 ノードぶんをまとめて行い、
+    /// 当たった子を入口 `t0` の昇順に辿る。棄却した候補（アルファ透明）では `tmax` を縮めない。
     ///
-    /// 棄却した候補では `tmax` を縮めず、区間 `(tmin, tmax)` もそのまま。だから棄却した面の
-    /// 先も同じ区間で探し続けるだけで、再開位置の取り方による自己交差は起きない（水密交差と
-    /// 誤差上界はそのまま）。`hit` は常に true を返す判定で呼ぶ（単相化されて従来と同じコード）。
+    /// **同値 `t` のタイブレーク: プリミティブ番号（`indices` に格納された値 = 三角形の添字）が小さい方が勝つ。**
+    /// 走査順に依存しない決定的な規則で、広い BVH に変えても（走査順が変わっても）結果が変わらない。
+    /// `World` の TLAS（葉の通し番号が小さい方が勝つ）と同じ規則。
     #[inline(always)]
     pub fn hit_filtered<F: Fn(usize, f64, f64) -> bool>(
         &self,
@@ -366,108 +508,94 @@ impl Bvh {
         mut tmax: f64,
         accept: F,
     ) -> Option<Hit> {
-        if self.nodes.is_empty() {
+        if self.wide.is_empty() {
             return None;
         }
-
         let inv = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
-
-        let mut stack_buf = [0i32; 64];
+        // 未初期化のスタック（積んだ分 `[..sp]` だけを読む。0 埋めは走査 1 回ごとに 2KB の書き込みになるので避ける）
+        let mut stack_buf: [std::mem::MaybeUninit<Entry>; 96] = [const { std::mem::MaybeUninit::uninit() }; 96];
         let mut sp = 0usize;
-        stack_buf[sp] = 0;
-        sp += 1;
-        let mut heap_stack: Vec<i32> = Vec::new();
+        let mut heap: Vec<Entry> = Vec::new();
         // 最近接候補は (三角形, t, u, v) だけを保持し、交差点と誤差上界は最後に 1 回だけ計算する
         let mut best: Option<(usize, f64, f64, f64)> = None;
-
-        macro_rules! push_id {
-            ($id:expr) => {{
-                let id = $id;
-                if heap_stack.is_empty() {
-                    if sp < stack_buf.len() {
-                        stack_buf[sp] = id;
-                        sp += 1;
-                    } else {
-                        heap_stack = stack_buf[..sp].to_vec();
-                        heap_stack.push(id);
-                    }
+        macro_rules! push {
+            ($e:expr) => {{
+                let e = $e;
+                if heap.is_empty() && sp < stack_buf.len() {
+                    stack_buf[sp] = std::mem::MaybeUninit::new(e);
+                    sp += 1;
                 } else {
-                    heap_stack.push(id);
+                    if heap.is_empty() {
+                        // SAFETY: `[..sp]` は積んで初期化した要素だけ
+                        heap.extend(stack_buf[..sp].iter().map(|x| unsafe { x.assume_init() }));
+                        sp = 0;
+                    }
+                    heap.push(e);
+                }
+            }};
+        }
+        macro_rules! push_children {
+            ($w:expr, $tmax:expr) => {{
+                let w = $w;
+                let nd = &self.wide[w as usize];
+                let mut hits = [(0.0f64, 0u32); WIDE_WIDTH];
+                let mut k = 0usize;
+                for i in 0..nd.n as usize {
+                    if let Some(t0) = nd.slot_entry(i, &r, inv, tmin, $tmax) {
+                        hits[k] = (t0, i as u32);
+                        k += 1;
+                    }
+                }
+                // 入口 t0 の降順に並べて積む（後入れ先出しなので、最も近い子が先に出る）
+                for a in 1..k {
+                    let mut b = a;
+                    while b > 0 && hits[b - 1].0 < hits[b].0 {
+                        hits.swap(b - 1, b);
+                        b -= 1;
+                    }
+                }
+                for j in 0..k {
+                    push!(Entry { t0: hits[j].0, w, slot: hits[j].1 });
                 }
             }};
         }
 
+        push_children!(0u32, tmax);
         loop {
-            let nid = if heap_stack.is_empty() {
-                if sp == 0 {
-                    break;
-                }
+            let e = if !heap.is_empty() {
+                heap.pop().unwrap()
+            } else if sp > 0 {
                 sp -= 1;
-                stack_buf[sp]
+                // SAFETY: `stack_buf[sp]` は積んで初期化済み
+                unsafe { stack_buf[sp].assume_init() }
             } else {
-                match heap_stack.pop() {
-                    Some(v) => v,
-                    None => break,
-                }
+                break;
             };
-            let n = &self.nodes[nid as usize];
-            if !n.bbox.hit_inv(r, inv, tmin, tmax) {
+            // 積んだ後に最近接が縮んで、もう届かない子は捨てる（従来の「取り出したときの箱判定」と同じ）
+            if e.t0 > tmax {
                 continue;
             }
-
-            if n.left == -1 && n.right == -1 {
-                let start = n.start as usize;
-                let end = start + n.count as usize;
-                for &ti in &self.indices[start..end] {
+            let nd = &self.wide[e.w as usize];
+            let i = e.slot as usize;
+            if nd.count[i] > 0 {
+                let start = nd.child[i] as usize;
+                for pos in start..start + nd.count[i] as usize {
+                    let ti = self.indices[pos];
                     if let Some((t, u, v)) = src.intersect(ti, r, tmin, tmax) {
                         if !accept(ti, u, v) {
                             continue;
                         }
-                        tmax = t;
-                        best = Some((ti, t, u, v));
+                        // 同値 t は番号の小さい方が勝つ（走査順に依存しない規則）。t が小さければ無条件に勝つ
+                        if best.map_or(true, |(bi, bt, _, _)| t < bt || (t == bt && ti < bi)) {
+                            // 区間の上端は、同値 t の候補（丸めで t_scaled が tmax·det をわずかに超える）が
+                            // 採用判定で落ちないよう少し広げる。勝敗は上の (t, 番号) の比較だけで決まる
+                            tmax = t * TIE_SLACK;
+                            best = Some((ti, t, u, v));
+                        }
                     }
                 }
             } else {
-                // Push farther child first so nearer is processed first (LIFO stack).
-                let a_id = n.left;
-                let b_id = n.right;
-
-                // If either is missing, fall back.
-                if a_id == -1 {
-                    if b_id != -1 { push_id!(b_id); }
-                    continue;
-                }
-                if b_id == -1 {
-                    push_id!(a_id);
-                    continue;
-                }
-
-                let a = &self.nodes[a_id as usize];
-                let b = &self.nodes[b_id as usize];
-
-                let a_hit = a.bbox.hit_range_inv(r, inv, tmin, tmax);
-                let b_hit = b.bbox.hit_range_inv(r, inv, tmin, tmax);
-
-                match (a_hit, b_hit) {
-                    (Some((a_t0, _)), Some((b_t0, _))) => {
-                        // Smaller entry t0 is nearer.
-                        if a_t0 <= b_t0 {
-                            // push far then near
-                            push_id!(b_id);
-                            push_id!(a_id);
-                        } else {
-                            push_id!(a_id);
-                            push_id!(b_id);
-                        }
-                    }
-                    (Some(_), None) => {
-                        push_id!(a_id);
-                    }
-                    (None, Some(_)) => {
-                        push_id!(b_id);
-                    }
-                    (None, None) => {}
-                }
+                push_children!(nd.child[i], tmax);
             }
         }
 
@@ -478,13 +606,90 @@ impl Bvh {
         })
     }
 
-    /// `hit_filtered` の any-hit 版（シャドウレイ専用）: 採用できる交差が 1 つ見つかった時点で
-    /// 探索を打ち切り、その交差を返す（**最近接である保証はない**。遮蔽の有無だけが要る呼び出し側でのみ使うこと）。
-    ///
-    /// 区間 `(tmin, tmax)` は最後まで縮めない（採用しない候補があっても同じ区間で探し続けるのは
-    /// `hit_filtered` と同じで、アルファ透明の扱いと自己交差回避はそのまま）。子ノードは近い方から
-    /// 押す（`hit_filtered` と同じ順）が、any-hit では正しさに影響しない（見つかり次第即座に返すため）。
-    /// 平均的には近い方から見つかりやすく、無駄なノード訪問を減らせる。
+    /// 葉のプリミティブ番号ごとに `visit(k)` を呼ぶ汎用の走査（TLAS 用。広い BVH）。箱の判定は
+    /// 区間 `(tmin, tmax·(1 + 1e-9))`（`tmax` は `visit` の中で縮められる）で、当たった子を入口 `t0` の昇順に辿る。
+    /// `visit` が true を返したら打ち切る（any-hit）。訪問順は 2 分木の走査と違うが、呼び出し側（`World`）が
+    /// 同値 `t` を添字で解決するので結果は同じ。
+    pub(crate) fn traverse_wide(&self, r: Ray, tmin: f64, tmax: &std::cell::Cell<f64>, mut visit: impl FnMut(usize) -> bool) {
+        if self.wide.is_empty() {
+            return;
+        }
+        let inv = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
+        let mut stack_buf: [std::mem::MaybeUninit<Entry>; 96] = [const { std::mem::MaybeUninit::uninit() }; 96];
+        let mut sp = 0usize;
+        let mut heap: Vec<Entry> = Vec::new();
+        macro_rules! push {
+            ($e:expr) => {{
+                let e = $e;
+                if heap.is_empty() && sp < stack_buf.len() {
+                    stack_buf[sp] = std::mem::MaybeUninit::new(e);
+                    sp += 1;
+                } else {
+                    if heap.is_empty() {
+                        // SAFETY: `[..sp]` は積んで初期化した要素だけ
+                        heap.extend(stack_buf[..sp].iter().map(|x| unsafe { x.assume_init() }));
+                        sp = 0;
+                    }
+                    heap.push(e);
+                }
+            }};
+        }
+        macro_rules! push_children {
+            ($w:expr) => {{
+                let w = $w;
+                let nd = &self.wide[w as usize];
+                let tmax_box = tmax.get() * (1.0 + 1e-9);
+                let mut hits = [(0.0f64, 0u32); WIDE_WIDTH];
+                let mut k = 0usize;
+                for i in 0..nd.n as usize {
+                    if let Some(t0) = nd.slot_entry(i, &r, inv, tmin, tmax_box) {
+                        hits[k] = (t0, i as u32);
+                        k += 1;
+                    }
+                }
+                for a in 1..k {
+                    let mut b = a;
+                    while b > 0 && hits[b - 1].0 < hits[b].0 {
+                        hits.swap(b - 1, b);
+                        b -= 1;
+                    }
+                }
+                for j in 0..k {
+                    push!(Entry { t0: hits[j].0, w, slot: hits[j].1 });
+                }
+            }};
+        }
+        push_children!(0u32);
+        loop {
+            let e = if !heap.is_empty() {
+                heap.pop().unwrap()
+            } else if sp > 0 {
+                sp -= 1;
+                // SAFETY: `stack_buf[sp]` は積んで初期化済み
+                unsafe { stack_buf[sp].assume_init() }
+            } else {
+                return;
+            };
+            if e.t0 > tmax.get() * (1.0 + 1e-9) {
+                continue;
+            }
+            let nd = &self.wide[e.w as usize];
+            let i = e.slot as usize;
+            if nd.count[i] > 0 {
+                let start = nd.child[i] as usize;
+                for pos in start..start + nd.count[i] as usize {
+                    if visit(self.indices[pos]) {
+                        return;
+                    }
+                }
+            } else {
+                push_children!(nd.child[i]);
+            }
+        }
+    }
+
+    /// [`Bvh::hit_filtered`] の any-hit 版（広い BVH）。採用できる交差が 1 つ見つかった時点で返す
+    /// （最近接の保証はない。遮蔽の有無だけが要る呼び出し側でのみ使う）。
     #[inline(always)]
     pub fn any_hit_filtered<F: Fn(usize, f64, f64) -> bool>(
         &self,
@@ -494,57 +699,73 @@ impl Bvh {
         tmax: f64,
         accept: F,
     ) -> Option<Hit> {
-        if self.nodes.is_empty() {
+        if self.wide.is_empty() {
             return None;
         }
-
         let inv = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
-
-        let mut stack_buf = [0i32; 64];
+        // 未初期化のスタック（積んだ分 `[..sp]` だけを読む。0 埋めは走査 1 回ごとに 2KB の書き込みになるので避ける）
+        let mut stack_buf: [std::mem::MaybeUninit<Entry>; 96] = [const { std::mem::MaybeUninit::uninit() }; 96];
         let mut sp = 0usize;
-        stack_buf[sp] = 0;
-        sp += 1;
-        let mut heap_stack: Vec<i32> = Vec::new();
+        let mut heap: Vec<Entry> = Vec::new();
 
-        macro_rules! push_id {
-            ($id:expr) => {{
-                let id = $id;
-                if heap_stack.is_empty() {
-                    if sp < stack_buf.len() {
-                        stack_buf[sp] = id;
-                        sp += 1;
-                    } else {
-                        heap_stack = stack_buf[..sp].to_vec();
-                        heap_stack.push(id);
-                    }
+        macro_rules! push {
+            ($e:expr) => {{
+                let e = $e;
+                if heap.is_empty() && sp < stack_buf.len() {
+                    stack_buf[sp] = std::mem::MaybeUninit::new(e);
+                    sp += 1;
                 } else {
-                    heap_stack.push(id);
+                    if heap.is_empty() {
+                        // SAFETY: `[..sp]` は積んで初期化した要素だけ
+                        heap.extend(stack_buf[..sp].iter().map(|x| unsafe { x.assume_init() }));
+                        sp = 0;
+                    }
+                    heap.push(e);
+                }
+            }};
+        }
+        macro_rules! push_children {
+            ($w:expr) => {{
+                let w = $w;
+                let nd = &self.wide[w as usize];
+                let mut hits = [(0.0f64, 0u32); WIDE_WIDTH];
+                let mut k = 0usize;
+                for i in 0..nd.n as usize {
+                    if let Some(t0) = nd.slot_entry(i, &r, inv, tmin, tmax) {
+                        hits[k] = (t0, i as u32);
+                        k += 1;
+                    }
+                }
+                for a in 1..k {
+                    let mut b = a;
+                    while b > 0 && hits[b - 1].0 < hits[b].0 {
+                        hits.swap(b - 1, b);
+                        b -= 1;
+                    }
+                }
+                for j in 0..k {
+                    push!(Entry { t0: hits[j].0, w, slot: hits[j].1 });
                 }
             }};
         }
 
+        push_children!(0u32);
         loop {
-            let nid = if heap_stack.is_empty() {
-                if sp == 0 {
-                    return None;
-                }
+            let e = if !heap.is_empty() {
+                heap.pop().unwrap()
+            } else if sp > 0 {
                 sp -= 1;
-                stack_buf[sp]
+                // SAFETY: `stack_buf[sp]` は積んで初期化済み
+                unsafe { stack_buf[sp].assume_init() }
             } else {
-                match heap_stack.pop() {
-                    Some(v) => v,
-                    None => return None,
-                }
+                return None;
             };
-            let n = &self.nodes[nid as usize];
-            if !n.bbox.hit_inv(r, inv, tmin, tmax) {
-                continue;
-            }
-
-            if n.left == -1 && n.right == -1 {
-                let start = n.start as usize;
-                let end = start + n.count as usize;
-                for &ti in &self.indices[start..end] {
+            let nd = &self.wide[e.w as usize];
+            let i = e.slot as usize;
+            if nd.count[i] > 0 {
+                let start = nd.child[i] as usize;
+                for pos in start..start + nd.count[i] as usize {
+                    let ti = self.indices[pos];
                     if let Some((t, u, v)) = src.intersect(ti, r, tmin, tmax) {
                         if !accept(ti, u, v) {
                             continue;
@@ -555,42 +776,7 @@ impl Bvh {
                     }
                 }
             } else {
-                let a_id = n.left;
-                let b_id = n.right;
-
-                if a_id == -1 {
-                    if b_id != -1 { push_id!(b_id); }
-                    continue;
-                }
-                if b_id == -1 {
-                    push_id!(a_id);
-                    continue;
-                }
-
-                let a = &self.nodes[a_id as usize];
-                let b = &self.nodes[b_id as usize];
-
-                let a_hit = a.bbox.hit_range_inv(r, inv, tmin, tmax);
-                let b_hit = b.bbox.hit_range_inv(r, inv, tmin, tmax);
-
-                match (a_hit, b_hit) {
-                    (Some((a_t0, _)), Some((b_t0, _))) => {
-                        if a_t0 <= b_t0 {
-                            push_id!(b_id);
-                            push_id!(a_id);
-                        } else {
-                            push_id!(a_id);
-                            push_id!(b_id);
-                        }
-                    }
-                    (Some(_), None) => {
-                        push_id!(a_id);
-                    }
-                    (None, Some(_)) => {
-                        push_id!(b_id);
-                    }
-                    (None, None) => {}
-                }
+                push_children!(nd.child[i]);
             }
         }
     }
@@ -612,11 +798,23 @@ mod tests {
             .collect()
     }
 
+    /// SAH の 2 分木（構築の直後。走査用の広い BVH は畳んだ後に 2 分木を捨てるので、構造のテストはこちらを見る）。
+    struct Bin {
+        nodes: Vec<BvhNode>,
+        indices: Vec<usize>,
+    }
+
+    fn binary(tris: &[Triangle], threads: usize) -> Bin {
+        let bounds: Vec<Aabb> = tris.iter().map(|t| t.bounds()).collect();
+        let (nodes, indices) = Bvh::build_binary(&bounds, threads);
+        Bin { nodes, indices }
+    }
+
     // ---- PERF-2: BVH 構築の並列化（逐次版とのビット一致） ----
 
 
     /// ノード配列・インデックス配列が完全に一致するか（`bbox` はビット単位）。
-    fn bvh_bit_identical(a: &Bvh, b: &Bvh) -> bool {
+    fn bvh_bit_identical(a: &Bin, b: &Bin) -> bool {
         if a.indices != b.indices || a.nodes.len() != b.nodes.len() {
             return false;
         }
@@ -641,10 +839,10 @@ mod tests {
     fn parallel_build_matches_sequential_bit_for_bit_for_a_large_mesh() {
         let mut rng = Rng::new(4242);
         let tris = random_tris(PARALLEL_MIN_TRIS + 20_000, &mut rng);
-        let seq = Bvh::build_with_threads((&tris).into(), 1);
+        let seq = binary(&tris, 1);
         assert!(seq.nodes.len() > 1, "test setup: mesh should actually split");
         for &threads in &[2usize, 3, 4, 8, 16] {
-            let par = Bvh::build_with_threads((&tris).into(), threads);
+            let par = binary(&tris, threads);
             assert!(bvh_bit_identical(&seq, &par), "threads={}: BVH differs from the sequential build", threads);
         }
     }
@@ -655,8 +853,8 @@ mod tests {
         let mut rng = Rng::new(99);
         for &n in &[PARALLEL_MIN_TRIS - 1, PARALLEL_MIN_TRIS, PARALLEL_MIN_TRIS + 1] {
             let tris = random_tris(n, &mut rng);
-            let seq = Bvh::build_with_threads((&tris).into(), 1);
-            let par = Bvh::build_with_threads((&tris).into(), 8);
+            let seq = binary(&tris, 1);
+            let par = binary(&tris, 8);
             assert!(bvh_bit_identical(&seq, &par), "n={}: BVH differs from the sequential build", n);
         }
     }
@@ -667,23 +865,23 @@ mod tests {
     fn parallel_build_matches_sequential_for_degenerate_inputs() {
         // 空メッシュ
         let empty: Vec<Triangle> = Vec::new();
-        let seq = Bvh::build_with_threads((&empty).into(), 1);
-        let par = Bvh::build_with_threads((&empty).into(), 8);
+        let seq = binary(&empty, 1);
+        let par = binary(&empty, 8);
         assert!(bvh_bit_identical(&seq, &par));
         assert!(seq.nodes.is_empty());
 
         // 三角形 1 個
         let one = vec![Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
-        let seq = Bvh::build_with_threads((&one).into(), 1);
-        let par = Bvh::build_with_threads((&one).into(), 8);
+        let seq = binary(&one, 1);
+        let par = binary(&one, 8);
         assert!(bvh_bit_identical(&seq, &par));
 
         // 全部同一位置（重心が一点に潰れる）。並列経路に乗る数まで増やす
         let degenerate: Vec<Triangle> = (0..PARALLEL_MIN_TRIS + 1000)
             .map(|i| Triangle::new_static(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), i))
             .collect();
-        let seq = Bvh::build_with_threads((&degenerate).into(), 1);
-        let par = Bvh::build_with_threads((&degenerate).into(), 8);
+        let seq = binary(&degenerate, 1);
+        let par = binary(&degenerate, 8);
         assert!(bvh_bit_identical(&seq, &par), "degenerate（同一位置）でビット一致しない");
     }
 
@@ -693,13 +891,14 @@ mod tests {
     fn parallel_build_is_a_valid_bvh() {
         let mut rng = Rng::new(55);
         let tris = random_tris(PARALLEL_MIN_TRIS + 5000, &mut rng);
+        let bin = binary(&tris, 8);
         let bvh = Bvh::build_with_threads((&tris).into(), 8);
         // 全三角形がちょうど 1 つのリーフに属す
         let mut seen = vec![0u32; tris.len()];
-        for node in &bvh.nodes {
+        for node in &bin.nodes {
             if node.left == -1 {
                 assert!(node.count as usize <= LEAF_SIZE);
-                for &i in &bvh.indices[node.start as usize..(node.start + node.count) as usize] {
+                for &i in &bin.indices[node.start as usize..(node.start + node.count) as usize] {
                     seen[i] += 1;
                 }
             } else {
@@ -774,7 +973,7 @@ mod tests {
         let mut rng = Rng::new(5);
         for &n in &[3usize, 12, 15, 100] {
             let tris = random_tris(n, &mut rng);
-            let bvh = Bvh::build((&tris).into());
+            let bvh = binary(&tris, 1);
             let mut seen = vec![0u32; n];
             for node in &bvh.nodes {
                 if node.left == -1 {
@@ -803,7 +1002,7 @@ mod tests {
                 Triangle::new_static(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 0.5, 0.0, 0.0), Vec3::new(x, 0.5, 0.0), i)
             })
             .collect();
-        let bvh = Bvh::build((&tris).into());
+        let bvh = binary(&tris, 1);
         let root = bvh.nodes[0];
         let l = bvh.nodes[root.left as usize].bbox;
         let r = bvh.nodes[root.right as usize].bbox;
@@ -828,6 +1027,133 @@ mod tests {
                 let all = bvh.hit_filtered((&tris).into(), r, 1e-4, 1e30, |_, _, _| true).map(|h| h.t);
                 assert_eq!(all, bvh.hit((&tris).into(), r, 1e-4, 1e30).map(|h| h.t));
             }
+        }
+    }
+
+    // ---- 広い BVH（2 分木を畳んだ N 分木の走査）----
+
+    /// 2 つの結果がビット単位で同じか（`None` 同士も一致）。
+    fn same_hit(a: &Option<Hit>, b: &Option<Hit>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+                a.t.to_bits() == b.t.to_bits() && bits(a.p) == bits(b.p) && bits(a.ng) == bits(b.ng) && bits(a.ns) == bits(b.ns)
+                    && a.prim_id == b.prim_id && a.mat_id == b.mat_id && a.bary.0.to_bits() == b.bary.0.to_bits() && a.bary.1.to_bits() == b.bary.1.to_bits()
+            }
+            _ => false,
+        }
+    }
+
+    /// 総当たりで決める勝者: 全三角形を独立に判定し、`(t, 番号)` が最小のもの（同値 t は番号の小さい方）。
+    fn brute_winner(tris: &[Triangle], r: Ray, tmin: f64, tmax: f64) -> Option<(f64, usize)> {
+        let mut best: Option<(f64, usize)> = None;
+        for (ti, t) in tris.iter().enumerate() {
+            if let Some((tt, _, _)) = t.intersect(r, tmin, tmax) {
+                if best.map_or(true, |(bt, _)| tt < bt) {
+                    best = Some((tt, ti));
+                }
+            }
+        }
+        best
+    }
+
+    /// 広い BVH の `hit` は、総当たりと `t`・`prim_id`・`mat_id` まで一致する。**同一の三角形を重ねた
+    /// （同値 `t` が必ず出る）メッシュ**を含め、同値 t は番号の小さい方が勝つ規則が走査順によらず守られていることを見る。
+    /// any-hit は存在が総当たりと一致する。
+    #[test]
+    fn wide_hit_matches_brute_force_including_ties() {
+        let mut rng = Rng::new(2024);
+        for (n, dup) in [(1usize, 0usize), (3, 1), (40, 0), (500, 0), (400, 3), (3000, 2)] {
+            let mut tris = random_tris(n, &mut rng);
+            // 重ね置き: 元と同じ頂点の三角形を、別の材質番号で（番号が大きい側に）追加する
+            let base = tris.len();
+            for _ in 0..dup {
+                for k in 0..base {
+                    let t = tris[k];
+                    tris.push(Triangle::new_static(t.v0_0, t.v1_0, t.v2_0, 1000 + tris.len()));
+                }
+            }
+            let bvh = Bvh::build(TriangleSource::from(&tris));
+            let mut ties = 0;
+            for _ in 0..4000 {
+                // 三角形の重心付近を狙うと、同値の重なりに当たりやすい
+                let target = { let t = tris[(rng.next_f64() * tris.len() as f64) as usize % tris.len()]; (t.v0_0 + t.v1_0 + t.v2_0) / 3.0 };
+                let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
+                let r = Ray { o, d: (target - o).norm(), time: 0.0 };
+                let src = TriangleSource::from(&tris);
+                let got = bvh.hit(src, r, 0.0, 1e30);
+                let want = brute_winner(&tris, r, 0.0, 1e30);
+                match (&got, want) {
+                    (None, None) => {}
+                    (Some(h), Some((t, ti))) => {
+                        assert_eq!(h.t.to_bits(), t.to_bits(), "n={n} dup={dup}: t");
+                        assert_eq!(h.prim_id, ti, "n={n} dup={dup}: prim_id");
+                        assert_eq!(h.mat_id, tris[ti].mat_id, "n={n} dup={dup}: mat_id");
+                        if dup > 0 { ties += 1; }
+                    }
+                    _ => panic!("n={n} dup={dup}: hit {:?} vs brute force {:?}", got.map(|h| (h.t, h.prim_id)), want),
+                }
+                let any = bvh.any_hit_filtered(src, r, 0.0, 1e30, |_, _, _| true).is_some();
+                assert_eq!(any, want.is_some());
+            }
+            if dup > 0 { assert!(ties > 100, "重ね置きの同値ケースが少なすぎる: {ties}"); }
+        }
+    }
+
+    /// 走査順を変える（ノードの畳み方が違う）ことがあっても結果が変わらないこと: 別のスレッド数で作った BVH
+    /// （構造は同一だが、念のため）と、レイの向きを変えた多数のレイで `hit` の結果が完全に一致する。
+    /// 加えて、同じメッシュを反転した並びで作った BVH（番号 → 位置の対応が違う = 走査順が違う）でも、
+    /// 番号で見た勝者は同じ。
+    #[test]
+    fn winner_does_not_depend_on_the_traversal_order() {
+        let mut rng = Rng::new(31);
+        let mut tris = random_tris(600, &mut rng);
+        let base = tris.len();
+        for k in 0..base {
+            let t = tris[k];
+            tris.push(Triangle::new_static(t.v0_0, t.v1_0, t.v2_0, 5000 + k));
+        }
+        let a = Bvh::build_with_threads((&tris).into(), 1);
+        let b = Bvh::build_with_threads((&tris).into(), 8);
+        // 並びを逆にしたメッシュ: 番号 i は base*2 - 1 - i に対応
+        let rev: Vec<Triangle> = tris.iter().rev().copied().collect();
+        let c = Bvh::build((&rev).into());
+        let n = tris.len();
+        for _ in 0..3000 {
+            let target = { let t = tris[(rng.next_f64() * n as f64) as usize % n]; (t.v0_0 + t.v1_0 + t.v2_0) / 3.0 };
+            let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
+            let r = Ray { o, d: (target - o).norm(), time: 0.0 };
+            let ha = a.hit((&tris).into(), r, 0.0, 1e30);
+            let hb = b.hit((&tris).into(), r, 0.0, 1e30);
+            assert!(same_hit(&ha, &hb));
+            // 逆並びでは「番号が小さい方が勝つ」は元の番号で大きい方 = 重ね置きの複製側が勝つので、t だけ一致すればよい
+            let hc = c.hit((&rev).into(), r, 0.0, 1e30);
+            assert_eq!(ha.map(|h| h.t.to_bits()), hc.map(|h| h.t.to_bits()));
+        }
+    }
+
+    /// 広い BVH の構造: 全三角形がちょうど 1 回リーフに現れ、子スロット数は 1..=WIDE_WIDTH、リーフ以外は子ノードを指す。
+    #[test]
+    fn wide_nodes_partition_all_triangles() {
+        let mut rng = Rng::new(9);
+        for n in [1usize, 2, 4, 5, 17, 300, 5000] {
+            let tris = random_tris(n, &mut rng);
+            let bvh = Bvh::build(TriangleSource::from(&tris));
+            let mut seen = vec![0u32; n];
+            for nd in &bvh.wide {
+                assert!((1..=WIDE_WIDTH as u8).contains(&nd.n));
+                for i in 0..nd.n as usize {
+                    if nd.count[i] > 0 {
+                        for pos in nd.child[i] as usize..nd.child[i] as usize + nd.count[i] as usize {
+                            seen[bvh.indices[pos]] += 1;
+                        }
+                    } else {
+                        assert!((nd.child[i] as usize) < bvh.wide.len());
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&c| c == 1), "n={n}");
         }
     }
 }
