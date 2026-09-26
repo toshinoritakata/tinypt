@@ -34,6 +34,7 @@ pub mod render;      // マルチスレッド・レンダリング実行
 pub mod output;      // 画像出力（PPM / HDR / EXR）
 pub mod denoise;     // Intel OIDN デノイザー
 pub mod hdr;         // Radiance HDR (.hdr) 読み書き
+pub mod png;         // PNG 書き出し（8bit RGB、自前の deflate）
 pub mod exr;         // OpenEXR (.exr) 読み書き
 pub mod env;         // 環境マップの読み込みと重点的サンプリング
 pub mod texture;     // ビットマップテクスチャ（UV サンプリング）

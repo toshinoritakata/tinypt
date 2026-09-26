@@ -5,6 +5,7 @@
 //! 渡すだけでよい（露出・トーンマップ・色空間・ガンマの判断はフォーマット内部）。
 //!
 //! - **PPM**: 露出補正 → トーンマップ → sRGB エンコード（入力デコードと対称） → 8bit、バイナリ（P6）
+//! - **PNG**: PPM と同じ画素（露出 → トーンマップ → sRGB → 8bit）を可逆に圧縮して書く
 //! - **HDR**: リニア RGB を RGBE エンコーディングで出力（シーン参照値を保存）
 //! - **EXR**: リニア sRGB → ACEScg 変換後に float32 で出力（シーン参照値を保存）
 //!
@@ -18,6 +19,7 @@ use crate::aces::srgb_to_acescg_pixels;
 use crate::config::Tonemap;
 use crate::exr::write_exr;
 use crate::hdr::write_hdr;
+use crate::png::write_png;
 use crate::math::{clamp, linear_to_srgb, Color};
 use crate::task::idx;
 
@@ -35,6 +37,8 @@ pub struct OutputSettings {
 pub enum OutputFormat {
     /// PPM（P6 バイナリ, 8bit, sRGB ガンマ）
     Ppm,
+    /// PNG（8bit RGB。画素は PPM と同一で、圧縮するだけ）
+    Png,
     /// Radiance HDR（RGBE, リニア）
     Hdr,
     /// OpenEXR（float32, ACEScg）
@@ -49,6 +53,8 @@ impl OutputFormat {
             OutputFormat::Exr
         } else if lower.ends_with(".hdr") {
             OutputFormat::Hdr
+        } else if lower.ends_with(".png") {
+            OutputFormat::Png
         } else {
             OutputFormat::Ppm
         }
@@ -70,6 +76,10 @@ impl OutputFormat {
                 let mut out = BufWriter::new(File::create(path)?);
                 write_ppm_p6(&mut out, w, h, &ppm_bytes(w, h, pixels, settings))?;
                 out.flush()
+            }
+            OutputFormat::Png => {
+                // 画素は PPM と同じバイト列（露出 → トーンマップ → sRGB → 8bit）。PNG は可逆に圧縮するだけ
+                write_png(path, w, h, &ppm_bytes(w, h, pixels, settings))
             }
             OutputFormat::Hdr => {
                 // シーン参照リニア値をそのまま RGBE 出力
@@ -153,6 +163,8 @@ mod tests {
         assert_eq!(OutputFormat::from_path("OUT.EXR"), OutputFormat::Exr);
         assert_eq!(OutputFormat::from_path("out.hdr"), OutputFormat::Hdr);
         assert_eq!(OutputFormat::from_path("out.HDR"), OutputFormat::Hdr);
+        assert_eq!(OutputFormat::from_path("out.png"), OutputFormat::Png);
+        assert_eq!(OutputFormat::from_path("OUT.PNG"), OutputFormat::Png);
         assert_eq!(OutputFormat::from_path("out.ppm"), OutputFormat::Ppm);
         // 未知の拡張子は PPM にフォールバック
         assert_eq!(OutputFormat::from_path("out.txt"), OutputFormat::Ppm);
@@ -323,5 +335,33 @@ mod tests {
         // 画素値に空白・改行と同じバイト（10, 32）が含まれても、P6 は長さで読むので壊れない
         let p6_ws = [b"P6\n2 1\n255\n".as_slice(), &[10, 32, 9, 13, 35, 10]].concat();
         assert_eq!(read_ppm(&p6_ws), (2, 1, vec![10, 32, 9, 13, 35, 10]));
+    }
+
+    /// 同じ画素列を `.ppm` と `.png` で書き、PNG をデコードした画素が PPM の画素と 1 バイトも違わない
+    /// （露出・トーンマップ・大小の値・0 / 1 を含む）。サイズは 1x1・幅 1・高さ 1・大きめ。
+    #[test]
+    fn png_pixels_match_ppm_exactly() {
+        let dir = std::env::temp_dir();
+        for (k, (w, h)) in [(1usize, 1usize), (1, 9), (11, 1), (173, 97)].into_iter().enumerate() {
+            let pixels: Vec<Color> = (0..w * h)
+                .map(|i| {
+                    let f = i as f64 / (w * h) as f64;
+                    Color::new(f * 6.0 - 0.5, (f * 40.0).sin().abs() * 2.0, if i % 7 == 0 { 50.0 } else { f })
+                })
+                .collect();
+            for (tm, ev) in [(Tonemap::Aces, 0.0), (Tonemap::None, 1.5), (Tonemap::Aces, -2.0)] {
+                let settings = OutputSettings { exposure: ev, tonemap: tm };
+                let base = dir.join(format!("tinypt_png_test_{}_{}", std::process::id(), k));
+                let (ppm, png) = (format!("{}.ppm", base.display()), format!("{}.png", base.display()));
+                OutputFormat::Ppm.write(&ppm, w, h, &pixels, settings).unwrap();
+                OutputFormat::from_path(&png).write(&png, w, h, &pixels, settings).unwrap();
+                let (pw, ph, prgb) = read_ppm(&std::fs::read(&ppm).unwrap());
+                let (nw, nh, nrgb) = crate::png::tests::decode(&std::fs::read(&png).unwrap());
+                assert_eq!((pw, ph), (nw, nh));
+                assert_eq!(prgb, nrgb, "{w}x{h} {ev}");
+                assert_eq!(nrgb, ppm_bytes(w, h, &pixels, settings));
+                let _ = (std::fs::remove_file(&ppm), std::fs::remove_file(&png));
+            }
+        }
     }
 }

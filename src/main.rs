@@ -75,7 +75,7 @@ Scene / output:
   --scene PATH               Mitsuba XML scene file (default: built-in scene, 1920x1080)
   --width N / --height N     Image size in pixels, 1..=65536 (overrides the scene file's <film>)
   --res WxH                  Both at once, e.g. --res 1920x1080 (same precedence; last flag wins)
-  -o, --out PATH             Output file; format from extension: .ppm .hdr .exr (default: out.ppm)
+  -o, --out PATH             Output file; format from extension: .ppm .png .hdr .exr (default: out.ppm)
   --env PATH                 HDR/EXR environment map (built-in scene only)
   --no-env                   Cancel an earlier --env
 
