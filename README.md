@@ -74,6 +74,28 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
 - **定数色との併用**: `<rgb name="reflectance">` も書くと、その色は**倍率**としてテクスチャに掛かる。片方だけなら他方は白 (1 倍)。
 - **パラメトリック形状の UV**: Mitsuba 準拠。`rectangle` = `((x+1)/2, (y+1)/2)`、`cube` = 面ごとに `[0,1]²`、`disk` = `(r, φ/2π)`、`sphere` = `(φ/2π, θ/π)` (極は ±z)。
 - **現状の制限**: XML でテクスチャを指定できるのは `diffuse` の `reflectance` のみ。
+- **手続き的な 3D ノイズ** (`<texture type="noise">`、**tinypt の独自拡張**): `diffuse` の `reflectance` に、画像の代わりに置ける。交差点の**3D 座標**で評価するソリッドノイズ (Perlin) なので、球の極や UV の継ぎ目で歪まない。画像テクスチャと同じく、定数色の `reflectance` を併記すると倍率になる。
+
+```xml
+<texture type="noise" name="reflectance">
+  <string name="pattern" value="marble"/>   <!-- fbm (既定) / turbulence / marble / wood / granite -->
+  <float name="scale" value="4.0"/>          <!-- 空間周波数。既定 1、(0, 1e6] -->
+  <integer name="octaves" value="5"/>        <!-- 既定 4、1..10 -->
+  <float name="lacunarity" value="2.0"/>     <!-- 既定 2、1..8 -->
+  <float name="gain" value="0.5"/>           <!-- 既定 0.5、0..1 -->
+  <float name="strength" value="6.0"/>       <!-- marble / wood の歪み。既定 1 -->
+  <rgb name="color0" value="0.05, 0.05, 0.06"/>   <!-- t=0 の色。既定 黒 -->
+  <rgb name="color1" value="0.85, 0.82, 0.78"/>   <!-- t=1 の色。既定 白 -->
+  <string name="space" value="local"/>       <!-- local (既定: 物体座標) / world -->
+  <point name="offset" x="0" y="0" z="0"/>   <!-- 評価前に座標へ足す。既定 0 -->
+</texture>
+```
+
+  - パターン: `fbm` = 雲・苔・汚れ / `turbulence` = 煙・錆 / `marble` = x 方向の縞を乱流で歪めた大理石の脈 / `wood` = y 軸まわりの年輪を乱流で歪めた木目 (`strength` 小さめが自然) / `granite` = 高周波 fBm のコントラストを上げた粒状の模様。
+  - **座標の空間 (`space`)**: 既定の `local` は**物体座標**で評価する (メッシュのインスタンスは変換の逆、球は `p − 中心`。モーションブラーで動くものは、その時刻に補間した変換・中心を使う)。模様が物体に付いてくるので、動く物体でも模様が流れず、同じメッシュを別の `to_world` で置けば同じ模様になる。`world` にすると**ワールド座標**で評価し、複数の物体を 1 つの石から削り出したように見せられる (動く物体では模様の中を泳ぐ)。
+  - **`offset`**: 評価前に座標へ足す。ローカルだと同じ形の物体は同じ模様になるので、物体ごとに違う値を書いて、模様は追従させたまま切り口だけ変える。
+  - シーンを k 倍すると模様も k 倍になる (`scale` は空間周波数。模様が物体に固定されているので正しい挙動)。
+  - 不正な `pattern` は警告して `fbm`、範囲外の値・不正な `space` は警告して丸める（`space` は `local`）。置換表はコンパイル時に固定なので、レンダリングは再現する。ノイズを使わないシーンの出力は変わらない。
 - **OBJ の `usemtl` / MTL**: OBJ の `<shape>` に `<bsdf>` も `<emitter>` も書かないと、`mtllib` の MTL から材質を作る (1 メッシュのまま、`usemtl` ごとに三角形の材質が変わる。BVH は割らない)。`<bsdf>` があれば従来どおり**全体を上書き**し MTL は読まない (`sample/sponza.xml` はこちら)。`<boolean name="use_mtl" value="false"/>` でも MTL を無視できる。例: `sample/sponza_textured.xml`。
   - MTL → BSDF: **`map_Kd` があれば常に** `Lambert { albedo: Kd, albedo_tex }` (sRGB デコード。`Kd` は倍率として掛かる)。`map_Kd` が無く、`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。どちらでもなければ `Lambert { albedo: Kd }`。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
     (`map_Kd` を優先するのは、拡散テクスチャと明るい鏡面反射を両方持つ材質を先に GGX 化すると拡散テクスチャがまるごと捨てられてしまうため — 拡散 + 光沢の合成 BSDF は `Material` に新しい variant が要るので扱わない。)

@@ -24,6 +24,7 @@ use crate::medium::{hg_eval, hg_sample, Medium, MediumEvent};
 use crate::ray::Ray;
 use crate::rng::Rng;
 use crate::normal_map::{orthonormalize, MapId, NormalMap};
+use crate::noise::NoiseTexture;
 use crate::texture::Texture;
 use crate::world::{DeltaLight, World};
 
@@ -206,7 +207,7 @@ pub fn radiance(
         };
 
         // テクスチャはここで 1 度だけ交差点の UV で評価し、以降の BSDF はテクスチャを知らない
-        let mat = mats[hit.mat_id].resolve_textures(surfaces.textures, hit.uv);
+        let mat = mats[hit.mat_id].resolve_textures(surfaces.textures, surfaces.noises, |local| if local { world.object_space_point(&hit, ray.time) } else { hit.p }, hit.uv);
 
         // 法線マップ／バンプマップ: シェーディング法線 `ns` だけを摂動する（1 か所。NEE も `Material::sample` も
         // この後の `hit.ns` を見るので、両方が同じ摂動後の法線になる）。`ng` / `p` / `p_error` には触れない
@@ -327,6 +328,7 @@ pub fn radiance(
 /// 材質ごとのサーフェス属性（色テクスチャと法線マップ）への参照の束。
 pub struct Surfaces<'a> {
     pub textures: &'a [Texture],
+    pub noises: &'a [NoiseTexture],
     pub normal_maps: &'a [NormalMap],
     /// `mat_id` → `normal_maps` の添字。空ならマップ無し（[`Scene::mat_maps`](crate::scene::Scene::mat_maps) の不変条件）
     pub mat_maps: &'a [Option<MapId>],
@@ -335,12 +337,12 @@ pub struct Surfaces<'a> {
 impl<'a> Surfaces<'a> {
     /// マップ無し・テクスチャ無し（テスト用）。
     pub const fn none() -> Surfaces<'static> {
-        Surfaces { textures: &[], normal_maps: &[], mat_maps: &[] }
+        Surfaces { textures: &[], noises: &[], normal_maps: &[], mat_maps: &[] }
     }
 
     /// 色テクスチャだけ（法線マップ無し）。
     pub const fn textures_only(textures: &'a [Texture]) -> Surfaces<'a> {
-        Surfaces { textures, normal_maps: &[], mat_maps: &[] }
+        Surfaces { textures, noises: &[], normal_maps: &[], mat_maps: &[] }
     }
 
     /// 材質 `mat_id` の法線マップ。テーブルが空なら即 `None`（マップを使わないシーンのコストは分岐 1 つ）。
@@ -1756,7 +1758,7 @@ mod map_tests {
     }
 
     fn surfaces(s: &Scene) -> Surfaces<'_> {
-        Surfaces { textures: &s.textures, normal_maps: &s.normal_maps, mat_maps: &s.mat_maps }
+        Surfaces { textures: &s.textures, noises: &s.noises, normal_maps: &s.normal_maps, mat_maps: &s.mat_maps }
     }
 
     /// `tf`（`<transform>` の中身）を付けた 1 枚の板（法線 +z、UV = (x+1)/2, (y+1)/2）に、`bsdf` を貼る。

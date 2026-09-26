@@ -293,6 +293,7 @@ fn render_with_threads(
         textures: &scene.textures,
         normal_maps: &scene.normal_maps,
         mat_maps: &scene.mat_maps,
+        noises: &scene.noises,
     };
     let surfaces_ref = &surfaces_val;
 
@@ -447,6 +448,7 @@ mod tests {
             textures: Vec::new(),
             normal_maps: Vec::new(),
             mat_maps: Vec::new(),
+            noises: Vec::new(),
             env: None,
             medium: None,
             load_stats: Default::default(),
@@ -692,7 +694,7 @@ mod tests {
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
     /// `RENDER_REVISION` は `Cargo.toml` の `version` から導出されるので、実質的には
     /// 「このハッシュを記録したときの `Cargo.toml` のバージョン」を数値で持っているのと同じ。
-    const GOLDEN_REVISION: u32 = 7000;
+    const GOLDEN_REVISION: u32 = 8000;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。

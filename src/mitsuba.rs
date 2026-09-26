@@ -35,7 +35,8 @@ use crate::env::EnvMap;
 use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
-use crate::material::TexId;
+use crate::material::{TexId, NOISE_TEX_FLAG};
+use crate::noise::{NoiseTexture, Pattern};
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
 use crate::constants::normal_map::MTL_BUMP_K;
 use crate::normal_map::{HeightMap, MapId, NormalMap};
@@ -182,6 +183,8 @@ thread_local! {
 // （引数を多数の関数に通さずに済む）。`load_scene_from_str` の先頭で 0 にする。
 thread_local! {
     static OBJ_PARSE_TIME: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    /// 読み込み中の `<texture type="noise">`（`parse_leaf_bsdf` が積み、`Scene::noises` になる。引数を通さないための thread_local）
+    static NOISES: std::cell::RefCell<Vec<NoiseTexture>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXTURE_LOAD_TIME: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
@@ -269,6 +272,7 @@ pub fn load_scene_from_str(
 ) -> io::Result<(Scene, SceneSettings)> {
     OBJ_PARSE_TIME.with(|c| c.set(std::time::Duration::ZERO));
     TEXTURE_LOAD_TIME.with(|c| c.set(std::time::Duration::ZERO));
+    NOISES.with(|n| n.borrow_mut().clear());
     let root = parse_tree(xml)?;
     if root.tag != "scene" {
         return Err(err("root element is not <scene>"));
@@ -409,7 +413,8 @@ pub fn load_scene_from_str(
         mesh_build: world.mesh_build_time(),
         texture_load: TEXTURE_LOAD_TIME.with(|c| c.get()),
     };
-    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, env, medium, load_stats }, settings))
+    let noises = NOISES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, noises, env, medium, load_stats }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
@@ -1351,6 +1356,46 @@ fn parse_texture(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> 
     }
 }
 
+/// `<texture type="noise">`（**独自拡張**）: 手続き的な 3D ソリッドノイズ。`NOISES` に積み、`NOISE_TEX_FLAG` 付きの
+/// 添字を返す。不正な `pattern` は警告して `fbm`、範囲外の値は丸める（`NoiseTexture::sanitized`）。
+fn parse_noise_texture(el: &Element) -> Option<TexId> {
+    let pattern = match el.string("pattern") {
+        None => Pattern::Fbm,
+        Some(s) => Pattern::parse(s).unwrap_or_else(|| {
+            warn(&format!("unknown noise pattern '{s}'; using fbm"));
+            Pattern::Fbm
+        }),
+    };
+    let raw = NoiseTexture {
+        pattern,
+        scale: el.float("scale").unwrap_or(1.0),
+        octaves: el.int("octaves").map_or(4, |o| o.clamp(0, 1000) as u32),
+        lacunarity: el.float("lacunarity").unwrap_or(2.0),
+        gain: el.float("gain").unwrap_or(0.5),
+        strength: el.float("strength").unwrap_or(1.0),
+        color0: el.color("color0").unwrap_or(Color::new(0.0, 0.0, 0.0)),
+        color1: el.color("color1").unwrap_or(Color::new(1.0, 1.0, 1.0)),
+        local: match el.string("space") {
+            None | Some("local") => true,
+            Some("world") => false,
+            Some(s) => {
+                warn(&format!("unknown noise space '{s}'; using local"));
+                true
+            }
+        },
+        offset: el.point("offset").unwrap_or(Vec3::new(0.0, 0.0, 0.0)),
+    };
+    let fixed = raw.sanitized();
+    if (fixed.scale, fixed.octaves, fixed.lacunarity, fixed.gain, fixed.strength) != (raw.scale, raw.octaves, raw.lacunarity, raw.gain, raw.strength) {
+        warn("noise texture parameter out of range (scale must be in (0, 1e6], octaves 1..10, lacunarity 1..8, gain 0..1); clamped");
+    }
+    NOISES.with(|n| {
+        let mut n = n.borrow_mut();
+        n.push(fixed);
+        Some(((n.len() - 1) as TexId) | NOISE_TEX_FLAG)
+    })
+}
+
 /// `<texture type="bitmap">` の `filename`（XML からの相対）と `wrap_mode` を読む。
 /// 型が違う・`filename` が無いときは警告して `None`。
 fn bitmap_source(el: &Element, base_dir: &Path) -> Option<(PathBuf, Wrap)> {
@@ -1461,9 +1506,13 @@ fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -
         "diffuse" => {
             // `reflectance` はテクスチャか定数色。テクスチャがある場合、定数色は色の倍率になる
             // （両方あれば掛け合わせる。片方だけなら他方は白 = 1 倍）。
-            let tex = el
-                .prop("texture", "reflectance")
-                .and_then(|t| parse_texture(t, base_dir, textures));
+            let tex = el.prop("texture", "reflectance").and_then(|t| {
+                if t.typ() == "noise" {
+                    parse_noise_texture(t)
+                } else {
+                    parse_texture(t, base_dir, textures)
+                }
+            });
             let default = if tex.is_some() { Color::new(1.0, 1.0, 1.0) } else { Color::new(0.5, 0.5, 0.5) };
             Material::Lambert {
                 albedo: el.color("reflectance").unwrap_or(default),
@@ -1774,7 +1823,7 @@ mod tests {
             load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
         });
         let mat = scene.mats[0];
-        let resolved = mat.resolve_textures(&scene.textures, (0.5, 0.5));
+        let resolved = mat.resolve_textures(&scene.textures, &scene.noises, |_| Vec3::new(0.0, 0.0, 0.0), (0.5, 0.5));
         match resolved {
             Material::Lambert { albedo, albedo_tex: None } => {
                 assert!((albedo.r() - 0.25).abs() < 1e-9 && (albedo.b() - 1.0).abs() < 1e-9,
@@ -2941,5 +2990,81 @@ mod tests {
         // to_world_end は案内付きの警告
         let (_, w) = sphere_end_scene(&format!(r#"{diffuse}<transform name="to_world_end"><translate x="1"/></transform>"#));
         assert!(w.iter().any(|m| m.contains("center_end")), "{w:?}");
+    }
+
+    // ---- 手続き的ノイズ（<texture type="noise">）----
+
+    fn noise_scene(inner: &str) -> (Scene, Vec<String>) {
+        let xml = format!(r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor><shape type="sphere"><bsdf type="diffuse"><rgb name="reflectance" value="0.5"/><texture type="noise" name="reflectance">{inner}</texture></bsdf></shape></scene>"#);
+        capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0)
+    }
+    fn albedo_at(s: &Scene, p: Vec3) -> f64 {
+        match s.mats[0].resolve_textures(&s.textures, &s.noises, |_| p, (0.5, 0.5)) {
+            Material::Lambert { albedo, albedo_tex: None } => albedo.r(),
+            _ => panic!("ノイズが畳み込まれていない"),
+        }
+    }
+
+    /// ノイズは位置で変わり、定数色は倍率として掛かる。不正な pattern / 範囲外の値は警告して丸め、落ちない。
+    #[test]
+    fn noise_texture_parses_varies_with_position_and_clamps() {
+        let ok = r#"<string name="pattern" value="marble"/><float name="scale" value="3"/><rgb name="color0" value="0"/><rgb name="color1" value="1"/>"#;
+        let (s, w) = noise_scene(ok);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.noises.len(), 1);
+        let vals: Vec<f64> = (0..20).map(|i| albedo_at(&s, Vec3::new(0.1 * i as f64, 0.3, 0.2))).collect();
+        assert!(vals.iter().all(|v| (0.0..=0.5 + 1e-12).contains(v)), "0.5 倍の範囲");
+        assert!(vals.iter().cloned().fold(0.0, f64::max) - vals.iter().cloned().fold(1.0, f64::min) > 0.1, "位置で変わる");
+        assert_eq!(albedo_at(&s, Vec3::new(0.3, 0.3, 0.3)).to_bits(), albedo_at(&s, Vec3::new(0.3, 0.3, 0.3)).to_bits());
+        let (_, w) = noise_scene(r#"<string name="pattern" value="nope"/>"#);
+        assert_eq!(w.iter().filter(|m| m.contains("noise pattern")).count(), 1, "{w:?}");
+        for bad in [r#"<float name="scale" value="0"/>"#, r#"<float name="scale" value="-2"/>"#, r#"<integer name="octaves" value="99"/>"#, r#"<integer name="octaves" value="0"/>"#] {
+            let (s, w) = noise_scene(bad);
+            assert!(w.iter().any(|m| m.contains("out of range")), "{bad}: {w:?}");
+            assert!(albedo_at(&s, Vec3::new(0.3, 0.3, 0.3)).is_finite());
+        }
+    }
+
+    fn placed_noise_scene(space: &str, off_b: &str) -> Scene {
+        let noise = |off: &str| format!(r#"<bsdf type="diffuse"><texture type="noise" name="reflectance"><string name="pattern" value="marble"/><float name="scale" value="3"/>{space}{off}</texture></bsdf>"#);
+        let xml = format!(
+            r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor>
+            <shape type="rectangle"><transform name="to_world"><translate x="0" y="0" z="0"/></transform>{}</shape>
+            <shape type="rectangle"><transform name="to_world"><translate x="7" y="2" z="-3"/><rotate y="1" angle="35"/></transform>{}</shape></scene>"#,
+            noise(""), noise(off_b)
+        );
+        capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0).0
+    }
+    /// 矩形（ローカルの点 (0.3, 0.2, 0)）の albedo。`which` は 0 / 1 の矩形。
+    fn rect_albedo(s: &Scene, which: usize) -> f64 {
+        let local = Vec3::new(0.3, 0.2, 0.0);
+        // 各矩形の to_world（テスト用に同じ式）でワールドの点と法線を得る
+        let xf = if which == 0 {
+            Transform::identity()
+        } else {
+            Transform::translate(Vec3::new(7.0, 2.0, -3.0)).compose(Transform::rotate(Vec3::new(0.0, 1.0, 0.0), 35.0))
+        };
+        let (pw, nw) = (xf.apply_point(local), xf.apply_normal(Vec3::new(0.0, 0.0, 1.0)));
+        let h = s.world.hit(Ray { o: pw + nw * 2.0, d: -nw, time: 0.0 }, 1e-9, 1e30).expect("hit");
+        match s.mats[h.mat_id].resolve_textures(&s.textures, &s.noises, |local| if local { s.world.object_space_point(&h, 0.0) } else { h.p }, h.uv) {
+            Material::Lambert { albedo, .. } => albedo.r(),
+            _ => panic!(),
+        }
+    }
+
+    /// ローカル座標: 違う `to_world` で置いた同じ形は、`offset` が同じなら同じ模様、違えば違う模様。
+    /// `space="world"` は従来どおりワールド座標（配置が違えば別の模様）。不正な space は警告して local。
+    #[test]
+    fn noise_space_local_world_and_offset() {
+        let s = placed_noise_scene("", "");
+        assert!((rect_albedo(&s, 0) - rect_albedo(&s, 1)).abs() < 1e-9, "同じ offset は同じ模様");
+        let s = placed_noise_scene("", r#"<point name="offset" x="5" y="1" z="2"/>"#);
+        assert!((rect_albedo(&s, 0) - rect_albedo(&s, 1)).abs() > 1e-3, "offset が違えば別の模様");
+        let s = placed_noise_scene(r#"<string name="space" value="world"/>"#, "");
+        assert!((rect_albedo(&s, 0) - rect_albedo(&s, 1)).abs() > 1e-3, "world は配置で変わる");
+        assert!(!s.noises[0].local);
+        let xml = r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor><shape type="sphere"><bsdf type="diffuse"><texture type="noise" name="reflectance"><string name="space" value="sideways"/></texture></bsdf></shape></scene>"#;
+        let (s, w) = capture_warnings(|| load_scene_from_str(xml, Path::new("."), &cfg(), (None, None)).unwrap().0);
+        assert!(s.noises[0].local && w.iter().any(|m| m.contains("noise space")), "{w:?}");
     }
 }

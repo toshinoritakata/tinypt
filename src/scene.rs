@@ -6,6 +6,7 @@ use crate::config::RenderConfig;
 use crate::env::EnvMap;
 use crate::geometry::Sphere;
 use crate::material::Material;
+use crate::noise::NoiseTexture;
 use crate::normal_map::{MapId, NormalMap};
 use crate::texture::Texture;
 use crate::math::{Color, Vec3};
@@ -40,6 +41,8 @@ pub struct Scene {
     /// `mat_id` → `normal_maps` の添字。**空か、さもなくば `mats` と同じ長さ**（不変条件。空ならマップ無しで、
     /// 積分器は何も引かない）。
     pub mat_maps: Vec<Option<MapId>>,
+    /// 手続き的な 3D ノイズ（`Material` が `NOISE_TEX_FLAG` 付きの `TexId` で参照する。画像の `textures` とは別）
+    pub noises: Vec<NoiseTexture>,
     /// 環境マップ（None でデフォルトの空色を使用）
     pub env: Option<EnvMap>,
     /// 一様な参加媒質（None で真空）。M3 までシーンファイルからは読めず、テストとコードから直接与える
@@ -120,7 +123,7 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
     };
 
     let load_stats = LoadStats { mesh_build: world.mesh_build_time(), ..Default::default() };
-    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), env, medium: None, load_stats }
+    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), noises: Vec::new(), env, medium: None, load_stats }
 }
 
 fn push(mats: &mut Vec<Material>, m: Material) -> usize {

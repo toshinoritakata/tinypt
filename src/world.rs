@@ -1001,6 +1001,31 @@ impl World {
         Some((xf.apply_vec(dpdu), xf.apply_vec(dpdv)))
     }
 
+    /// 交差点を、その物体の空間へ戻した位置。手続き的テクスチャをローカル座標で評価するために使う。
+    ///
+    /// - メッシュのインスタンス（`inst_id = Some(i)`）: インスタンス変換の逆。**アニメーションしていれば `time` で
+    ///   補間した変換の逆**（開き姿勢の逆だと、動いている間に模様がずれる）。
+    /// - 球（`inst_id = None`、`prim_id` = 球の添字）: `p − その時刻の中心`。動く球は補間後の中心。半径では割らない
+    ///   （`scale` の意味が球ごとに変わるため）。
+    pub fn object_space_point(&self, hit: &Hit, time: f64) -> Vec3 {
+        match hit.inst_id {
+            Some(i) => match self.instances.get(i) {
+                Some(inst) => match &inst.anim {
+                    Some(a) => a.at(time).apply_point_inv(hit.p),
+                    None => inst.xform.apply_point_inv(hit.p),
+                },
+                None => hit.p,
+            },
+            None => match self.spheres.get(hit.prim_id) {
+                Some(s) => match self.sphere_end.get(hit.prim_id) {
+                    Some(Some(end)) => hit.p - lerp_center(s.c, *end, time).0,
+                    _ => hit.p - s.c,
+                },
+                None => hit.p,
+            },
+        }
+    }
+
     /// 発光マテリアルからライトサンプリング構造（CDF）を構築する。
     /// 各ライトの重み = 表面積 × 放射輝度の輝度値。
     ///
@@ -3657,6 +3682,57 @@ mod tests {
         }
     }
 
+
+    // ---- ローカル座標（object_space_point）----
+
+    fn local_noise() -> crate::noise::NoiseTexture {
+        crate::noise::NoiseTexture {
+            pattern: crate::noise::Pattern::Marble, scale: 3.0, octaves: 4, lacunarity: 2.0, gain: 0.5, strength: 4.0,
+            color0: Color::new(0.0, 0.0, 0.0), color1: Color::new(1.0, 1.0, 1.0), local: true, offset: Vec3::new(0.0, 0.0, 0.0),
+        }
+    }
+
+    /// 動く球: 時刻 0 / 0.5 / 1 で、球上の同じ点（中心からの相対位置）のローカル座標は同じで、ノイズの値も同じ
+    /// （模様が球に追従する）。ワールド座標で評価すると値が違う。
+    #[test]
+    fn local_point_follows_a_moving_sphere() {
+        let mut world = World::new();
+        let idx = world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 0.5, mat_id: 0 });
+        world.set_sphere_end(idx, Vec3::new(4.0, 1.0, 0.0));
+        let n = local_noise();
+        let mut local = Vec::new();
+        let mut worldv = Vec::new();
+        for time in [0.0, 0.5, 1.0] {
+            let c = Vec3::new(4.0, 1.0, 0.0) * time;
+            let h = world.hit(ray_at(c + Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0), time), 1e-9, 1e30).expect("hit");
+            let p = world.object_space_point(&h, time);
+            assert!((p - Vec3::new(0.0, 0.0, 0.5)).len() < 1e-9, "time {time}: {p:?}");
+            local.push(n.factor(p));
+            worldv.push(n.factor(h.p));
+        }
+        assert!(local.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9), "{local:?}");
+        assert!((worldv[0] - worldv[1]).abs() > 1e-3, "ワールド評価は泳ぐ: {worldv:?}");
+    }
+
+    /// アニメーションするインスタンス: 補間した変換の逆を使う（開き姿勢の逆だと time 0.5 / 1 でずれる）。
+    #[test]
+    fn local_point_follows_an_animated_instance() {
+        let tri = Triangle::new_static(Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0);
+        let mut world = World::new();
+        let start = Transform::translate(Vec3::new(0.0, 0.0, 0.0));
+        let end = Transform::translate(Vec3::new(4.0, 1.0, 0.0)).compose(Transform::rotate(Vec3::new(0.0, 1.0, 0.0), 70.0));
+        let inst = world.add_mesh_instance(vec![tri], start, None);
+        assert!(world.set_instance_end_transform(inst, end));
+        let anim = AnimatedTransform::new(start, end).unwrap();
+        let local = Vec3::new(0.1, 0.0, 0.0);
+        for time in [0.0, 0.3, 0.5, 1.0] {
+            let xf = anim.at(time);
+            let (pw, nw) = (xf.apply_point(local), xf.apply_normal(Vec3::new(0.0, 0.0, 1.0)));
+            let h = world.hit(ray_at(pw + nw * 2.0, -nw, time), 1e-9, 1e30).expect("hit");
+            let p = world.object_space_point(&h, time);
+            assert!((p - local).len() < 1e-9, "time {time}: {p:?}");
+        }
+    }
 
     // ---- 動く球（center_end）----
 

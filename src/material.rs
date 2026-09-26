@@ -23,12 +23,18 @@ use crate::geometry::{face_forward, offset_ray_origin, Hit};
 use crate::math::{reflect, refract, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::noise::NoiseTexture;
 use crate::texture::Texture;
 
 /// テクスチャ配列（[`crate::scene::Scene::textures`]）への添字。
 /// `Material` を `Copy` のまま保つために、テクスチャ本体ではなく添字を持たせている
 /// （マテリアルは交差ごとにコピーされるので、`Vec` を抱えさせたくない）。
 pub type TexId = u32;
+
+/// `TexId` の最上位ビット。立っていれば画像テクスチャ（[`crate::scene::Scene::textures`]）ではなく、
+/// 手続き的ノイズ（[`crate::scene::Scene::noises`]）への添字（下位 31 ビット）。暫定の相乗り
+/// （`Material` を `Copy` のまま、variant を増やさずに済ませるため。統一的な仕組みに載せ替えるまでの措置）。
+pub const NOISE_TEX_FLAG: TexId = 1 << 31;
 
 #[derive(Clone, Copy)]
 /// 積分器が対応するマテリアルモデル。各 variant が一つの BSDF を表す。
@@ -89,8 +95,18 @@ impl Material {
     /// **テクスチャの評価はここ 1 回だけ**にして、`sample` / `eval` はテクスチャを知らないままにする
     /// （BSDF の実装に UV やテクスチャ配列を持ち込まない）。積分器は交差ごとに 1 度これを呼ぶ。
     /// 添字が範囲外のときはテクスチャ無しとして扱う（読み込みに失敗したシーンでも落とさない）。
-    pub fn resolve_textures(self, textures: &[Texture], uv: (f64, f64)) -> Self {
+    ///
+    /// 手続き的ノイズ（`NOISE_TEX_FLAG` 付きの添字）は、UV ではなく交差点の**位置**で評価する（3D なので球の極や
+    /// UV の継ぎ目で破綻しない）。`p_of(local)` が位置を返す: `local` ならその物体の空間、そうでなければワールド空間。
+    /// ノイズを持つ材質のときだけ呼ばれる（物体空間への逆変換のコストを、ノイズを使わない材質に払わせない）。ノイズを使わない材質は、この分岐に入らず従来と同じ。
+    pub fn resolve_textures(self, textures: &[Texture], noises: &[NoiseTexture], p_of: impl FnOnce(bool) -> Vec3, uv: (f64, f64)) -> Self {
         match self {
+            Material::Lambert { albedo, albedo_tex: Some(id) } if id & NOISE_TEX_FLAG != 0 => {
+                match noises.get((id & !NOISE_TEX_FLAG) as usize) {
+                    Some(n) => Material::Lambert { albedo: albedo.hadamard(n.eval(p_of(n.local))), albedo_tex: None },
+                    None => Material::Lambert { albedo, albedo_tex: None },
+                }
+            }
             Material::Lambert { albedo, albedo_tex: Some(id) } => {
                 let tex = match textures.get(id as usize) {
                     Some(t) => t.sample(uv),

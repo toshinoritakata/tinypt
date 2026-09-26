@@ -38,6 +38,7 @@ pub mod exr;         // OpenEXR (.exr) 読み書き
 pub mod env;         // 環境マップの読み込みと重点的サンプリング
 pub mod texture;     // ビットマップテクスチャ（UV サンプリング）
 pub mod mtl;         // Wavefront MTL パーサ
+pub mod noise;       // 手続き的な 3D ソリッドノイズ（Perlin・大理石・木目・花崗岩）
 pub mod normal_map;  // ハイトマップ／ノーマルマップによる法線の摂動
 
 pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash, scene_hash_with_medium};
