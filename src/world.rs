@@ -319,6 +319,25 @@ fn sphere_world_bounds(s: &Sphere) -> Aabb {
     Aabb::empty().grow(s.c - e).grow(s.c + e)
 }
 
+/// 動く球の時刻 `t` の中心 `c0·(1−t) + c1·t` と、その丸め誤差の上界（成分ごとの L∞、余裕を見て γ(4)）。
+#[inline(always)]
+fn lerp_center(c0: Vec3, c1: Vec3, t: f64) -> (Vec3, f64) {
+    (c0 * (1.0 - t) + c1 * t, gamma(4) * c0.max_abs().max(c1.max_abs()))
+}
+
+/// 動く球の掃過ボリューム: シャッター区間の両端の中心に置いた球の箱の和。中心は時刻の**線形**関数なので、
+/// 区間の途中の球は両端の球の凸包に入り、箱は凸なのでこの和は**厳密に保守的**（回転のあるインスタンスと違って
+/// 途中で膨らまない）。補間の丸めぶん（`lerp_center` の誤差）を足す。
+fn moving_sphere_bounds(s: &Sphere, end: Vec3, shutter: (f64, f64)) -> Aabb {
+    let at = |t: f64| {
+        let (c, err) = lerp_center(s.c, end, t);
+        let b = sphere_world_bounds(&Sphere { c, ..*s });
+        let e = Vec3::new(err, err, err);
+        Aabb::empty().grow(b.min - e).grow(b.max + e)
+    };
+    at(shutter.0).union(at(shutter.1))
+}
+
 /// メッシュを `xform` で配置したインスタンスの、ワールド空間の保守的な境界ボックス。
 fn instance_world_bounds(mesh: &Mesh, xform: &Transform) -> Aabb {
     let mut b = Aabb::empty();
@@ -378,6 +397,8 @@ pub struct World {
     delta_lights: Vec<DeltaLight>,
     /// シャッター区間（アニメーション変換の掃過ボリュームを作るのに使う）
     shutter: (f64, f64),
+    /// 球ごとのシャッター閉じ時点の中心（`None` は静止）。**動く球が 1 つも無ければ空**で、静止球の経路は従来のまま
+    sphere_end: Vec<Option<Vec3>>,
 }
 
 /// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、それ以外は球 `k - n_inst`
@@ -408,6 +429,7 @@ impl World {
             tlas: OnceLock::new(),
             delta_lights: Vec::new(),
             shutter: (0.0, 1.0),
+            sphere_end: Vec::new(),
         }
     }
 
@@ -425,9 +447,12 @@ impl World {
     /// インスタンスはメッシュの BVH ルートの AABB の 8 頂点を変換して包む。
     pub fn bounds(&self) -> Aabb {
         let mut b = Aabb::empty();
-        for s in &self.spheres {
+        for (i, s) in self.spheres.iter().enumerate() {
             let r = Vec3::new(s.r, s.r, s.r);
             b = b.grow(s.c - r).grow(s.c + r);
+            if let Some(Some(end)) = self.sphere_end.get(i) {
+                b = b.grow(*end - r).grow(*end + r);
+            }
         }
         for inst in &self.instances {
             let Some(mesh) = self.meshes.get(inst.mesh_id) else { continue };
@@ -451,6 +476,31 @@ impl World {
         let idx = self.spheres.len();
         self.spheres.push(sphere);
         idx
+    }
+
+    /// 球 `idx` にシャッター閉じ時点の中心 `end` を与え、レイの `time`（0 = 開 = `Sphere::c`、1 = 閉）で**線形補間**する
+    /// 動く球にする。球は回転しても見た目が変わらず、スケールは半径で表せるので、必要なのは平行移動だけ
+    /// （インスタンスの `AnimatedTransform` は使わない）。`end` が非有限なら `false`（静止のまま）。
+    /// **発光する球には使わないこと**（光源サンプリングは時刻を見ないので、呼び出し側が警告して静止にする）。
+    pub fn set_sphere_end(&mut self, idx: usize, end: Vec3) -> bool {
+        if !(end.x.is_finite() && end.y.is_finite() && end.z.is_finite()) {
+            return false;
+        }
+        self.tlas = OnceLock::new();
+        self.sphere_end.resize(self.spheres.len(), None);
+        self.sphere_end[idx] = Some(end);
+        true
+    }
+
+    /// 球 `idx` の交差判定。動く球はレイの時刻で中心を補間してから解く（静止は従来と同じ `Sphere::hit`）。
+    #[inline(always)]
+    fn sphere_hit(&self, idx: usize, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        let s = &self.spheres[idx];
+        if let Some(Some(end)) = self.sphere_end.get(idx) {
+            let (c, err) = lerp_center(s.c, *end, r.time);
+            return s.hit_at(c, err, r, tmin, tmax);
+        }
+        s.hit(r, tmin, tmax)
     }
 
     /// 三角形群からメッシュを構築し、`xform` で配置したインスタンスを追加する。
@@ -598,7 +648,10 @@ impl World {
             .get_or_init(|| {
                 let mut bounds: Vec<Aabb> = Vec::with_capacity(n_prims);
                 bounds.extend(self.instances.iter().map(|i| i.world_bounds));
-                bounds.extend(self.spheres.iter().map(sphere_world_bounds));
+                bounds.extend(self.spheres.iter().enumerate().map(|(i, s)| match self.sphere_end.get(i) {
+                    Some(Some(end)) => moving_sphere_bounds(s, *end, self.shutter),
+                    _ => sphere_world_bounds(s),
+                }));
                 Some(Tlas { bvh: Bvh::build_from_bounds(&bounds, 1), n_inst: self.instances.len(), n_sph: self.spheres.len() })
             })
             .as_ref()?;
@@ -691,7 +744,7 @@ impl World {
                     let idx = k - tlas.n_inst;
                     // 同値タイで勝てる（添字が小さい）ときだけ、区間の上端をわずかに広げて t == closest の交差を拾う
                     let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
-                    if let Some(mut h) = self.spheres[idx].hit(r, tmin, hi) {
+                    if let Some(mut h) = self.sphere_hit(idx, r, tmin, hi) {
                         if h.t < c || (h.t == c && k < best_k) {
                             h.prim_id = idx;
                             closest.set(h.t);
@@ -723,8 +776,8 @@ impl World {
         }
 
         // Spheres
-        for (idx, s) in self.spheres.iter().enumerate() {
-            if let Some(mut h) = s.hit(r, tmin, closest) {
+        for idx in 0..self.spheres.len() {
+            if let Some(mut h) = self.sphere_hit(idx, r, tmin, closest) {
                 h.prim_id = idx;
                 closest = h.t;
                 best = Some(h);
@@ -845,7 +898,7 @@ impl World {
                     self.occluded_instance(k, r, inv_d, tmin, tmax, skip)
                 } else {
                     let idx = k - tlas.n_inst;
-                    skip != Some((None, idx)) && self.spheres[idx].hit(r, tmin, tmax).is_some()
+                    skip != Some((None, idx)) && self.sphere_hit(idx, r, tmin, tmax).is_some()
                 };
                 found
             });
@@ -864,11 +917,11 @@ impl World {
         }
 
         // Spheres
-        for (idx, s) in self.spheres.iter().enumerate() {
+        for idx in 0..self.spheres.len() {
             if skip == Some((None, idx)) {
                 continue;
             }
-            if s.hit(r, tmin, tmax).is_some() {
+            if self.sphere_hit(idx, r, tmin, tmax).is_some() {
                 return true;
             }
         }
@@ -3604,6 +3657,87 @@ mod tests {
         }
     }
 
+
+    // ---- 動く球（center_end）----
+
+    fn ray_at(o: Vec3, d: Vec3, time: f64) -> Ray {
+        Ray { o, d, time }
+    }
+
+    /// time = 0 / 0.5 / 1 で開・中間・閉の位置に当たり、他の位置では外れる。
+    #[test]
+    fn moving_sphere_hits_at_interpolated_center() {
+        let mut world = World::new();
+        let idx = world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 0.5, mat_id: 0 });
+        assert!(world.set_sphere_end(idx, Vec3::new(4.0, 0.0, 0.0)));
+        let down = Vec3::new(0.0, 0.0, -1.0);
+        let shoot = |x: f64, time: f64| world.hit(ray_at(Vec3::new(x, 0.0, 5.0), down, time), 1e-9, 1e30).is_some();
+        for (time, cx) in [(0.0, 0.0), (0.5, 2.0), (1.0, 4.0)] {
+            assert!(shoot(cx, time) && shoot(cx + 0.4, time) && shoot(cx - 0.4, time), "time {time}");
+            assert!(!shoot(cx + 0.6, time) && !shoot(cx - 0.6, time), "time {time}");
+        }
+        // 別の時刻の位置には当たらない
+        assert!(!shoot(4.0, 0.0) && !shoot(0.0, 1.0) && !shoot(2.0, 0.0));
+        // 非有限の終点は拒否して静止のまま
+        assert!(!world.set_sphere_end(idx, Vec3::new(f64::NAN, 0.0, 0.0)));
+    }
+
+    /// 掃過ボリュームの保守性: 動く球を含むシーンで、箱（TLAS）で棄却する通常経路と、箱の無い総当たり
+    /// （`hit_linear` / `occluded_linear`）が、ランダムなレイ × 時刻でビット単位で一致する。
+    /// プリミティブ数は TLAS の閾値（20）の前後、移動距離は半径より大きいものを含む。
+    #[test]
+    fn moving_sphere_sweep_bounds_are_conservative() {
+        let mut rng = Rng::new(2024);
+        let mut checked = 0;
+        for n in [3usize, 19, 20, 21, 60] {
+            let mut world = World::new();
+            for i in 0..n {
+                let c = Vec3::new(rng.next_f64() * 12.0 - 6.0, rng.next_f64() * 4.0 - 2.0, rng.next_f64() * 12.0 - 6.0);
+                let r = 0.2 + rng.next_f64() * 0.6;
+                let idx = world.add_sphere(Sphere { c, r, mat_id: 0 });
+                if i % 2 == 0 {
+                    let d = Vec3::new(rng.next_f64() * 8.0 - 4.0, rng.next_f64() * 4.0 - 2.0, rng.next_f64() * 8.0 - 4.0);
+                    world.set_sphere_end(idx, c + d);
+                }
+            }
+            world.set_shutter(0.1, 0.9);
+            for _ in 0..2500 {
+                let o = Vec3::new(rng.next_f64() * 20.0 - 10.0, rng.next_f64() * 8.0 - 4.0, rng.next_f64() * 20.0 - 10.0);
+                let target = Vec3::new(rng.next_f64() * 12.0 - 6.0, rng.next_f64() * 4.0 - 2.0, rng.next_f64() * 12.0 - 6.0);
+                let time = 0.1 + 0.8 * rng.next_f64();
+                let r = ray_at(o, (target - o).norm(), time);
+                assert_same_hit(world.hit(r, 1e-9, 1e30), world.hit_linear(r, 1e-9, 1e30), "sphere sweep");
+                let tmax = (target - o).len() * 1.2;
+                assert_eq!(world.occluded(r, 1e-9, tmax, None), world.occluded_linear(r, 1e-9, tmax, None), "occluded");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10_000);
+    }
+
+    /// `center_end` の無い球は、動く球が同じワールドにあってもビット一致（従来と同じ `Sphere::hit`）。
+    /// 開と閉が同じ中心なら、どの時刻でも静止とほぼ一致（補間の丸めだけ）。
+    #[test]
+    fn static_sphere_is_bit_identical_and_degenerate_move_is_static() {
+        let s = Sphere { c: Vec3::new(0.3, -0.2, 0.1), r: 0.9, mat_id: 0 };
+        let mut world = World::new();
+        let a = world.add_sphere(s);
+        let b = world.add_sphere(Sphere { c: Vec3::new(5.0, 0.0, 0.0), r: 1.0, mat_id: 0 });
+        world.set_sphere_end(b, Vec3::new(6.0, 1.0, 0.0));
+        let c = world.add_sphere(s);
+        world.set_sphere_end(c, s.c); // 開 = 閉
+        let mut rng = Rng::new(9);
+        for _ in 0..500 {
+            let o = Vec3::new(rng.next_f64() * 6.0 - 3.0, rng.next_f64() * 6.0 - 3.0, 4.0);
+            let r = ray_at(o, (Vec3::new(0.3, -0.2, 0.1) - o + Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, 0.0)).norm(), rng.next_f64());
+            assert_same_hit(world.sphere_hit(a, r, 1e-9, 1e30), s.hit(r, 1e-9, 1e30), "static");
+            match (world.sphere_hit(c, r, 1e-9, 1e30), s.hit(r, 1e-9, 1e30)) {
+                (None, None) => {}
+                (Some(x), Some(y)) => assert!((x.t - y.t).abs() < 1e-12 && (x.p - y.p).len() < 1e-12),
+                (x, y) => panic!("degenerate move differs: {:?} {:?}", x.map(|h| h.t), y.map(|h| h.t)),
+            }
+        }
+    }
 }
 
 /// クロージャの所要時間を測って `(結果, 経過)` を返す（構築時間の内訳表示用）。
@@ -3611,5 +3745,4 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
     let t0 = std::time::Instant::now();
     let v = f();
     (v, t0.elapsed())
-
 }

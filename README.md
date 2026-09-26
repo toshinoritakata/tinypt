@@ -6,9 +6,6 @@ Rust 製のモンテカルロパストレーサー。
 
 <table>
 <tr>
-<td colspan="3"><a href="docs/images/showcase_all.png"><img src="docs/images/showcase_all.png" alt="showcase.xml"></a><br>全機能の複合サンプル: パラメトリック形状・メッシュ共有・各種マテリアル・色/法線/バンプ/アルファのマップ・環境マップ・面光源・点/平行/スポット光源・参加媒質・モーションブラー・被写界深度。2048spp、1200x675、デノイズあり。<a href="sample/showcase.xml"><code>sample/showcase.xml</code></a></td>
-</tr>
-<tr>
 <td width="34%"><a href="docs/images/showcase_sponza_textured.png"><img src="docs/images/showcase_sponza_textured.png" alt="Sponza (textured)"></a><br>Crytek Sponza (262,267 三角形、テクスチャ + アルファマスク + バンプマップ)。512spp、1200x675、デノイズあり。<a href="sample/sponza_textured.xml"><code>sample/sponza_textured.xml</code></a></td>
 <td width="33%"><a href="docs/images/showcase_default.png"><img src="docs/images/showcase_default.png" alt="default.xml"></a><br>組み込みマテリアルサンプル (拡散・金属・GGX・ガラス)。2048spp、1200x675、デノイズあり。<a href="sample/default.xml"><code>sample/default.xml</code></a></td>
 <td width="33%"><a href="docs/images/showcase_rungholt.png"><img src="docs/images/showcase_rungholt.png" alt="Rungholt"></a><br>Rungholt (6,704,264 三角形)。512spp、1200x675、デノイズあり。<a href="sample/rungholt.xml"><code>sample/rungholt.xml</code></a></td>
@@ -275,7 +272,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | 要素 | 対応内容 |
 |---|---|
 | `<sensor type="perspective">` | `fov` / `fov_axis` / `to_world`(`lookat`) / `to_world_end`(`lookat`、独自拡張: カメラのモーションブラー、[詳細](#モーションブラー)) / `aperture_radius` / `focus_distance` (DOF、焦点は視線に垂直な平面) |
-| `<shape type="sphere">` | `center` / `radius` |
+| `<shape type="sphere">` | `center` / `radius` / `center_end` (独自拡張: モーションブラー、[詳細](#モーションブラー)) |
 | `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` + `face_normals` (下記) |
 | `<shape type="rectangle"\|"cube"\|"disk">` | Mitsuba 正準形メッシュ + `to_world` |
 | `<transform>` | `translate` / `rotate` (任意軸) / `scale` (均一・非均一) / `matrix` (4×4) |
@@ -380,14 +377,23 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - `to_world_end` と `filename_end` は**併用できる** (頂点の変形と変換の動きが両方効く)。
 - 開・閉どちらかの変換が**特異または鏡像** (行列式が負) のときは補間できないので、警告して静止のままにする。
 - `shutter_open > shutter_close` は入れ替え、`shutter_open == shutter_close` は時刻固定 (ブラー無し) で有効。範囲外は [0, 1] に収める (頂点モーションの鍵が時刻 0 と 1 のため)。
-- 動かせるのはメッシュ (`obj` / `rectangle` / `cube` / `disk`)。**球・面光源・カメラは動かせない** (警告して静止)。キーフレームは 2 つだけ。
+- 動かせるのはメッシュ (`obj` / `rectangle` / `cube` / `disk`)・**球**・カメラ。**面光源 (発光するメッシュ・球) は動かせない** (警告して静止)。キーフレームは 2 つだけ。
+- **球**は `<point name="center_end" .../>` (独自拡張) でシャッター閉じ時点の**中心**を与える。中心を time で**線形補間**するだけで、`to_world_end` は使えない (警告)。球は回転しても見た目が変わらず、拡大縮小は半径で表せるので、動きは平行移動だけで足りる。`radius` のアニメーションは未対応 (半径は固定)。`center_end` の無い球は出力がビット単位で変わらない。
+
+```xml
+<shape type="sphere">
+  <point name="center" x="0" y="0.27" z="0"/>
+  <float name="radius" value="0.27"/>
+  <point name="center_end" x="0.4" y="0.27" z="0.1"/>   <!-- 独自拡張。省略で静止 -->
+  <bsdf type="diffuse"/>
+</shape>
+```
 - 動くインスタンスは、レイごとに変換を補間して再合成するぶん静止より重い (`sample/motion.xml` で全体が約 5 割増し)。
 
 ### サンプル
 
 | ファイル | 内容 |
 |---|---|
-| `sample/showcase.xml` | **全機能の複合サンプル**。外部モデル不要 (テクスチャは `tools/gen_showcase_textures.py` で生成済みのものを同梱) |
 | `sample/default.xml` | 組み込みデフォルトシーン相当 (地面 + 球4個 + 球光源、背景は黒) |
 | `sample/mesh.xml` | OBJ メッシュ (立方体) + transform/instance |
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |

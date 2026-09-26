@@ -308,9 +308,17 @@ impl Sphere {
     /// q = −(b + sign(b)·√disc)、t = q/a と c/q で解く。各根について計算誤差の上界を見積もり、
     /// `t > 誤差上界`（真に正と言える）かつ [tmin, tmax] の近い方を採用する。交差点は球面上に
     /// 射影し直し（PBRT と同じ）、誤差上界 `p_error` を付ける。
+    #[inline]
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
-        let oc = r.o - self.c;
-        let oc_err = (r.o.abs() + self.c.abs()).max_abs() * gamma(1);
+        self.hit_at(self.c, 0.0, r, tmin, tmax)
+    }
+
+    /// 中心を `ctr`（`self.c` 以外でもよい）に置いた球との交差判定。モーションブラーする球は、呼び出し側が
+    /// レイの `time` で補間した中心を渡す。`ctr_err` は補間で `ctr` に乗る丸め誤差の上界（静止は 0。
+    /// `x + 0.0 == x` なので、静止球の結果は従来とビット単位で同じ）。
+    pub fn hit_at(&self, ctr: Vec3, ctr_err: f64, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+        let oc = r.o - ctr;
+        let oc_err = (r.o.abs() + ctr.abs()).max_abs() * gamma(1) + ctr_err;
         let a = r.d.dot(r.d);
         let b = oc.dot(r.d);
         let rr = self.r * self.r;
@@ -362,8 +370,8 @@ impl Sphere {
         if len > 0.0 {
             p_obj = p_obj * (self.r / len);
         }
-        let p = self.c + p_obj;
-        let p_error = p_obj.abs() * gamma(5) + (self.c.abs() + p_obj.abs()) * gamma(2);
+        let p = ctr + p_obj;
+        let p_error = p_obj.abs() * gamma(5) + (ctr.abs() + p_obj.abs()) * gamma(2) + Vec3::new(ctr_err, ctr_err, ctr_err);
         let n = p_obj / self.r;
         // 解析的な球なので幾何法線とシェーディング法線は同一（補間する頂点法線を持たない）
         Some(Hit { t, p, ng: n, ns: n, mat_id: self.mat_id, prim_id: 0, inst_id: None, p_error, bary: (0.0, 0.0), uv: Self::uv_at(n) })

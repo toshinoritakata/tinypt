@@ -780,9 +780,17 @@ fn parse_shape(
             let radius = el.float("radius").unwrap_or(1.0);
             push_material(mats, mat_maps, mat, map);
             if el.children.iter().any(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end")) {
-                warn("to_world_end on a sphere is unsupported (only mesh shapes can move); ignored");
+                warn("to_world_end on a sphere is unsupported (spheres move by <point name=\"center_end\"> only); ignored");
             }
-            world.add_sphere(Sphere { c: center, r: radius, mat_id });
+            let idx = world.add_sphere(Sphere { c: center, r: radius, mat_id });
+            // 独自拡張: シャッター閉じ時点の中心（線形補間）。発光する球は光源サンプリングが時刻を見ないので動かせない
+            if el.prop("point", "center_end").is_some() {
+                match el.point("center_end") {
+                    _ if is_emitter => warn("center_end on an area-light sphere is unsupported (the light would not move); ignored"),
+                    Some(end) if world.set_sphere_end(idx, end) => {}
+                    _ => warn("sphere center_end is invalid (needs finite x / y / z); the sphere stays static"),
+                }
+            }
             return;
         }
         // Mitsuba 正準形: 中心原点・法線 +Z・[-1,1]² の正方形
@@ -2900,5 +2908,38 @@ mod tests {
             let e = eye_at(&mut s, 1.0);
             assert!((e - Vec3::new(4.0, 1.0, 0.0)).len() < 1e-12 && e.x.is_finite(), "{end}");
         }
+    }
+
+    // ---- 球のモーション（center_end）----
+
+    fn sphere_end_scene(inner: &str) -> (Scene, Vec<String>) {
+        let xml = format!(r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor><shape type="sphere"><point name="center" x="0" y="0" z="0"/><float name="radius" value="0.5"/>{inner}</shape></scene>"#);
+        capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0)
+    }
+    fn hits_at(scene: &Scene, x: f64, time: f64) -> bool {
+        let r = Ray { o: Vec3::new(x, 0.0, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time };
+        scene.world.hit(r, 1e-9, 1e30).is_some()
+    }
+
+    /// `center_end` を読んで time で線形補間する。省略は静止、不正値・発光球は警告して静止。
+    #[test]
+    fn sphere_center_end_moves_and_bad_input_stays_static() {
+        let diffuse = r#"<bsdf type="diffuse"/>"#;
+        let (s, w) = sphere_end_scene(&format!(r#"{diffuse}<point name="center_end" x="4" y="0" z="0"/>"#));
+        assert!(w.is_empty(), "{w:?}");
+        assert!(hits_at(&s, 0.0, 0.0) && hits_at(&s, 2.0, 0.5) && hits_at(&s, 4.0, 1.0) && !hits_at(&s, 0.0, 1.0));
+        let (s, w) = sphere_end_scene(diffuse);
+        assert!(w.is_empty() && hits_at(&s, 0.0, 1.0) && !hits_at(&s, 4.0, 1.0));
+        // 不正（成分が足りない / 数値でない）: 警告 1 回で静止
+        let (s, w) = sphere_end_scene(&format!(r#"{diffuse}<point name="center_end" x="4" y="oops" z="0"/>"#));
+        assert_eq!(w.iter().filter(|m| m.contains("center_end")).count(), 1, "{w:?}");
+        assert!(hits_at(&s, 0.0, 1.0) && !hits_at(&s, 4.0, 1.0));
+        // 発光する球は動かせない
+        let (s, w) = sphere_end_scene(r#"<emitter type="area"><rgb name="radiance" value="1"/></emitter><point name="center_end" x="4" y="0" z="0"/>"#);
+        assert_eq!(w.iter().filter(|m| m.contains("center_end")).count(), 1, "{w:?}");
+        assert!(hits_at(&s, 0.0, 1.0) && !hits_at(&s, 4.0, 1.0));
+        // to_world_end は案内付きの警告
+        let (_, w) = sphere_end_scene(&format!(r#"{diffuse}<transform name="to_world_end"><translate x="1"/></transform>"#));
+        assert!(w.iter().any(|m| m.contains("center_end")), "{w:?}");
     }
 }
