@@ -102,6 +102,38 @@ impl Material {
         }
     }
 
+    /// `Ggx` の粗さだけを置き換えた材質（他はそのまま）。範囲 `[1e-3, 1]` への保護は呼び出し側（シェーダー）が行う。
+    pub fn with_alpha(self, alpha: f64) -> Self {
+        match self {
+            Material::Ggx { albedo, .. } => Material::Ggx { albedo, alpha },
+            other => other,
+        }
+    }
+
+    /// `Dielectric` の屈折率だけを置き換えた材質（他はそのまま）。
+    pub fn with_ior(self, ior: f64) -> Self {
+        match self {
+            Material::Dielectric { absorption, .. } => Material::Dielectric { ior, absorption },
+            other => other,
+        }
+    }
+
+    /// `Dielectric` の吸収だけを置き換えた材質（他はそのまま）。
+    pub fn with_absorption(self, absorption: Color) -> Self {
+        match self {
+            Material::Dielectric { ior, .. } => Material::Dielectric { ior, absorption },
+            other => other,
+        }
+    }
+
+    /// `DiffuseLight` の放射輝度だけを置き換えた材質（他はそのまま）。
+    pub fn with_emit(self, emit: Color) -> Self {
+        match self {
+            Material::DiffuseLight { .. } => Material::DiffuseLight { emit },
+            other => other,
+        }
+    }
+
     /// 発光体なら放射輝度を返す（`DiffuseLight` のみ `Some`）。
     pub fn emitted(&self) -> Option<Color> {
         match self {

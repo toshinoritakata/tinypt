@@ -188,7 +188,9 @@ pub fn radiance(
         // この後の `hit.ns` を見るので、両方が同じ摂動後の法線になる）。`ng` / `p` / `p_error` には触れない
         // （原点ずらし・表裏判定・光源の面積と pdf は幾何法線基準のまま）。
         let mut hit = hit;
-        if let Some(map_id) = shaders.normal_map(hit.mat_id) {
+        // 法線の摂動は列の順に適用する（バンプで凹凸を付けてからノーマルマップで細部、など）。各段が `face_forward` と
+        // `NS_NG_MIN` の判定を行うので、途中で退化した段は飛ばされて `ns` がそのまま次へ渡る。摂動なしの材質は空の列
+        for &map_id in shaders.normal_chain(hit.mat_id) {
             perturb_shading_normal(world, shaders, map_id, &mut hit, ray.time);
         }
         let hit = hit;
@@ -1737,6 +1739,42 @@ mod map_tests {
 
     fn down_ray(x: f64, y: f64) -> Ray {
         Ray { o: Vec3::new(x, y, 3.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 }
+    }
+
+    /// 法線マップの重ね掛け: バンプ + ノーマルの 2 枚が**順に**適用され（外側に書いた方が先）、1 枚だけのときとも
+    /// 逆順とも違う `ns` になる。`ng` / `p` は不変で `ns · ng > 0`、`ns` は単位。強い（z が負の）マップを重ねても保たれる。
+    #[test]
+    fn stacked_maps_apply_in_order_and_keep_ns_on_the_geometric_side() {
+        let dir = tmpdir();
+        write_png(&dir, "n.png", 1, 1, &[[230, 128, 190]]);
+        write_png(&dir, "h.png", 8, 1, &(0..8u8).map(|i| [i * 36; 3]).collect::<Vec<_>>());
+        write_png(&dir, "bad.png", 1, 1, &[[128, 128, 0]]); // z 成分 −1（地平線の下を向く強いマップ）
+        let normal = |f: &str, inner: &str| format!(r#"<bsdf type="normalmap"><texture type="bitmap" name="normalmap"><string name="filename" value="{f}"/></texture>{inner}</bsdf>"#);
+        let bump = |inner: &str| format!(r#"<bsdf type="bumpmap"><float name="scale" value="6"/><texture type="bitmap" name="bumpmap"><string name="filename" value="h.png"/><string name="wrap_mode" value="clamp"/></texture>{inner}</bsdf>"#);
+        let diffuse = r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.5,0.5,0.5"/></bsdf>"#;
+        let shade = |bsdf: &str| {
+            let s = scene(&plate_xml("", bsdf, ""), &dir);
+            let orig = s.world.hit(down_ray(0.3, 0.2), 0.0, 1e30).unwrap();
+            let mut h = orig;
+            let chain = s.shaders.normal_chain(h.mat_id).len();
+            for &id in s.shaders.normal_chain(h.mat_id) {
+                perturb_shading_normal(&s.world, &s.shaders, id, &mut h, 0.0);
+            }
+            let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+            assert_eq!((bits(h.ng), bits(h.p)), (bits(orig.ng), bits(orig.p)));
+            assert!(h.ns.dot(h.ng) > 0.0 && (h.ns.len() - 1.0).abs() < 1e-12, "ns が幾何法線の側にない / 単位でない");
+            (h.ns, chain)
+        };
+        let (bump_only, c1) = shade(&bump(diffuse));
+        let (normal_only, c2) = shade(&normal("n.png", diffuse));
+        let (bump_then_normal, c3) = shade(&bump(&normal("n.png", diffuse)));
+        let (normal_then_bump, c4) = shade(&normal("n.png", &bump(diffuse)));
+        assert_eq!((c1, c2, c3, c4), (1, 1, 2, 2));
+        assert!((bump_then_normal - bump_only).len() > 1e-3 && (bump_then_normal - normal_only).len() > 1e-3, "2 枚が効いていない");
+        assert!((bump_then_normal - normal_then_bump).len() > 1e-6, "順序が反映されていない");
+        // 地平線の下を向く強いマップを重ねても ns · ng > 0（shade 内の assert）
+        let _ = shade(&bump(&normal("bad.png", &normal("bad.png", diffuse))));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 摂動は `ns` だけを変える: `ng` / `p` / `p_error` はビット単位で不変で、`ns · ng > 0`、`ns` は単位。

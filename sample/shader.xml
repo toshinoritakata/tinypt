@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- シェーダーの式のデモ（tinypt の独自拡張。assets/ には依存しない）。
+       左  : 粗さをノイズで変調した金属（錆びのように、場所によって反射のぼけ方が変わる）
+       中央: 反射率を「錆の色 ↔ 金属色」のノイズの mix で塗った球（mix）
+       右奥: バンプ + ノーマルの重ね掛け（外側に書いた bumpmap が先、内側の normalmap が後）
+       床  : 画像（市松）× ノイズ（汚れ）の合成（mul）
+     texture の type: bitmap（Mitsuba 準拠）/ noise・mul・add・mix（独自拡張。Mitsuba には無い）。
+     パラメータごとにテクスチャを置ける: reflectance / specular_reflectance / alpha / int_ior / absorption。
+     テクスチャは tools/gen_shader_textures.py で生成した sample/textures/shader_*.png（コミット済み）。
+     使い方: tinypt --scene sample/shader.xml -o shader.png -->
+<scene version="3.0.0">
+  <integrator type="path"><integer name="max_depth" value="8"/><integer name="rr_depth" value="4"/></integrator>
+  <sampler type="independent"><integer name="sample_count" value="256"/></sampler>
+  <film type="hdrfilm"><integer name="width" value="1200"/><integer name="height" value="675"/></film>
+  <sensor type="perspective">
+    <float name="fov" value="36"/><string name="fov_axis" value="y"/>
+    <transform name="to_world"><lookat origin="0, 3.2, 8.5" target="0, 0.9, 0" up="0, 1, 0"/></transform>
+  </sensor>
+
+  <emitter type="envmap"><string name="filename" value="env.exr"/><float name="scale" value="0.3"/></emitter>
+
+  <!-- 床: 市松の画像 × 汚れのノイズ -->
+  <shape type="rectangle">
+    <transform name="to_world"><rotate x="1" angle="-90"/><scale x="7" y="5" z="1"/></transform>
+    <bsdf type="diffuse">
+      <texture type="mul" name="reflectance">
+        <texture type="bitmap"><string name="filename" value="textures/shader_color.png"/></texture>
+        <texture type="noise">
+          <string name="pattern" value="fbm"/><float name="scale" value="3.5"/><integer name="octaves" value="5"/>
+          <rgb name="color0" value="0.12"/><rgb name="color1" value="1.0"/>
+        </texture>
+      </texture>
+    </bsdf>
+  </shape>
+
+  <!-- 左: 粗さがノイズで変わる金属 -->
+  <shape type="sphere">
+    <point name="center" x="-2.6" y="1.1" z="0.4"/><float name="radius" value="1.1"/>
+    <bsdf type="roughconductor">
+      <rgb name="specular_reflectance" value="0.95, 0.72, 0.5"/>
+      <texture type="noise" name="alpha">
+        <string name="pattern" value="fbm"/><float name="scale" value="2.4"/><integer name="octaves" value="5"/>
+        <rgb name="color0" value="0.01"/><rgb name="color1" value="0.9"/>
+      </texture>
+    </bsdf>
+  </shape>
+
+  <!-- 中央: 錆の色 ↔ 金属色をノイズで混ぜる（mix） -->
+  <shape type="sphere">
+    <point name="center" x="0.2" y="1.0" z="1.4"/><float name="radius" value="1.0"/>
+    <bsdf type="roughconductor">
+      <float name="alpha" value="0.25"/>
+      <texture type="mix" name="specular_reflectance">
+        <rgb name="value" value="0.85, 0.85, 0.9"/>
+        <rgb name="value" value="0.55, 0.22, 0.1"/>
+        <texture type="noise"><string name="pattern" value="fbm"/><float name="scale" value="2.2"/><integer name="octaves" value="5"/><rgb name="color0" value="-0.4"/><rgb name="color1" value="1.6"/></texture>
+      </texture>
+    </bsdf>
+  </shape>
+
+  <!-- 右奥: バンプ（大きな凹凸）の上にノーマルマップ（細かいドーム）を重ねる -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="3.0" y="1.6" z="-1.6"/><rotate y="1" angle="-25"/><scale x="1.8" y="1.6" z="1"/></transform>
+    <bsdf type="bumpmap">
+      <float name="scale" value="6"/>
+      <texture type="bitmap" name="bumpmap"><string name="filename" value="textures/shader_height.png"/></texture>
+      <bsdf type="normalmap">
+        <texture type="bitmap" name="normalmap"><string name="filename" value="textures/shader_normal.png"/></texture>
+        <bsdf type="diffuse"><rgb name="reflectance" value="0.75, 0.7, 0.62"/></bsdf>
+      </bsdf>
+    </bsdf>
+  </shape>
+
+  <!-- 上方の面光源 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="-1" y="6" z="3"/><rotate x="1" angle="90"/><scale x="1.5" y="1.5" z="1"/></transform>
+    <emitter type="area"><rgb name="radiance" value="20, 19, 17"/></emitter>
+  </shape>
+</scene>

@@ -36,7 +36,7 @@ use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
 use crate::material::TexId;
-use crate::shader::{ShaderSet, TexRef};
+use crate::shader::{Exprs, ShaderSet, TexRef, ValueId, ValueNode};
 use crate::noise::{NoiseTexture, Pattern};
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
 use crate::constants::normal_map::MTL_BUMP_K;
@@ -186,6 +186,8 @@ thread_local! {
     static OBJ_PARSE_TIME: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
     /// 読み込み中の `<texture type="noise">`（`parse_leaf_bsdf` が積み、`Scene::noises` になる。引数を通さないための thread_local）
     static NOISES: std::cell::RefCell<Vec<NoiseTexture>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 読み込み中の式のアリーナ（`ShaderSet::values` になる。ノイズと同じく引数を通さないための thread_local）
+    static VALUES: std::cell::RefCell<Vec<ValueNode>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXTURE_LOAD_TIME: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
@@ -274,6 +276,7 @@ pub fn load_scene_from_str(
     OBJ_PARSE_TIME.with(|c| c.set(std::time::Duration::ZERO));
     TEXTURE_LOAD_TIME.with(|c| c.set(std::time::Duration::ZERO));
     NOISES.with(|n| n.borrow_mut().clear());
+    VALUES.with(|v| v.borrow_mut().clear());
     let root = parse_tree(xml)?;
     if root.tag != "scene" {
         return Err(err("root element is not <scene>"));
@@ -415,8 +418,9 @@ pub fn load_scene_from_str(
     shaders.textures = textures;
     shaders.noises = NOISES.with(|n| std::mem::take(&mut *n.borrow_mut()));
     shaders.normal_maps = normal_maps;
+    shaders.set_values(VALUES.with(|v| std::mem::take(&mut *v.borrow_mut())));
     for (m, e) in mats.iter().zip(&mat_maps) {
-        shaders.push(*m, e.tex, e.map);
+        shaders.push_shader(*m, e.exprs, &e.normals);
     }
     Ok((Scene { cam, world, shaders, env, medium, load_stats }, settings))
 }
@@ -787,7 +791,7 @@ fn parse_shape(
         "sphere" => {
             let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
             let radius = el.float("radius").unwrap_or(1.0);
-            push_material(mats, mat_maps, mat, map);
+            push_material(mats, mat_maps, mat, map.clone());
             if el.children.iter().any(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end")) {
                 warn("to_world_end on a sphere is unsupported (spheres move by <point name=\"center_end\"> only); ignored");
             }
@@ -828,7 +832,7 @@ fn parse_shape(
             // （`Hit.mat_id` と面光源の判定は mat_override を見る）
             if let Some(&mesh_id) = mtl_state.obj_cache.get(&key) {
                 let xform = shape_to_world(el);
-                push_material(mats, mat_maps, mat, map);
+                push_material(mats, mat_maps, mat, map.clone());
                 let inst_id = world.add_instance_of(mesh_id, xform, Some(mat_id));
                 apply_end_transform(el, world, inst_id, is_emitter);
                 return;
@@ -859,7 +863,7 @@ fn parse_shape(
 
     // to_world 変換（なければ恒等）でメッシュをインスタンス配置する。
     let xform = shape_to_world(el);
-    push_material(mats, mat_maps, mat, map);
+    push_material(mats, mat_maps, mat, map.clone());
     let inst_id = world.add_mesh_data_instance(mesh, xform, None);
     if let Some(key) = cache_key {
         mtl_state.obj_cache.insert(key, world.instance_mesh_id(inst_id));
@@ -900,12 +904,12 @@ fn push_material(mats: &mut Vec<Material>, mat_maps: &mut Vec<Extra>, mat: Mater
     mats.len() - 1
 }
 
-/// 材質ごとの、`Material`（BSDF の値）の外にある付随情報: 法線マップと、アルベドを変調するテクスチャ / ノイズ。
-/// ローダーの内部だけで使い、最後に `ShaderSet::push` で式（`Mul(Const, Texture | Noise)`）に組み立てる。
-#[derive(Clone, Copy, Default)]
+/// 材質ごとの、`Material`（BSDF の値）の外にある付随情報: パラメータの式（`VALUES` のアリーナへの添字）と、
+/// 法線マップの列（先に書いた = 外側のものが先）。ローダーの内部だけで使い、最後に `ShaderSet::push_shader` に渡す。
+#[derive(Clone, Default)]
 struct Extra {
-    map: Option<MapId>,
-    tex: Option<TexRef>,
+    exprs: Exprs,
+    normals: Vec<MapId>,
 }
 
 /// 法線マップの種別（キャッシュのキー）。
@@ -1010,7 +1014,7 @@ fn parse_obj_with_mtl(
                 Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }
             }
         };
-        push_material(mats, mat_maps, mat, maps[mi]);
+        push_material(mats, mat_maps, mat, maps[mi].clone());
     }
     for t in mesh.tris.iter_mut() {
         t.mat_id += base;
@@ -1171,14 +1175,18 @@ fn mtl_to_material(
     // ここでは扱わない（優先順位で解く）。
     if let Some(p) = m.map_kd.as_deref() {
         let tex = load_mtl_texture(dir, p, textures, state);
-        return (Material::Lambert { albedo: kd }, alpha, Extra { map, tex: tex.map(TexRef::Image) });
+        let albedo = tex.map(|t| {
+            let root = add_value(ValueNode::Texture(t));
+            mul_const(kd, root)
+        });
+        return (Material::Lambert { albedo: kd }, alpha, Extra { exprs: Exprs { albedo, ..Exprs::default() }, normals: map.into_iter().collect() });
     }
     if ks.luminance() > 0.05 && m.ns > 1.0 {
         // Blinn-Phong 指数 → GGX の粗さ: alpha = sqrt(2 / (Ns + 2))
         let rough = (2.0 / (m.ns + 2.0)).sqrt().clamp(1e-3, 1.0);
-        return (Material::Ggx { albedo: ks, alpha: rough }, alpha, Extra { map, tex: None });
+        return (Material::Ggx { albedo: ks, alpha: rough }, alpha, Extra { exprs: Exprs::default(), normals: map.into_iter().collect() });
     }
-    (Material::Lambert { albedo: kd }, alpha, Extra { map, tex: None })
+    (Material::Lambert { albedo: kd }, alpha, Extra { exprs: Exprs::default(), normals: map.into_iter().collect() })
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -1468,10 +1476,6 @@ fn parse_bsdf(
                     (default_mat(), Extra::default())
                 }
             };
-            if inner.map.is_some() {
-                // 1 材質スロットに 1 マップ: 外側を採用し、内側のマップは捨てる（登録済みの分は参照されないまま残る）
-                warn(&format!("nested {} inside {}; the outer map is used", el.typ(), el.typ()));
-            }
             let tex_el = wrapper_texture(el, if is_normal { "normalmap" } else { "bumpmap" });
             let map = tex_el.and_then(|t| {
                 let (path, wrap) = bitmap_source(t, base_dir)?;
@@ -1503,56 +1507,65 @@ fn parse_bsdf(
             match map {
                 Some(m) => {
                     normal_maps.push(m);
-                    (mat, Extra { map: Some((normal_maps.len() - 1) as MapId), tex: inner.tex })
+                    // 外側（先に書いた方）を先に適用し、内側のマップがその後に続く
+                    let mut normals = vec![(normal_maps.len() - 1) as MapId];
+                    normals.extend(inner.normals.iter().copied());
+                    (mat, Extra { exprs: inner.exprs, normals })
                 }
                 None => (mat, inner),
             }
         }
         _ => {
-            let (mat, tex) = parse_leaf_bsdf(el, base_dir, textures);
-            (mat, Extra { map: None, tex })
+            let (mat, exprs) = parse_leaf_bsdf(el, base_dir, textures);
+            (mat, Extra { exprs, normals: Vec::new() })
         }
     }
 }
 
 /// マップのラッパーではない通常の `bsdf` をマテリアルにマップする。
-fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> (Material, Option<TexRef>) {
-    let mut tex_ref: Option<TexRef> = None;
+fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> (Material, Exprs) {
+    let mut ex = Exprs::default();
+    let white = Color::new(1.0, 1.0, 1.0);
     let mat = match el.typ() {
         "diffuse" => {
-            // `reflectance` はテクスチャか定数色。テクスチャがある場合、定数色は色の倍率になる
+            // `reflectance` はテクスチャ（式）か定数色。テクスチャがある場合、定数色は色の倍率になる
             // （両方あれば掛け合わせる。片方だけなら他方は白 = 1 倍）。
-            let tex = el.prop("texture", "reflectance").and_then(|t| {
-                if t.typ() == "noise" {
-                    parse_noise_texture(t)
-                } else {
-                    parse_texture(t, base_dir, textures).map(TexRef::Image)
-                }
-            });
-            let default = if tex.is_some() { Color::new(1.0, 1.0, 1.0) } else { Color::new(0.5, 0.5, 0.5) };
-            tex_ref = tex;
-            Material::Lambert {
-                albedo: el.color("reflectance").unwrap_or(default),
-            }
+            let root = param_expr(el, "reflectance", base_dir, textures);
+            let default = if root.is_some() { white } else { Color::new(0.5, 0.5, 0.5) };
+            let albedo = el.color("reflectance").unwrap_or(default);
+            ex.albedo = root.map(|r| mul_const(albedo, r));
+            Material::Lambert { albedo }
         }
-        "conductor" => Material::Metal {
-            albedo: el.color("specular_reflectance").unwrap_or(Color::new(1.0, 1.0, 1.0)),
-        },
+        "conductor" => {
+            let root = param_expr(el, "specular_reflectance", base_dir, textures);
+            let albedo = el.color("specular_reflectance").unwrap_or(white);
+            ex.albedo = root.map(|r| mul_const(albedo, r));
+            Material::Metal { albedo }
+        }
         "roughconductor" => {
             let dist = el.string("distribution").unwrap_or("ggx");
             if dist != "ggx" {
                 warn(&format!("roughconductor distribution '{}' unsupported; using ggx", dist));
             }
-            Material::Ggx {
-                albedo: el.color("specular_reflectance").unwrap_or(Color::new(1.0, 1.0, 1.0)),
-                alpha: el.float("alpha").unwrap_or(0.1),
-            }
+            let root = param_expr(el, "specular_reflectance", base_dir, textures);
+            let albedo = el.color("specular_reflectance").unwrap_or(white);
+            ex.albedo = root.map(|r| mul_const(albedo, r));
+            // 粗さもテクスチャ（式）にできる（Mitsuba の roughconductor と同じ。式の第 1 成分が alpha）
+            ex.alpha = param_expr(el, "alpha", base_dir, textures);
+            Material::Ggx { albedo, alpha: el.float("alpha").unwrap_or(0.1) }
         }
         "dielectric" | "thindielectric" | "roughdielectric" => {
             let int_ior = el.float("int_ior").unwrap_or(1.5);
             let ext_ior = el.float("ext_ior").unwrap_or(1.0);
             // absorption は独自拡張（標準 Mitsuba は medium で表現）
             let absorption = el.color("absorption").unwrap_or(Color::new(0.0, 0.0, 0.0));
+            // 屈折率と吸収もテクスチャ（式）にできる。屈折率は int_ior / ext_ior なので、式の第 1 成分を ext_ior で割る
+            ex.ior = param_expr(el, "int_ior", base_dir, textures).map(|r| {
+                let k = add_value(ValueNode::Const(Color::new(1.0 / ext_ior, 1.0 / ext_ior, 1.0 / ext_ior)));
+                add_value(ValueNode::Mul(r, k))
+            });
+            let abs_root = param_expr(el, "absorption", base_dir, textures);
+            ex.absorption = abs_root.map(|r| mul_const(el.color("absorption").unwrap_or(white), r));
             Material::Dielectric { ior: int_ior / ext_ior, absorption }
         }
         other => {
@@ -1562,7 +1575,91 @@ fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -
             }
         }
     };
-    (mat, tex_ref)
+    (mat, ex)
+}
+
+/// 式のノードを読み込み中のアリーナ（`VALUES`）に足して添字を返す。
+fn add_value(node: ValueNode) -> ValueId {
+    VALUES.with(|v| {
+        let mut v = v.borrow_mut();
+        v.push(node);
+        (v.len() - 1) as ValueId
+    })
+}
+
+/// `Mul(Const(factor), root)`（定数の色はテクスチャ / 式の倍率）。
+fn mul_const(factor: Color, root: ValueId) -> ValueId {
+    let c = add_value(ValueNode::Const(factor));
+    add_value(ValueNode::Mul(c, root))
+}
+
+/// `<bsdf>` の子の `<texture name="...">` を式として読む（無ければ `None`）。
+fn param_expr(el: &Element, name: &str, base_dir: &Path, textures: &mut Vec<Texture>) -> Option<ValueId> {
+    el.prop("texture", name).and_then(|t| parse_expr(t, base_dir, textures, 0))
+}
+
+/// 式の入れ子の深さの上限（不正な入れ子で警告して止める）。
+const MAX_XML_EXPR_DEPTH: u32 = 16;
+
+/// `<texture>` を式のノードに変換して `VALUES` に積み、根の添字を返す。
+/// - `bitmap`（Mitsuba 準拠）/ `noise`（**独自拡張**）: 葉。
+/// - `mul` / `add` / `mix`（**独自拡張**。Mitsuba には無い）: 子（`<texture>` か定数の `<rgb>` / `<srgb>`）を組み合わせる。
+///   `mul` / `add` は 2 個以上（3 個以上は左から順に畳む）、`mix` は 2 個 + 3 個目の子か `<float name="weight">`（既定 0.5）が `t`。
+/// 子が足りない・型が不明・深すぎるときは警告して、読めた範囲（または `None`）に倒す。
+fn parse_expr(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>, depth: u32) -> Option<ValueId> {
+    if depth > MAX_XML_EXPR_DEPTH {
+        warn("texture expression nested too deeply; ignored");
+        return None;
+    }
+    match el.typ() {
+        "bitmap" => parse_texture(el, base_dir, textures).map(|id| add_value(ValueNode::Texture(id))),
+        "noise" => parse_noise_texture(el).map(|r| match r {
+            TexRef::Noise(id) => add_value(ValueNode::Noise(id)),
+            TexRef::Image(id) => add_value(ValueNode::Texture(id)),
+        }),
+        op @ ("mul" | "add" | "mix") => {
+            // 子は `<texture>`（入れ子の式）か、`<rgb>` / `<srgb>`（定数の色）。現れた順に並べる
+            let kids: Vec<ValueId> = el
+                .children
+                .iter()
+                .filter_map(|c| match c.tag.as_str() {
+                    "texture" => parse_expr(c, base_dir, textures, depth + 1),
+                    "rgb" | "srgb" => {
+                        let v = parse_vec3(c.attr("value")?)?;
+                        let col = if c.tag == "srgb" { Color::from_srgb(v.x, v.y, v.z) } else { Color::new(v.x, v.y, v.z) };
+                        Some(add_value(ValueNode::Const(col)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let need = 2;
+            if kids.len() < need {
+                warn(&format!("texture '{op}' needs at least {need} child textures (got {}); {}", kids.len(), if kids.is_empty() { "ignored" } else { "using the one it has" }));
+                return kids.first().copied();
+            }
+            match op {
+                "mul" => Some(kids[1..].iter().fold(kids[0], |acc, &k| add_value(ValueNode::Mul(acc, k)))),
+                "add" => Some(kids[1..].iter().fold(kids[0], |acc, &k| add_value(ValueNode::Add(acc, k)))),
+                _ => {
+                    if kids.len() > 3 {
+                        warn("texture 'mix' takes 2 textures and an optional third for the weight; the extra ones are ignored");
+                    }
+                    let t = match kids.get(2) {
+                        Some(&t) => t,
+                        None => {
+                            let w = el.float("weight").unwrap_or(0.5);
+                            add_value(ValueNode::Const(Color::new(w, w, w)))
+                        }
+                    };
+                    Some(add_value(ValueNode::Mix(kids[0], kids[1], t)))
+                }
+            }
+        }
+        other => {
+            warn(&format!("unsupported texture type '{other}', ignored"));
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2335,7 +2432,7 @@ mod tests {
     }
 
     /// ノーマルマップのテクスチャは raw（リニア）固定。`raw="false"` は警告して無視。
-    /// 内側の `<bsdf>` が無ければ diffuse + 警告。二重ラップは外側を採用して警告。
+    /// 内側の `<bsdf>` が無ければ diffuse + 警告。二重ラップは警告なしで順に重ね掛け（外側が先）。
     #[test]
     fn wrapper_warnings_and_raw_reading() {
         let raw_false = format!(
@@ -2363,10 +2460,9 @@ mod tests {
             n = NMAP, d = DIFF
         );
         map_scene(&nested, |s, w| {
-            assert!(w.iter().any(|m| m.contains("nested")), "{:?}", w);
-            assert_eq!(s.mat_maps().len(), 1);
-            // 外側のマップ（2 番目に登録されたもの）が使われる
-            assert_eq!(s.mat_maps()[0], Some(1));
+            // 入れ子は警告なしで重ね掛けになる: 外側（先に書いた方）が先、内側が後（登録順は内側が先なので [1, 0]）
+            assert!(!w.iter().any(|m| m.contains("nested")), "{:?}", w);
+            assert_eq!(s.shaders.normal_chain(0), &[1, 0]);
         });
     }
 
@@ -3087,5 +3183,108 @@ mod tests {
         let xml = r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor><shape type="sphere"><bsdf type="diffuse"><texture type="noise" name="reflectance"><string name="space" value="sideways"/></texture></bsdf></shape></scene>"#;
         let (s, w) = capture_warnings(|| load_scene_from_str(xml, Path::new("."), &cfg(), (None, None)).unwrap().0);
         assert!(s.shaders.noises[0].local && w.iter().any(|m| m.contains("noise space")), "{w:?}");
+    }
+
+    // ---- 式の記法（入れ子の <texture>、mul / add / mix、パラメータごとのテクスチャ）----
+
+    fn expr_scene(bsdf: &str) -> (Scene, Vec<String>) {
+        let xml = format!(r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor><shape type="sphere">{bsdf}</shape></scene>"#);
+        capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0)
+    }
+    const NOISE_A: &str = r#"<texture type="noise"><string name="pattern" value="fbm"/><float name="scale" value="3"/><rgb name="color0" value="0.1"/><rgb name="color1" value="0.9"/></texture>"#;
+    const NOISE_B: &str = r#"<texture type="noise"><string name="pattern" value="turbulence"/><float name="scale" value="5"/></texture>"#;
+
+    /// 粗さ（roughconductor の `alpha`）をノイズで変調できる: 評価した alpha が場所で変わり、[1e-3, 1] に収まる。
+    #[test]
+    fn roughness_can_be_a_noise_texture() {
+        let xml = r#"<bsdf type="roughconductor"><rgb name="specular_reflectance" value="0.9, 0.6, 0.4"/><texture type="noise" name="alpha"><string name="pattern" value="fbm"/><float name="scale" value="6"/><rgb name="color0" value="0.05"/><rgb name="color1" value="0.6"/></texture></bsdf>"#;
+        let (s, w) = expr_scene(xml);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(s.shaders.shaders[0].alpha.is_some() && s.shaders.shaders[0].albedo.is_none());
+        let mut seen = Vec::new();
+        for i in 0..40 {
+            match s.shaders.eval_at(0, &s.world, Vec3::new(0.13 * i as f64, 0.07 * i as f64, 0.3), (0.0, 0.0)) {
+                Material::Ggx { alpha, albedo } => {
+                    assert!((1e-3..=1.0).contains(&alpha) && (albedo.r() - 0.9).abs() < 1e-12);
+                    seen.push(alpha);
+                }
+                _ => panic!(),
+            }
+        }
+        let (lo, hi) = seen.iter().fold((1.0f64, 0.0f64), |(l, h), &a| (l.min(a), h.max(a)));
+        assert!(hi - lo > 0.1, "粗さが場所で変わっていない: {lo} .. {hi}");
+    }
+
+    /// `mul` / `add` / `mix` は子の `<texture>` を組み合わせ、評価は各ノイズの値の素直な式とビット一致。定数色は倍率のまま。
+    #[test]
+    fn mul_add_mix_compose_child_textures() {
+        let p = Vec3::new(0.4, 0.3, 0.2);
+        let a = |s: &Scene| s.shaders.noises[0].eval(p);
+        let b = |s: &Scene| s.shaders.noises[1].eval(p);
+        let bits = |c: Color| (c.r().to_bits(), c.g().to_bits(), c.b().to_bits());
+        let albedo = |s: &Scene| match s.shaders.eval_at(0, &s.world, p, (0.0, 0.0)) { Material::Lambert { albedo } => albedo, _ => panic!() };
+        let white = Color::new(1.0, 1.0, 1.0);
+        let mul = format!(r#"<bsdf type="diffuse"><texture type="mul" name="reflectance">{NOISE_A}{NOISE_B}</texture></bsdf>"#);
+        let (s, w) = expr_scene(&mul);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(bits(albedo(&s)), bits(white.hadamard(a(&s).hadamard(b(&s)))));
+        let add = format!(r#"<bsdf type="diffuse"><texture type="add" name="reflectance">{NOISE_A}{NOISE_B}</texture></bsdf>"#);
+        let (s, _) = expr_scene(&add);
+        assert_eq!(bits(albedo(&s)), bits(white.hadamard(a(&s) + b(&s))));
+        // mix: weight の float（既定 0.5）と、3 つ目の texture が t
+        let mix = format!(r#"<bsdf type="diffuse"><texture type="mix" name="reflectance">{NOISE_A}{NOISE_B}<float name="weight" value="0.25"/></texture></bsdf>"#);
+        let (s, _) = expr_scene(&mix);
+        assert_eq!(bits(albedo(&s)), bits(white.hadamard(a(&s) * 0.75 + b(&s) * 0.25)));
+        let mix_default = format!(r#"<bsdf type="diffuse"><texture type="mix" name="reflectance">{NOISE_A}{NOISE_B}</texture></bsdf>"#);
+        let (s, _) = expr_scene(&mix_default);
+        assert_eq!(bits(albedo(&s)), bits(white.hadamard(a(&s) * 0.5 + b(&s) * 0.5)));
+        // 定数の反射率は倍率として掛かる
+        let scaled = format!(r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.5, 1.0, 2.0"/><texture type="mul" name="reflectance">{NOISE_A}{NOISE_B}</texture></bsdf>"#);
+        let (s, _) = expr_scene(&scaled);
+        assert_eq!(bits(albedo(&s)), bits(Color::new(0.5, 1.0, 2.0).hadamard(a(&s).hadamard(b(&s)))));
+    }
+
+    /// 不正な記法（子が足りない・型が不明・深すぎる入れ子）は警告して読めた範囲に倒す（落とさない）。
+    #[test]
+    fn bad_expressions_warn_and_fall_back() {
+        let one_child = format!(r#"<bsdf type="diffuse"><texture type="mul" name="reflectance">{NOISE_A}</texture></bsdf>"#);
+        let (s, w) = expr_scene(&one_child);
+        assert!(w.iter().any(|m| m.contains("'mul' needs at least 2")), "{w:?}");
+        assert!(s.shaders.shaders[0].albedo.is_some(), "1 つは読めたのでそれを使う");
+        let none = r#"<bsdf type="diffuse"><texture type="add" name="reflectance"/></bsdf>"#;
+        let (s, w) = expr_scene(none);
+        assert!(w.iter().any(|m| m.contains("'add' needs at least 2")), "{w:?}");
+        assert!(s.shaders.shaders[0].albedo.is_none());
+        let unknown = r#"<bsdf type="diffuse"><texture type="checkerboard" name="reflectance"/></bsdf>"#;
+        let (s, w) = expr_scene(unknown);
+        assert!(w.iter().any(|m| m.contains("unsupported texture type 'checkerboard'")), "{w:?}");
+        assert!(s.shaders.shaders[0].albedo.is_none());
+        let mut deep = NOISE_A.to_string();
+        for _ in 0..19 {
+            deep = format!(r#"<texture type="mul">{deep}{NOISE_B}</texture>"#);
+        }
+        let deep = format!(r#"<texture type="mul" name="reflectance">{deep}{NOISE_B}</texture>"#);
+        let (_, w) = expr_scene(&format!(r#"<bsdf type="diffuse">{deep}</bsdf>"#));
+        assert!(w.iter().any(|m| m.contains("nested too deeply")), "{w:?}");
+        let too_many = format!(r#"<bsdf type="diffuse"><texture type="mix" name="reflectance">{NOISE_A}{NOISE_B}{NOISE_A}{NOISE_B}</texture></bsdf>"#);
+        let (_, w) = expr_scene(&too_many);
+        assert!(w.iter().any(|m| m.contains("'mix' takes 2 textures")), "{w:?}");
+    }
+
+    /// ガラスの屈折率・吸収と、金属の反射率もテクスチャ（式）にできる。
+    #[test]
+    fn other_parameters_take_textures() {
+        let glass = format!(r#"<bsdf type="dielectric"><float name="ext_ior" value="1.0"/><texture type="noise" name="int_ior"><string name="pattern" value="fbm"/><rgb name="color0" value="1.3"/><rgb name="color1" value="1.7"/></texture><texture type="noise" name="absorption"><string name="pattern" value="fbm"/></texture></bsdf>"#);
+        let (s, w) = expr_scene(&glass);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(s.shaders.shaders[0].ior.is_some() && s.shaders.shaders[0].absorption.is_some());
+        match s.shaders.eval_at(0, &s.world, Vec3::new(0.4, 0.3, 0.2), (0.0, 0.0)) {
+            Material::Dielectric { ior, absorption } => assert!((1.3..=1.7).contains(&ior) && absorption.r() >= 0.0),
+            _ => panic!(),
+        }
+        let metal = format!(r#"<bsdf type="conductor">{}</bsdf>"#, NOISE_A.replacen("<texture type=\"noise\">", "<texture type=\"noise\" name=\"specular_reflectance\">", 1));
+        let (s, w) = expr_scene(&metal);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(matches!(s.shaders.shaders[0].base, Material::Metal { .. }) && s.shaders.shaders[0].albedo.is_some());
     }
 }

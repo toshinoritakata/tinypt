@@ -121,6 +121,6 @@ fn push(mats: &mut Vec<Material>, m: Material) -> usize {
 impl Scene {
     /// テスト用: 材質ごとの法線マップの添字（`mat_id` 順）。
     pub fn mat_maps(&self) -> Vec<Option<crate::normal_map::MapId>> {
-        self.shaders.shaders.iter().map(|s| s.normal).collect()
+        (0..self.shaders.shaders.len()).map(|i| self.shaders.normal_map(i)).collect()
     }
 }

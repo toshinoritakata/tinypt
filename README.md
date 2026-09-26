@@ -134,6 +134,50 @@ Mitsuba 準拠のラッパー `bsdf` で、内側の `<bsdf>` に法線の摂動
 
 `twosided` の内側にも置ける。UV を持つメッシュ (OBJ・`rectangle`・`cube`・`disk`) にだけ効く (球や UV 無しは摂動しない)。バンプの強さは無次元で、モデルを一様に拡大縮小しても見た目が変わらない。Sponza の煉瓦のハイトマップでは `scale` 4〜16 で明瞭な凹凸になる。OBJ の MTL では `map_bump` (`-bm` 強度、既定 1) がハイトマップ、`norm` (拡張) がタンジェント空間ノーマルマップとして自動で効く (両方あれば `norm`)。強度は `-bm × 8` (Sponza で選んだ換算係数 `MTL_BUMP_K`)。
 
+**重ね掛け** (独自拡張): `normalmap` / `bumpmap` を**入れ子**にすると、複数のマップが順に適用される。**外側に書いたものが先**で、内側が後 (バンプで大きな凹凸を付けてからノーマルマップで細部、など)。各段で幾何法線との整合を保つので、強いマップを重ねても `ns · ng > 0` は保たれる。
+
+```xml
+<bsdf type="bumpmap">                 <!-- 先: 大きな凹凸 -->
+  <float name="scale" value="6"/>
+  <texture type="bitmap" name="bumpmap"><string name="filename" value="h.png"/></texture>
+  <bsdf type="normalmap">             <!-- 後: 細かい凹凸 -->
+    <texture type="bitmap" name="normalmap"><string name="filename" value="n.png"/></texture>
+    <bsdf type="diffuse"/>
+  </bsdf>
+</bsdf>
+```
+
+### シェーダーの式 (テクスチャの合成とパラメータごとのテクスチャ)
+
+**独自拡張**（`bitmap` 以外は Mitsuba に無い）。`<texture>` を入れ子にして式を作れて、材質のパラメータごとに置ける。
+
+| `<texture type=…>` | 意味 |
+|---|---|
+| `bitmap` | 画像 (Mitsuba 準拠) |
+| `noise` | 手続き的 3D ノイズ ([テクスチャ](#テクスチャ)) |
+| `mul` / `add` | 子の成分ごとの積 / 和。子は 2 個以上 (3 個以上は左から順に畳む)。子は `<texture>` か定数の `<rgb>` / `<srgb>` |
+| `mix` | `a·(1−t) + b·t`。子 2 個 + 3 個目の子か `<float name="weight">` (既定 0.5) が `t` (`t` は [0, 1] に収める) |
+
+- **パラメータ**: `diffuse` の `reflectance`、`conductor` / `roughconductor` の `specular_reflectance` と **`alpha` (粗さ)**、`dielectric` の `int_ior` / `absorption` に、式を置ける。定数の `<rgb>` を併記すると倍率として掛かる。
+- **スカラの取り出し**: `alpha` / `int_ior` / `mix` の `t` は式の**第 1 成分 (`r`)** を使う (グレースケールの画像やノイズはそのまま使える)。値域は保護される: `alpha` は [1e-3, 1]、`int_ior` は正、`absorption` は負にならない。
+- 不正な記法 (子が足りない・不明な型・深すぎる入れ子) は警告して、読めた範囲に倒す。
+- 放射輝度 (`emit`) の式は XML からは付けられない (光源のサンプリングは一様な放射輝度を前提にしているため)。
+- 例: [`sample/shader.xml`](sample/shader.xml) (粗さをノイズで変調した金属 / 錆の色 ↔ 金属色の `mix` / バンプ + ノーマルの重ね掛け / 画像 × ノイズの床)。テクスチャは `tools/gen_shader_textures.py` で生成した `sample/textures/shader_*.png`。
+
+```xml
+<bsdf type="roughconductor">
+  <rgb name="specular_reflectance" value="0.9, 0.6, 0.4"/>
+  <texture type="noise" name="alpha"><string name="pattern" value="fbm"/><float name="scale" value="6"/>
+    <rgb name="color0" value="0.05"/><rgb name="color1" value="0.6"/></texture>     <!-- 粗さがノイズで変わる -->
+</bsdf>
+<bsdf type="diffuse">
+  <texture type="mul" name="reflectance">                                            <!-- 画像 × ノイズ -->
+    <texture type="bitmap"><string name="filename" value="textures/shader_color.png"/></texture>
+    <texture type="noise"><string name="pattern" value="fbm"/></texture>
+  </texture>
+</bsdf>
+```
+
 ### GGX マイクロファセット
 
 物理ベースの光沢反射マテリアル。`Metal` の完全鏡面と異なり、表面の微細な凹凸（マイクロファセット）による粗さを表現する。
@@ -422,6 +466,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/env_scene.xml` | 環境マップ (`env.exr`) によるライティング |
 | `sample/cornell.xml` | Cornell box (rectangle/cube + 面光源)。`--tonemap none` 推奨 |
 | `sample/spotlight.xml` | スポットライト 2 灯 + 薄い霧。光の円錐と球・箱の影。光源は写らない ([詳細](#デルタ光源)) |
+| `sample/shader.xml` | シェーダーの式: 粗さをノイズで変調した金属・`mix` で塗った球・バンプ + ノーマルの重ね掛け・画像 × ノイズの床 ([詳細](#シェーダーの式-テクスチャの合成とパラメータごとのテクスチャ)) |
 | `sample/motion.xml` | モーションブラー: 静止した箱・回転する箱・横切りながら回る箱・変形するボール ([詳細](#モーションブラー)) |
 | `sample/fog.xml` | 天井のスリットから差し込む光がつくるゴッドレイ (光の筋)。部屋の中を霧 (`<medium>`) で満たす ([詳細](#参加媒質)) |
 | `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
