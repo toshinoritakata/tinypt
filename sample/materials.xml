@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- マテリアル一覧。カメラを旋回させて、反射・ハイライト・屈折が視点でどう動くかを見るためのシーン。
+     球を**円周上**に並べてあるのは、直線に並べると横から見たときに重なってしまうため。
+     旋回アニメーションは tools/render_orbit.py で作る（このファイル自体は 1 枚絵としても描ける）。 -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="16"/>
+    <integer name="rr_depth" value="5"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="512"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="960"/>
+    <integer name="height" value="540"/>
+  </film>
+
+  <!-- 旋回の既定位置。tools/render_orbit.py が origin をフレームごとに書き換える -->
+  <sensor type="perspective">
+    <float name="fov" value="38"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0.000, 3.150, 6.400" target="0, 0.55, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 環境マップ: 鏡面と GGX に映り込む像を与える。これが無いと金属が真っ黒になる -->
+  <emitter type="envmap">
+    <string name="filename" value="env.exr"/>
+    <float name="scale" value="0.32"/>
+  </emitter>
+
+  <!-- 床（十分に広く、視点を回しても縁が入らない大きさ） -->
+  <shape type="rectangle">
+    <transform name="to_world"><rotate x="1" angle="-90"/><scale x="14" y="14" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.20, 0.20, 0.22"/></bsdf>
+  </shape>
+
+  <!-- 面光源（真上）。ハイライトの位置が視点で動くのを見せる -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0" y="6.5" z="0"/><rotate x="1" angle="90"/><scale x="1.6" y="1.6" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0"/></bsdf>
+    <emitter type="area"><rgb name="radiance" value="42, 40, 36"/></emitter>
+  </shape>
+
+  <!-- Lambert（拡散） -->
+  <shape type="sphere">
+    <point name="center" x="2.035" y="0.62" z="1.175"/><float name="radius" value="0.62"/>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.80, 0.25, 0.20"/></bsdf>
+  </shape>
+  <!-- 完全鏡面の金属 -->
+  <shape type="sphere">
+    <point name="center" x="0.000" y="0.62" z="2.350"/><float name="radius" value="0.62"/>
+    <bsdf type="conductor"><rgb name="specular_reflectance" value="0.95, 0.95, 0.95"/></bsdf>
+  </shape>
+  <!-- GGX α=0.05（磨いた金） -->
+  <shape type="sphere">
+    <point name="center" x="-2.035" y="0.62" z="1.175"/><float name="radius" value="0.62"/>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.05"/><rgb name="specular_reflectance" value="0.95, 0.78, 0.35"/></bsdf>
+  </shape>
+  <!-- GGX α=0.30（曇った銅） -->
+  <shape type="sphere">
+    <point name="center" x="-2.035" y="0.62" z="-1.175"/><float name="radius" value="0.62"/>
+    <bsdf type="roughconductor"><string name="distribution" value="ggx"/><float name="alpha" value="0.30"/><rgb name="specular_reflectance" value="0.90, 0.55, 0.42"/></bsdf>
+  </shape>
+  <!-- 誘電体（透明ガラス） -->
+  <shape type="sphere">
+    <point name="center" x="-0.000" y="0.62" z="-2.350"/><float name="radius" value="0.62"/>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+  <!-- 誘電体 + 吸収（色ガラス） -->
+  <shape type="sphere">
+    <point name="center" x="2.035" y="0.62" z="-1.175"/><float name="radius" value="0.62"/>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/><rgb name="absorption" value="1.70, 0.35, 0.18"/></bsdf>
+  </shape>
+</scene>
