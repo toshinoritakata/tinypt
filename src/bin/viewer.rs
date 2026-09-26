@@ -112,6 +112,13 @@ impl Job {
 }
 
 /// 保存と同じ経路でリニア RGB を作る（蓄積を解決 → 必要ならデノイズ）。
+/// ブラウザ用のディレクトリ一覧: (サブフォルダ, `.xml` ファイル)、または読めなかった理由。
+type Listing = Result<(Vec<String>, Vec<String>), String>;
+
+fn scan(dir: &std::path::Path) -> Listing {
+    list_dir(dir).map_err(|e| e.to_string())
+}
+
 /// `dir` の中身を (サブフォルダ, `.xml` ファイル)（名前のみ）で返す。隠しエントリ（`.` で始まる名前）は出さず、
 /// 拡張子は大文字小文字を区別せず、どちらも名前の小文字順に並べる。読めないディレクトリはエラー。
 fn list_dir(dir: &std::path::Path) -> std::io::Result<(Vec<String>, Vec<String>)> {
@@ -270,7 +277,8 @@ struct App {
     message: String,
     one_to_one: bool,
     /// アプリ内のシーンブラウザ（`Some` の間だけ表示。中身は今見ているディレクトリ）
-    browser: Option<std::path::PathBuf>,
+    /// （見ているディレクトリ, その一覧）。一覧は開いたとき・移動したとき・Refresh のときだけ読み直す（毎フレーム読まない）
+    browser: Option<(std::path::PathBuf, Listing)>,
     /// 検証用フック（環境変数）
     autosave: Option<String>,
     cancel_at_tiles: Option<usize>,
@@ -677,7 +685,15 @@ impl eframe::App for App {
                     // アプリ内ブラウザの開閉（ネイティブのダイアログは非対象のファイルを隠せないので使わない）
                     self.browser = match self.browser {
                         Some(_) => None,
-                        None => self.scenes_dir.as_ref().and_then(|d| d.canonicalize().ok()).or_else(|| std::env::current_dir().ok()),
+                        None => self
+                            .scenes_dir
+                            .as_ref()
+                            .and_then(|d| d.canonicalize().ok())
+                            .or_else(|| std::env::current_dir().ok())
+                            .map(|d| {
+                                let l = scan(&d);
+                                (d, l)
+                            }),
                     };
                 }
                 if !self.scenes.is_empty() {
@@ -840,8 +856,8 @@ impl eframe::App for App {
             }
         });
 
-        if let Some(dir) = self.browser.clone() {
-            let (mut close, mut goto, mut open) = (ctx.input(|i| i.key_pressed(egui::Key::Escape)), None, None);
+        if let Some((dir, listing)) = &self.browser {
+            let (mut close, mut goto, mut open, mut refresh) = (ctx.input(|i| i.key_pressed(egui::Key::Escape)), None, None, false);
             egui::Window::new("Open scene").collapsible(false).default_size([440.0, 420.0]).show(ctx, |ui| {
                 ui.label(dir.display().to_string());
                 ui.separator();
@@ -849,16 +865,16 @@ impl eframe::App for App {
                     if dir.parent().is_some() && ui.selectable_label(false, "..").clicked() {
                         goto = dir.parent().map(std::path::Path::to_path_buf);
                     }
-                    match list_dir(&dir) {
+                    match listing {
                         Ok((dirs, xmls)) => {
                             for d in dirs {
                                 if ui.selectable_label(false, format!("{d}/")).clicked() {
-                                    goto = Some(dir.join(&d));
+                                    goto = Some(dir.join(d));
                                 }
                             }
                             for f in xmls {
-                                if ui.selectable_label(false, &f).clicked() {
-                                    open = Some(dir.join(&f));
+                                if ui.selectable_label(false, f).clicked() {
+                                    open = Some(dir.join(f));
                                 }
                             }
                         }
@@ -868,17 +884,27 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
-                if ui.button("Close").clicked() {
-                    close = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Refresh").clicked() {
+                        refresh = true;
+                    }
+                });
             });
+            let dir = dir.clone();
             if let Some(f) = open {
                 self.browser = None;
                 self.open_scene(Some(f.to_string_lossy().into_owned()));
             } else if close {
                 self.browser = None;
             } else if let Some(d) = goto {
-                self.browser = Some(d);
+                let l = scan(&d);
+                self.browser = Some((d, l));
+            } else if refresh {
+                let l = scan(&dir);
+                self.browser = Some((dir, l));
             }
         }
 
