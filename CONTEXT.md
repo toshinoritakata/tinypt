@@ -147,6 +147,10 @@ Every contribution added to a path's radiance — any emitter/background hit (MI
 A number that identifies "the same rendered output" for checkpoint compatibility. It is *derived* from the crate's `Cargo.toml` version (`major*1_000_000 + minor*1_000 + patch`, computed at compile time by the `const fn revision_from_version`) rather than tracked by hand — the version is the single source of truth. **Convention: same version ⇒ same pixels for the same scene/settings.** A change that alters the accumulation buffer (integrator, BSDF, sampling, the RNG sequence, …) means bumping `Cargo.toml`'s patch version; the golden tests in `render.rs` (`GOLDEN_REVISION` vs `RENDER_REVISION`) catch a forgotten bump. `checkpoint::scene_hash` mixes in `RENDER_REVISION` alone (not a separate version string — that would be the same information twice, since the revision already encodes the version losslessly).
 _Avoid_: a hand-maintained revision counter separate from the crate version.
 
+**Render probe** (`render::RenderProbe`, `render_observed`):
+A window onto a render in progress, used by the `viewer` binary (feature `viewer`). The main thread already merges finished tiles in task-id order; with a probe it also merges each tile into the probe's own buffer and bumps a tile counter, and workers check the probe's `cancel` flag between tiles. Byte-for-byte output is preserved because nothing about sampling changes — same tiles, same per-pixel seeds, same merge order — and the probe only *copies* merged tiles. With no probe (`render`, the CLI) the cost is one `Option` check per tile. A cancelled render returns the tiles merged so far (unmerged pixels have `acc_w = 0`, which `resolve_pixels` turns into black) and skips the final checkpoint. The viewer's preview goes through `resolve_pixels` and `ppm_bytes` — the same path as saving — never a separate tone map. The command-line parser lives in `cli` so `tinypt` and `viewer` share it.
+_Avoid_: a second accumulation path for display.
+
 ### Scene description
 
 **Scene file**:

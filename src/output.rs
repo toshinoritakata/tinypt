@@ -95,7 +95,7 @@ impl OutputFormat {
 }
 
 /// PPM の画素値（行優先、1 画素 R, G, B の 8bit）。露出補正 → トーンマップ → sRGB エンコード → 量子化。
-fn ppm_bytes(w: usize, h: usize, pixels: &[Color], settings: OutputSettings) -> Vec<u8> {
+pub fn ppm_bytes(w: usize, h: usize, pixels: &[Color], settings: OutputSettings) -> Vec<u8> {
     let scale = 2.0_f64.powf(settings.exposure);
     let mut bytes = Vec::with_capacity(w * h * 3);
     for y in 0..h {

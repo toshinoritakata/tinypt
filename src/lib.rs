@@ -32,6 +32,7 @@ pub mod checkpoint;  // レンダリング中間状態の永続化
 pub mod config;      // レンダリング設定
 pub mod scene;       // シーン構築
 pub mod mitsuba;     // Mitsuba XML シーンローダー
+pub mod cli;         // CLI / ビューア共通のコマンドライン解析
 pub mod render;      // マルチスレッド・レンダリング実行
 pub mod output;      // 画像出力（PPM / HDR / EXR）
 pub mod denoise;     // Intel OIDN デノイザー
@@ -46,7 +47,7 @@ pub mod normal_map;  // ハイトマップ／ノーマルマップによる法�
 
 pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash, scene_hash_with_medium};
 pub use config::{RenderConfig, Tonemap};
-pub use output::{resolve_pixels, OutputFormat, OutputSettings};
+pub use output::{ppm_bytes, resolve_pixels, OutputFormat, OutputSettings};
 pub use mitsuba::load_scene;
-pub use render::render;
+pub use render::{render, render_observed, RenderProbe};
 pub use scene::build_default_scene;

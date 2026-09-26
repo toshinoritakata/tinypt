@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crossbeam::scope;
@@ -55,6 +57,53 @@ impl RenderOutput {
                 self.acc_w[global_idx] += r.w[local_idx];
             }
         }
+    }
+}
+
+/// レンダリングの進捗を外から覗き、中断するための口（ビューア用）。
+///
+/// [`render_observed`] に渡すと、メインスレッドがタイルを（タスク ID 順に）マージするたびに、
+/// 同じタイルを覗き用のバッファへもマージする。**覗く相手がいない通常のレンダー（`probe = None`）では
+/// 何もしない**（タイルごとの分岐が 1 つ増えるだけで、サンプルの順序・乱数の消費・蓄積の値は不変）。
+pub struct RenderProbe {
+    /// `true` にするとワーカーはタイルの切れ目で止まる。マージ済みのバッファはそのまま有効。
+    pub cancel: AtomicBool,
+    /// マージ済みのタイル数
+    tiles_done: AtomicUsize,
+    /// タイルの総数（`render_observed` の開始時に設定される）
+    tiles_total: AtomicUsize,
+    /// 現在の蓄積バッファ（`render` 内の `out` と同じ内容）
+    buffers: Mutex<RenderOutput>,
+}
+
+impl RenderProbe {
+    /// `width` x `height` のレンダー用に、空のバッファで作る。
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            tiles_done: AtomicUsize::new(0),
+            tiles_total: AtomicUsize::new(0),
+            buffers: Mutex::new(RenderOutput {
+                acc: vec![Color::new(0.0, 0.0, 0.0); width * height],
+                acc_w: vec![0.0; width * height],
+            }),
+        }
+    }
+
+    /// `(マージ済みのタイル数, タイルの総数)`。
+    pub fn tiles(&self) -> (usize, usize) {
+        (self.tiles_done.load(Ordering::Relaxed), self.tiles_total.load(Ordering::Relaxed))
+    }
+
+    /// 現在の蓄積バッファを（ロックを握ったまま）`f` に渡す。`f` はすぐ返すこと。
+    pub fn with_buffers<R>(&self, f: impl FnOnce(&[Color], &[f64]) -> R) -> R {
+        let b = self.buffers.lock().unwrap();
+        f(&b.acc, &b.acc_w)
+    }
+
+    /// 完了したサンプルの総数（全画素の重みの合計。適応サンプリングでも正しい）。
+    pub fn samples_done(&self) -> f64 {
+        self.buffers.lock().unwrap().acc_w.iter().sum()
     }
 }
 
@@ -192,16 +241,40 @@ fn validate_resume(
 /// ワーカースレッド数は `available_parallelism` に従う。結果はスレッド数に依存しない
 /// （ピクセル単位のシードとタスク ID 順のマージによる）。
 pub fn render(scene: &Scene, config: &RenderConfig, ckpt_file: &str) -> std::io::Result<RenderOutput> {
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    render_with_threads(scene, config, ckpt_file, threads)
+    render_observed(scene, config, ckpt_file, None)
 }
 
-/// ワーカースレッド数を指定してレンダーする（[`render`] の本体。テストでスレッド数非依存性を確かめるため分離）。
+/// [`render`] に進捗の覗き口と中断（[`RenderProbe`]）を付けたもの。`probe = None` なら `render` と同一。
+///
+/// 中断（`probe.cancel`）されたときは、タスク ID 順にマージ済みのタイルまでが入ったバッファを返す
+/// （マージされなかった画素は `acc_w = 0`。チェックポイントの最終保存は行わない）。
+pub fn render_observed(
+    scene: &Scene,
+    config: &RenderConfig,
+    ckpt_file: &str,
+    probe: Option<&RenderProbe>,
+) -> std::io::Result<RenderOutput> {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    render_impl(scene, config, ckpt_file, threads, probe)
+}
+
+/// ワーカースレッド数を指定してレンダーする（テストでスレッド数非依存性を確かめるため分離）。
+#[cfg(test)]
 fn render_with_threads(
     scene: &Scene,
     config: &RenderConfig,
     ckpt_file: &str,
     threads: usize,
+) -> std::io::Result<RenderOutput> {
+    render_impl(scene, config, ckpt_file, threads, None)
+}
+
+fn render_impl(
+    scene: &Scene,
+    config: &RenderConfig,
+    ckpt_file: &str,
+    threads: usize,
+    probe: Option<&RenderProbe>,
 ) -> std::io::Result<RenderOutput> {
     let threads = threads.max(1);
     let w = config.width;
@@ -233,6 +306,14 @@ fn render_with_threads(
                 ckpt_file, resume_next_id
             );
         }
+    }
+
+    if let Some(p) = probe {
+        p.tiles_total.store(tid, Ordering::Relaxed);
+        p.tiles_done.store(resume_next_id, Ordering::Relaxed);
+        let mut b = p.buffers.lock().unwrap();
+        b.acc.copy_from_slice(&out.acc);
+        b.acc_w.copy_from_slice(&out.acc_w);
     }
 
     // タスク配布用チャネル (tx→rx) と結果回収用チャネル (rtx→rrx)
@@ -270,6 +351,10 @@ fn render_with_threads(
             sp.spawn(move |_| {
                 // ワーカーループ: チャネルからタスクを受信し処理
                 while let Ok(t) = rx.recv() {
+                    // 覗き口があり中断が要求されていたら、タイルの切れ目で止まる
+                    if probe.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
+                        break;
+                    }
                     let tile_w = t.x1 - t.x0;
                     let tile_h = t.y1 - t.y0;
                     let mut sum = vec![Color::new(0.0, 0.0, 0.0); tile_w * tile_h];
@@ -316,13 +401,18 @@ fn render_with_threads(
         }
 
         for _ in 0..remaining {
-            let r = rrx.recv().unwrap();
+            // 通常は全タスクの結果が届く。中断でワーカーが先に止まったときだけ Err（ここで打ち切る）
+            let Ok(r) = rrx.recv() else { break };
             pending.insert(r.id, r);
 
             // Merge any consecutive ready tiles.
             while let Some(r) = pending.remove(&next_id) {
                 out.merge_tile(&r, w);
                 next_id += 1;
+                if let Some(p) = probe {
+                    p.buffers.lock().unwrap().merge_tile(&r, w);
+                    p.tiles_done.store(next_id, Ordering::Relaxed);
+                }
 
                 // 進捗表示（PROGRESS_INTERVAL_MSごと、または完了時）
                 let now = Instant::now();
@@ -348,8 +438,8 @@ fn render_with_threads(
     })
     .unwrap();
 
-    // Final checkpoint
-    if ckpt_enabled {
+    // Final checkpoint（中断されたレンダーは未完なので保存しない）
+    if ckpt_enabled && !probe.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
         if let Err(e) = save_checkpoint(ckpt_file, config.scene_hash, w, h, tid, &out.acc, &out.acc_w) {
             eprintln!("Final checkpoint save failed: {}", e);
         }
@@ -644,7 +734,7 @@ mod tests {
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
     /// `RENDER_REVISION` は `Cargo.toml` の `version` から導出されるので、実質的には
     /// 「このハッシュを記録したときの `Cargo.toml` のバージョン」を数値で持っているのと同じ。
-    const GOLDEN_REVISION: u32 = 14000;
+    const GOLDEN_REVISION: u32 = 15000;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
