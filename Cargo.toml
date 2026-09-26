@@ -1,13 +1,13 @@
 [package]
 name = "tinypt"
-version = "0.15.0"
+version = "0.17.0"
 edition = "2024"
 
 [features]
 default = ["oidn"]
 oidn = ["dep:oidn"]
 # GUI ビューア（`viewer` バイナリ）。egui / eframe は重いので既定には入れない
-viewer = ["dep:eframe"]
+viewer = ["dep:eframe", "dep:rfd"]
 
 [dependencies]
 crossbeam = "0.8"
@@ -17,6 +17,7 @@ exr = "1.7"
 quick-xml = "0.37"
 oidn = { version = "2.5.1", optional = true }
 eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts"] }
+rfd = { version = "0.15", optional = true }
 
 [[bin]]
 name = "tinypt"

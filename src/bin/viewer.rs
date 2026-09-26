@@ -7,10 +7,26 @@
 //! 表示画像は保存と同じ経路（`resolve_pixels` → `ppm_bytes` = 露出 → トーンマップ → sRGB → 8bit）で作る。
 //! 表示用に別のトーンマップは持たない。デノイズはプレビューには掛けず、保存時に CLI と同じ扱いで掛ける。
 //!
-//! 検証用フック（環境変数）: `TINYPT_VIEWER_AUTOSAVE=PATH` は完了・中断の後に保存ボタンと同じ処理で保存し、
+//! シーンは `Open…`（ネイティブのダイアログ）、パス欄、同じディレクトリの一覧から開ける。切り替えは
+//! 「走っているレンダーを止める → ワーカーの終了を待つ → 読み込む → 描く」を新しいスレッドの中で行うので、
+//! UI スレッドは止まらず、古いワーカーが新しい画面に書き込むこともない。読み込みに失敗したら直前の表示を保つ。
+//!
+//! 設定は 2 種類に分けてある。**A（やり直し不要）**: トーンマップ・露出・デノイズの ON/OFF は蓄積バッファを
+//! そのまま `resolve_pixels` / `OutputSettings` に渡し直すだけ（動かした瞬間に反映。レンダーには触らない）。
+//! **B（やり直し）**: spp・解像度・シード・適応サンプリングは「適用」で、シーン切り替えと同じ
+//! `open_scene`（止める → ワーカー終了を待つ → 読む → 描く）を通る。
+//!
+//! 検証用フック（環境変数）: `TINYPT_VIEWER_VIEW=exposure=1.5;tonemap=none;denoise=0` は
+//! `TINYPT_VIEWER_VIEW_AT_TILES=N`（既定 0）タイルで A の値を GUI の状態に設定し、
+//! `TINYPT_VIEWER_APPLY=spp=8;res=160x90;seed=2` は最初の描画開始後に B の欄へ入れて「適用」と同じ処理を呼ぶ。
+//! `TINYPT_VIEWER_AUTOSAVE=PATH` は完了・中断の後に保存ボタンと同じ処理で保存し、
 //! `TINYPT_VIEWER_CANCEL_AT_TILES=N` は N タイルのマージ後に中断する。
+//! `TINYPT_VIEWER_OPEN=A;B;…` と `TINYPT_VIEWER_SAVE_DIR=DIR` は、最初のシーンの完了後に（ボタンと同じ
+//! `open_scene` で）順に開き、完了するたびに `DIR/<番号>_<名前>.ppm` へ保存する。
+//! `TINYPT_VIEWER_SWITCH_AT_TILES=N` を足すと、完了を待たず N タイルで次へ切り替える。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +34,7 @@ use eframe::egui;
 use tinypt::cli::{load_with_overrides, parse_args, CliOverrides, USAGE};
 use tinypt::math::Color;
 use tinypt::{
-    denoise, ppm_bytes, render_observed, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, RenderProbe,
+    denoise, ppm_bytes, render_observed, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, RenderProbe, Tonemap,
 };
 
 /// レンダー用スレッドの状態（GUI が読む）。
@@ -33,14 +49,22 @@ enum Phase {
 struct Job {
     phase: Arc<Mutex<Phase>>,
     cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    /// このジョブが開くシーン（`None` は組み込みシーン）
+    path: Option<String>,
 }
 
 impl Job {
-    fn start(config: RenderConfig, overrides: Arc<CliOverrides>) -> Self {
+    /// `prev`（前のジョブのスレッド）が完全に終わるのを**新しいスレッドの中で**待ってから読み込む。
+    fn start(config: RenderConfig, overrides: Arc<CliOverrides>, prev: Option<JoinHandle<()>>) -> Self {
+        let path = config.scene_path.clone();
         let phase = Arc::new(Mutex::new(Phase::Loading));
         let cancel = Arc::new(AtomicBool::new(false));
         let (p, c) = (phase.clone(), cancel.clone());
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
+            if let Some(h) = prev {
+                let _ = h.join();
+            }
             let mut config = config;
             let scene = match load_with_overrides(&mut config, &overrides) {
                 Ok(s) => s,
@@ -68,7 +92,7 @@ impl Job {
                 Err(e) => Phase::Failed(format!("render failed: {e}")),
             };
         });
-        Job { phase, cancel }
+        Job { phase, cancel, handle: Some(handle), path }
     }
 
     fn cancel(&self) {
@@ -95,26 +119,145 @@ enum Snap {
     Failed(String),
 }
 
+/// プレビュー（GL テクスチャ）に載せられる 1 辺の上限。GUI の解像度欄はこれ以下に丸める。
+const PREVIEW_MAX: usize = 8192;
+
+/// A: 表示・保存の後処理（変えてもレンダーは続く）。
+#[derive(Clone, Copy, PartialEq)]
+struct View {
+    tonemap: Tonemap,
+    exposure: f64,
+    denoise: bool,
+}
+
+/// B: 変えるとやり直しになる設定。`edit`（欄の値）と `active`（いま走っているレンダーの値）を分けて持つ。
+#[derive(Clone, Copy, PartialEq)]
+struct Opts {
+    spp: usize,
+    width: usize,
+    height: usize,
+    seed: u64,
+    adaptive: bool,
+    adaptive_min: usize,
+    threshold: f64,
+}
+
+impl Opts {
+    fn of(c: &RenderConfig) -> Self {
+        Self {
+            spp: c.spp,
+            width: c.width,
+            height: c.height,
+            seed: c.seed,
+            adaptive: c.adaptive_enabled,
+            adaptive_min: c.adaptive_min_spp,
+            threshold: c.adaptive_threshold,
+        }
+    }
+
+    /// 不正な値を丸める。丸めたものを警告として返す（落とさない）。
+    fn clamped(mut self) -> (Self, Vec<String>) {
+        let mut w = Vec::new();
+        if self.spp == 0 {
+            self.spp = 1;
+            w.push("spp 0 → 1".to_string());
+        }
+        for (v, name) in [(&mut self.width, "width"), (&mut self.height, "height")] {
+            if *v == 0 || *v > PREVIEW_MAX {
+                let c = (*v).clamp(1, PREVIEW_MAX);
+                w.push(format!("{name} {v} → {c} (viewer accepts 1..={PREVIEW_MAX})"));
+                *v = c;
+            }
+        }
+        if self.adaptive_min == 0 {
+            self.adaptive_min = 1;
+            w.push("adaptive min spp 0 → 1".to_string());
+        }
+        if !self.threshold.is_finite() || self.threshold < 0.0 {
+            self.threshold = 0.02;
+            w.push("adaptive threshold → 0.02".to_string());
+        }
+        (self, w)
+    }
+}
+
 struct App {
     base: RenderConfig,
+    view: View,
+    /// 最後にテクスチャへ反映した (トーンマップ, 露出) — 変わったら蓄積はそのままで作り直す
+    shown_view: Option<(Tonemap, u64)>,
+    edit: Opts,
+    active: Opts,
+    /// 現在のジョブの config で `edit` / `active` を同期したか
+    opts_synced: bool,
+    opts_note: String,
+    view_hook: Option<String>,
+    view_hook_at: usize,
+    apply_hook: Option<String>,
+    /// 検証フック: `TINYPT_VIEWER_EDIT`（B の欄を入れるだけ）と `TINYPT_VIEWER_SHOTS=N:path;…`
+    /// （N タイルに達したらビューア自身のウィンドウを PNG に保存する。OS のスクリーンキャプチャは使わない）
+    edit_hook: Option<String>,
+    shots: Vec<(usize, String)>,
+    shot_path: Option<String>,
     overrides: Arc<CliOverrides>,
     job: Job,
     texture: Option<egui::TextureHandle>,
     /// 最後にテクスチャへ反映したタイル数（変化が無ければ作り直さない）
     shown_tiles: Option<usize>,
+    /// 直前に表示できていたレンダー（読み込みに失敗したときの保存・表示に使う）
+    last: Option<(Arc<RenderProbe>, Arc<RenderConfig>)>,
+    path_input: String,
+    /// 現在のシーンと同じディレクトリの `*.xml`
+    scenes: Vec<String>,
+    scenes_dir: Option<std::path::PathBuf>,
     save_path: String,
     message: String,
     one_to_one: bool,
     /// 検証用フック（環境変数）
     autosave: Option<String>,
     cancel_at_tiles: Option<usize>,
+    /// 検証用: 順に開くシーン、保存先、途中で切り替えるタイル数、次に開く番号
+    seq: Vec<String>,
+    seq_next: usize,
+    seq_dir: Option<String>,
+    switch_at_tiles: Option<usize>,
+    seq_saved: bool,
 }
 
 impl App {
     fn new(base: RenderConfig, overrides: CliOverrides) -> Self {
         let overrides = Arc::new(overrides);
-        let job = Job::start(base.clone(), overrides.clone());
+        let job = Job::start(base.clone(), overrides.clone(), None);
         Self {
+            view: View { tonemap: base.tonemap, exposure: base.exposure, denoise: base.denoise_enabled },
+            shown_view: None,
+            edit: Opts::of(&base),
+            active: Opts::of(&base),
+            opts_synced: false,
+            opts_note: String::new(),
+            view_hook: std::env::var("TINYPT_VIEWER_VIEW").ok(),
+            view_hook_at: std::env::var("TINYPT_VIEWER_VIEW_AT_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            apply_hook: std::env::var("TINYPT_VIEWER_APPLY").ok(),
+            edit_hook: std::env::var("TINYPT_VIEWER_EDIT").ok(),
+            shots: std::env::var("TINYPT_VIEWER_SHOTS")
+                .map(|v| {
+                    v.split(';')
+                        .filter_map(|e| e.split_once(':').and_then(|(n, p)| Some((n.parse().ok()?, p.to_string()))))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            shot_path: None,
+            last: None,
+            path_input: base.scene_path.clone().unwrap_or_default(),
+            scenes: Vec::new(),
+            scenes_dir: None,
+            seq: std::env::var("TINYPT_VIEWER_OPEN")
+                .map(|v| v.split(';').filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default(),
+            seq_next: 0,
+            seq_dir: std::env::var("TINYPT_VIEWER_SAVE_DIR").ok(),
+            switch_at_tiles: std::env::var("TINYPT_VIEWER_SWITCH_AT_TILES").ok().and_then(|v| v.parse().ok()),
+            seq_saved: false,
             save_path: base.output_path.clone(),
             base,
             overrides,
@@ -128,12 +271,93 @@ impl App {
         }
     }
 
-    fn reload(&mut self) {
+    /// シーンを開いて描き始める（`Open…`・パス欄・一覧・`Reload`・検証フックが共通で使う唯一の入口）。
+    ///
+    /// 走っているジョブに中断を掛け、そのスレッドを新しいジョブのスレッドへ渡す（終了を待つのはそちら。
+    /// UI は待たない）。CLI 由来の上書き（`--res` / `--spp` など）は `load_with_overrides` が同じ規則で適用する。
+    /// 表示中のテクスチャは、新しいシーンが描き始めるまで（失敗したらそのまま）残す。
+    fn open_scene(&mut self, path: Option<String>) {
         self.job.cancel();
-        self.job = Job::start(self.base.clone(), self.overrides.clone());
-        self.texture = None;
-        self.shown_tiles = None;
+        let prev = self.job.handle.take();
+        let mut config = self.base.clone();
+        config.scene_path = path.clone();
+        self.job = Job::start(config, self.overrides.clone(), prev);
+        if let Some(p) = &path {
+            self.path_input = p.clone();
+        }
         self.message.clear();
+        self.opts_synced = false;
+    }
+
+    /// B の「適用」: 欄の値を丸めて検証し、スペックを上書きとして記録してからシーンを開き直す（= やり直し）。
+    /// 変えた項目だけを CLI と同じ「上書き」にする（変えていない解像度・spp はシーンファイルの値に従い続ける）。
+    fn apply_opts(&mut self) {
+        let (e, warns) = self.edit.clamped();
+        self.edit = e;
+        self.opts_note = if warns.is_empty() { String::new() } else { format!("adjusted: {}", warns.join(", ")) };
+        let mut ov = CliOverrides { spp: self.overrides.spp, width: self.overrides.width, height: self.overrides.height, help: false };
+        if e.spp != self.active.spp {
+            ov.spp = Some(e.spp);
+            self.base.spp = e.spp;
+        }
+        if e.width != self.active.width || e.height != self.active.height {
+            ov.width = Some(e.width);
+            ov.height = Some(e.height);
+            self.base.width = e.width;
+            self.base.height = e.height;
+        }
+        self.base.seed = e.seed;
+        self.base.adaptive_enabled = e.adaptive;
+        self.base.adaptive_min_spp = e.adaptive_min;
+        self.base.adaptive_threshold = e.threshold;
+        self.overrides = Arc::new(ov);
+        let p = self.job.path.clone();
+        self.open_scene(p);
+    }
+
+    /// 検証フック用: `key=value;…` を A の状態（`view`）または B の欄（`edit`）へ入れる。GUI の欄と同じ変数を触る。
+    fn set_from_spec(&mut self, spec: &str) {
+        for kv in spec.split(';').filter(|s| !s.is_empty()) {
+            let Some((k, v)) = kv.split_once('=') else { continue };
+            match k {
+                "exposure" => self.view.exposure = v.parse().ok().filter(|x: &f64| x.is_finite()).unwrap_or(self.view.exposure),
+                "tonemap" => self.view.tonemap = Tonemap::from_str(v).unwrap_or(self.view.tonemap),
+                "denoise" => self.view.denoise = v != "0",
+                "spp" => self.edit.spp = v.parse().unwrap_or(self.edit.spp),
+                "seed" => self.edit.seed = v.parse().unwrap_or(self.edit.seed),
+                "adaptive" => self.edit.adaptive = v != "0",
+                "res" => {
+                    if let Some((w, h)) = v.split_once('x') {
+                        self.edit.width = w.parse().unwrap_or(self.edit.width);
+                        self.edit.height = h.parse().unwrap_or(self.edit.height);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 一覧用に、`path` と同じディレクトリの `*.xml` を集める（ディレクトリが変わったときだけ）。
+    fn refresh_scene_list(&mut self, path: &str) {
+        let dir = std::path::Path::new(path).parent().map(|d| if d.as_os_str().is_empty() { ".".into() } else { d.to_path_buf() });
+        if dir == self.scenes_dir {
+            return;
+        }
+        self.scenes = dir
+            .as_ref()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| {
+                let mut v: Vec<String> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        self.scenes_dir = dir;
     }
 
     fn snapshot(&self) -> Snap {
@@ -159,8 +383,8 @@ impl App {
 
     /// 現在のバッファを既存の出力経路で保存する（拡張子でフォーマット。デノイズは CLI と同じ設定に従う）。
     fn save(&mut self, probe: &RenderProbe, config: &RenderConfig) {
-        let pixels = resolved_pixels(probe, config, config.denoise_enabled);
-        let settings = OutputSettings { exposure: config.exposure, tonemap: config.tonemap };
+        let pixels = resolved_pixels(probe, config, self.view.denoise);
+        let settings = OutputSettings { exposure: self.view.exposure, tonemap: self.view.tonemap };
         let path = self.save_path.clone();
         self.message = match OutputFormat::from_path(&path).write(&path, config.width, config.height, &pixels, settings) {
             Ok(()) => format!("saved {path}"),
@@ -174,6 +398,98 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let snap = self.snapshot();
         let running = matches!(snap, Snap::Loading | Snap::Live { finished: false, .. });
+        if let Snap::Live { probe, config, .. } = &snap {
+            self.last = Some((probe.clone(), config.clone()));
+        }
+        if let Some(p) = self.job.path.clone() {
+            self.refresh_scene_list(&p);
+        }
+        // 走り始めたレンダーの config を B の欄へ反映（適用後は同じ値、シーンを開いたときはシーンの値）
+        if let (Snap::Live { config, .. }, false) = (&snap, self.opts_synced) {
+            self.active = Opts::of(config);
+            self.edit = self.active;
+            self.opts_synced = true;
+            if let Some(spec) = self.edit_hook.take() {
+                self.set_from_spec(&spec);
+            }
+            if let Some(spec) = self.apply_hook.take() {
+                self.set_from_spec(&spec);
+                self.apply_opts();
+            }
+        }
+        // 検証フック: スクリーンショット（要求 → 次のフレームで Event::Screenshot が届く）
+        if let Some(path) = self.shot_path.clone() {
+            let got = ctx.input(|i| {
+                i.raw.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(img) = got {
+                let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                let r = image::save_buffer(&path, &rgba, img.size[0] as u32, img.size[1] as u32, image::ColorType::Rgba8);
+                eprintln!("[hook] screenshot {path}: {:?}", r.map_err(|e| e.to_string()));
+                self.shot_path = None;
+            }
+        } else if let (Snap::Live { probe, .. }, Some((n, _))) = (&snap, self.shots.first()) {
+            if probe.tiles().0 >= *n {
+                let (_, path) = self.shots.remove(0);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                self.shot_path = Some(path);
+            }
+        }
+        // 検証フック（A）: 指定タイル数で view を変える。レンダーは触らない
+        if let (Snap::Live { probe, elapsed, .. }, true) = (&snap, self.view_hook.is_some()) {
+            let t = probe.tiles().0;
+            if t >= self.view_hook_at {
+                let spec = self.view_hook.take().unwrap();
+                eprintln!("[hook] A-change '{}' at tiles={} elapsed={:.2}s", spec, t, elapsed.as_secs_f64());
+                self.set_from_spec(&spec);
+            }
+        }
+
+        // 検証用フック: 順に開く。完了（または指定タイル数）で次へ。失敗したら直前の表示を保存して次へ
+        if !self.seq.is_empty() || self.seq_dir.is_some() {
+            let idx = self.seq_next;
+            let mut advance = false;
+            match &snap {
+                Snap::Live { probe, config, finished, cancelled, .. } => {
+                    if *finished && !*cancelled && !self.seq_saved {
+                        if let Some(dir) = self.seq_dir.clone() {
+                            let stem = std::path::Path::new(self.job.path.as_deref().unwrap_or("builtin"))
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            self.save_path = format!("{dir}/{idx}_{stem}.ppm");
+                            self.save(probe, config);
+                        }
+                        self.seq_saved = true;
+                    }
+                    match self.switch_at_tiles {
+                        Some(n) if !*finished && probe.tiles().0 >= n => advance = true,
+                        _ => advance = *finished && self.seq_saved,
+                    }
+                }
+                Snap::Failed(_) if !self.seq_saved => {
+                    if let (Some(dir), Some((probe, config))) = (self.seq_dir.clone(), self.last.clone()) {
+                        self.save_path = format!("{dir}/{idx}_failed_kept.ppm");
+                        self.save(&probe, &config);
+                    }
+                    self.seq_saved = true;
+                    advance = true;
+                }
+                _ => {}
+            }
+            if advance {
+                if let Some(next) = self.seq.get(self.seq_next).cloned() {
+                    self.seq_next += 1;
+                    self.seq_saved = false;
+                    self.open_scene(Some(next));
+                } else if matches!(snap, Snap::Live { finished: true, .. }) {
+                    self.seq_dir = None; // 全部済んだ
+                }
+            }
+        }
 
         // 検証用フック
         if let Snap::Live { probe, config, finished, .. } = &snap {
@@ -194,22 +510,56 @@ impl eframe::App for App {
         // 画像の更新: 進捗が進んだときだけ resolve → ppm_bytes（保存と同じ経路）でテクスチャを作り直す
         if let Snap::Live { probe, config, .. } = &snap {
             let tiles = probe.tiles().0;
-            if self.shown_tiles != Some(tiles) {
+            let view_key = (self.view.tonemap, self.view.exposure.to_bits());
+            if config.width.max(config.height) > PREVIEW_MAX {
+                self.texture = None; // GL のテクスチャ上限を超える（進捗と保存は使える）
+            } else if self.shown_tiles != Some(tiles) || self.shown_view != Some(view_key) {
                 let pixels = resolved_pixels(probe, config, false);
-                let settings = OutputSettings { exposure: config.exposure, tonemap: config.tonemap };
+                let settings = OutputSettings { exposure: self.view.exposure, tonemap: self.view.tonemap };
                 let rgb = ppm_bytes(config.width, config.height, &pixels, settings);
                 let img = egui::ColorImage::from_rgb([config.width, config.height], &rgb);
                 self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::NEAREST));
                 self.shown_tiles = Some(tiles);
+                self.shown_view = Some(view_key);
             }
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("scene:");
-                ui.monospace(self.base.scene_path.as_deref().unwrap_or("(built-in)"));
+                let edit = ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(360.0).hint_text("path to a .xml scene"));
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Load").clicked() || enter) && !self.path_input.trim().is_empty() {
+                    let p = self.path_input.trim().to_string();
+                    self.open_scene(Some(p));
+                }
+                if ui.button("Open…").clicked() {
+                    let mut dlg = rfd::FileDialog::new().add_filter("Mitsuba XML scene", &["xml"]);
+                    if let Some(d) = self.scenes_dir.as_ref().and_then(|d| d.canonicalize().ok()) {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(f) = dlg.pick_file() {
+                        self.open_scene(Some(f.to_string_lossy().into_owned()));
+                    }
+                }
+                if !self.scenes.is_empty() {
+                    let mut picked = None;
+                    let cur = self.job.path.clone().unwrap_or_default();
+                    egui::ComboBox::from_id_salt("scenes").selected_text("scenes…").show_ui(ui, |ui| {
+                        for sc in &self.scenes {
+                            let name = std::path::Path::new(sc).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            if ui.selectable_label(*sc == cur, name).clicked() {
+                                picked = Some(sc.clone());
+                            }
+                        }
+                    });
+                    if let Some(sc) = picked {
+                        self.open_scene(Some(sc));
+                    }
+                }
                 if ui.button("Reload").clicked() {
-                    self.reload();
+                    let p = self.job.path.clone();
+                    self.open_scene(p);
                 }
                 if ui.add_enabled(running, egui::Button::new("Abort")).clicked() {
                     self.job.cancel();
@@ -218,10 +568,13 @@ impl eframe::App for App {
             });
             ui.horizontal(|ui| match &snap {
                 Snap::Loading => {
-                    ui.label("loading scene…");
+                    ui.label(format!("loading {}…", self.job.path.as_deref().unwrap_or("built-in scene")));
                 }
                 Snap::Failed(m) => {
                     ui.colored_label(egui::Color32::LIGHT_RED, m);
+                    if self.last.is_some() {
+                        ui.weak("(showing the previous scene)");
+                    }
                 }
                 Snap::Live { probe, config, elapsed, finished, cancelled } => {
                     let px = (config.width * config.height) as f64;
@@ -247,9 +600,13 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("save to:");
                 ui.text_edit_singleline(&mut self.save_path);
-                if let Snap::Live { probe, config, .. } = &snap {
+                let target = match &snap {
+                    Snap::Live { probe, config, .. } => Some((probe.clone(), config.clone())),
+                    _ => self.last.clone(),
+                };
+                if let Some((probe, config)) = target {
                     if ui.button("Save").clicked() {
-                        self.save(probe, config);
+                        self.save(&probe, &config);
                     }
                 }
                 if self.base.denoise_enabled {
@@ -258,6 +615,78 @@ impl eframe::App for App {
                 ui.label(&self.message);
             });
             ui.weak("Preview is the raw accumulation — not denoised. Denoise (if enabled) is applied only when saving.");
+        });
+
+        egui::SidePanel::left("opts").resizable(false).default_width(230.0).show(ctx, |ui| {
+            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), egui::RichText::new("View — applies instantly").strong());
+            ui.weak("Re-displays the current accumulation. The render keeps running.");
+            ui.horizontal(|ui| {
+                ui.label("tonemap");
+                egui::ComboBox::from_id_salt("tm")
+                    .selected_text(if self.view.tonemap == Tonemap::Aces { "aces" } else { "none" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.view.tonemap, Tonemap::Aces, "aces");
+                        ui.selectable_value(&mut self.view.tonemap, Tonemap::None, "none");
+                    });
+            });
+            let prev = self.view.exposure;
+            ui.horizontal(|ui| {
+                ui.label("exposure EV");
+                ui.add(egui::DragValue::new(&mut self.view.exposure).speed(0.05).range(-20.0..=20.0));
+            });
+            if !self.view.exposure.is_finite() {
+                self.view.exposure = if prev.is_finite() { prev } else { 0.0 };
+            }
+            if cfg!(feature = "oidn") {
+                ui.checkbox(&mut self.view.denoise, "denoise on save");
+                ui.weak("(preview is never denoised)");
+            } else {
+                ui.add_enabled(false, egui::Checkbox::new(&mut self.view.denoise, "denoise on save"));
+                ui.weak("built without the oidn feature");
+            }
+            ui.separator();
+            let orange = egui::Color32::from_rgb(230, 160, 70);
+            ui.colored_label(orange, egui::RichText::new("Render — Apply restarts").strong());
+            ui.weak("Discards the accumulation and re-renders from scratch.");
+            let e = &mut self.edit;
+            egui::Grid::new("b").num_columns(2).show(ui, |ui| {
+                ui.label("spp");
+                ui.add(egui::DragValue::new(&mut e.spp).range(1..=1_000_000));
+                ui.end_row();
+                ui.label("width");
+                ui.add(egui::DragValue::new(&mut e.width).range(1..=PREVIEW_MAX));
+                ui.end_row();
+                ui.label("height");
+                ui.add(egui::DragValue::new(&mut e.height).range(1..=PREVIEW_MAX));
+                ui.end_row();
+                ui.label("seed");
+                ui.add(egui::DragValue::new(&mut e.seed));
+                ui.end_row();
+                ui.label("adaptive");
+                ui.checkbox(&mut e.adaptive, "");
+                ui.end_row();
+                ui.label("  min spp");
+                ui.add_enabled(e.adaptive, egui::DragValue::new(&mut e.adaptive_min).range(1..=1_000_000));
+                ui.end_row();
+                ui.label("  threshold");
+                ui.add_enabled(e.adaptive, egui::DragValue::new(&mut e.threshold).speed(0.001).range(0.0..=10.0));
+                ui.end_row();
+            });
+            let dirty = self.edit != self.active;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(dirty, egui::Button::new("Apply (restart)")).clicked() {
+                    self.apply_opts();
+                }
+                if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
+                    self.edit = self.active;
+                }
+            });
+            if dirty {
+                ui.colored_label(orange, "pending changes — not applied yet");
+            }
+            if !self.opts_note.is_empty() {
+                ui.colored_label(egui::Color32::LIGHT_RED, &self.opts_note);
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -277,7 +706,7 @@ impl eframe::App for App {
         });
 
         // 実行中は約 10 Hz で覗く。終了後は入力があるときだけ再描画（自動保存フックの待ちを除く）
-        if running || self.autosave.is_some() {
+        if running || self.autosave.is_some() || !self.seq.is_empty() || !self.shots.is_empty() || self.shot_path.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -296,7 +725,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]).with_title("tinypt viewer"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 680.0]).with_title("tinypt viewer"),
         ..Default::default()
     };
     eframe::run_native("tinypt viewer", options, Box::new(move |_cc| Ok(Box::new(App::new(config, overrides)))))
