@@ -79,7 +79,7 @@ impl RenderConfig {
             checkpoint_enabled: false,
             checkpoint_every_tasks: 128,
             scene_hash: 0x4859503000000001u64, // プレースホルダ（'HYP0' は旧プロジェクト名 Hyperion の名残）
-            output_path: "out.ppm".to_string(),
+            output_path: "out.png".to_string(),
             env_map_path: None,
             scene_path: None,
             denoise_enabled: true,

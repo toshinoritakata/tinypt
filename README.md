@@ -244,7 +244,7 @@ cargo run --release -- [オプション]
 
 以下の例はリポジトリのルートで実行する前提。
 
-未知のオプション、数値として解釈できない値 (`--exposure` / `--adaptive-threshold` の NaN・無限大を含む)、値の欠落は stderr に `Warning:` を出して無視する (終了コードは変わらない)。`--spp 0` / `--adaptive-min-spp 0` は警告して 1 にする。`-h` / `--help` で使い方を表示して終了する (レンダーしない)。**引数なしで起動した場合も同じく、バージョン・有効な feature・使い方を表示して終了する** (組み込みシーンを描くには何かフラグを 1 つ付ける。例: `tinypt -o out.ppm`)。
+未知のオプション、数値として解釈できない値 (`--exposure` / `--adaptive-threshold` の NaN・無限大を含む)、値の欠落は stderr に `Warning:` を出して無視する (終了コードは変わらない)。`--spp 0` / `--adaptive-min-spp 0` は警告して 1 にする。`-h` / `--help` で使い方を表示して終了する (レンダーしない)。**引数なしで起動した場合も同じく、バージョン・有効な feature・使い方を表示して終了する** (組み込みシーンを描くには何かフラグを 1 つ付ける。例: `tinypt -o out.png`)。
 
 描画前に、読み込んだシーンの内容と所要時間の内訳を stderr に出す。大きなシーンでは BVH 構築が支配的になるので、起動が遅いときの切り分けに使える:
 
@@ -263,7 +263,7 @@ Loaded in 2.81s (obj parse 0.91s, mesh + BVH build 1.87s, textures 0.00s)
 | `--spp N` | 512 | サンプル数 (samples per pixel) |
 | `--width N` / `--height N` | シーン既定 | 画像サイズ (1〜65536)。シーンファイルの `<film>` を上書きする。片方だけ指定すると、もう片方は `<film>` の値が残る |
 | `--res WxH` | — | 幅と高さを同時に指定 (`--res 1920x1080`)。優先順位は `--width` / `--height` と同じで、後に書いた方が勝つ |
-| `-o, --out PATH` | `out.ppm` | 出力ファイル (拡張子で形式を自動判定) |
+| `-o, --out PATH` | `out.png` | 出力ファイル (拡張子で形式を自動判定) |
 | `--env PATH` | — | HDR/EXR 環境マップ。**組み込みシーンのみ有効** (`--scene` 時は無視され XML の `<emitter>` が使われる)。読み込み失敗時は警告して空のグラデーションにフォールバック |
 | `--no-env` | — | それ以前に指定した `--env` を取り消す (デフォルトも未指定＝手続き的な空) |
 | `--denoise` / `--no-denoise` | 有効 | Intel OIDN デノイズ |
@@ -320,7 +320,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 
 ```bash
 # PPM に 1024 spp でレンダリング
-./target/release/tinypt --spp 1024 -o output.ppm
+./target/release/tinypt --spp 1024 -o output.png
 
 # EXR 出力 + 環境マップ使用 (組み込みシーン)
 ./target/release/tinypt --spp 2048 -o output.exr --env sample/env.exr
@@ -329,7 +329,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 ./target/release/tinypt --no-denoise --adaptive --spp 4096 -o output.hdr
 
 # Mitsuba XML シーンを読み込んでレンダリング
-./target/release/tinypt --scene sample/default.xml -o output.ppm
+./target/release/tinypt --scene sample/default.xml -o output.png
 ```
 
 ## メッシュの共有と TLAS
@@ -354,7 +354,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 `--scene` で [Mitsuba レンダラー](https://www.mitsuba-renderer.org/) の XML シーン記述のサブセットを読み込める（未指定時は組み込みのデフォルトシーン）。採用理由は [`docs/adr/0002`](docs/adr/0002-mitsuba-xml-scene-format.md) を参照。
 
 ```bash
-./target/release/tinypt --scene sample/default.xml -o output.ppm
+./target/release/tinypt --scene sample/default.xml -o output.png
 ```
 
 ### 対応要素
@@ -507,7 +507,7 @@ OBJ は 100 万三角形で 30MB を超えるためリポジトリには入っ�
 ```bash
 python3 tools/gen_highpoly.py                   # 既定: シーン全体で約 100 万三角形
 python3 tools/gen_highpoly.py --tris 5000000    # 三角形数を変える (100 万 → 500 万)
-./target/release/tinypt --scene sample/highpoly.xml --spp 128 -o renders/highpoly.ppm
+./target/release/tinypt --scene sample/highpoly.xml --spp 128 -o renders/highpoly.png
 ```
 
 生成先は `assets/highpoly/` (`.gitignore` の `*.obj` で無視される。`sample/` は
@@ -525,8 +525,8 @@ OBJ が無いまま実行すると shape ごとに `failed to load obj ...; skip
 ```bash
 tools/fetch_models.sh                # 両方 (既に展開済みならスキップ)
 tools/fetch_models.sh sponza         # 片方だけ
-./target/release/tinypt --scene sample/sponza.xml   --spp 256 -o renders/sponza.ppm
-./target/release/tinypt --scene sample/rungholt.xml --spp 512 -o renders/rungholt.ppm
+./target/release/tinypt --scene sample/sponza.xml   --spp 256 -o renders/sponza.png
+./target/release/tinypt --scene sample/rungholt.xml --spp 512 -o renders/rungholt.png
 ```
 
 | シーン | 三角形 | 内容 |
@@ -546,9 +546,9 @@ Rungholt は CC BY 3.0 / © kescha ("Neu Rungholt" を Mineways で OBJ 化)。
 再配布しないこと (スクリプトが配布元から直接取得する)。
 
 ```bash
-./target/release/tinypt --scene sample/mesh.xml -o mesh.ppm
-./target/release/tinypt --scene sample/env_scene.xml -o env.ppm
-./target/release/tinypt --scene sample/cornell.xml --tonemap none -o cornell.ppm
+./target/release/tinypt --scene sample/mesh.xml -o mesh.png
+./target/release/tinypt --scene sample/env_scene.xml -o env.png
+./target/release/tinypt --scene sample/cornell.xml --tonemap none -o cornell.png
 ```
 
 ### 記述例
