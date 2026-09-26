@@ -44,6 +44,7 @@ pub mod texture;     // ビットマップテクスチャ（UV サンプリン�
 pub mod mtl;         // Wavefront MTL パーサ
 pub mod noise;       // 手続き的な 3D ソリッドノイズ（Perlin・大理石・木目・花崗岩）
 pub mod normal_map;  // ハイトマップ／ノーマルマップによる法線の摂動
+pub mod sdf;         // 陰関数曲面（SDF）ノード木とスフィアトレーシング
 
 pub use checkpoint::{ckpt_path, remove_stale_tmp, scene_hash, scene_hash_with_medium};
 pub use config::{RenderConfig, Tonemap};

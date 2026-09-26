@@ -7,6 +7,7 @@
 //! ## 対応要素
 //! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
 //! - `shape type="sphere"`: `center` / `radius`
+//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。スフィアトレーシング、光源にはならない
 //! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
 //! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `thindielectric`・`roughdielectric`(dielectric 扱い) / `twosided`(unwrap)。未知の型は警告して diffuse
 //! - `emitter type="area"`: `radiance`（shape に付随）
@@ -47,6 +48,7 @@ use std::sync::Arc;
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
+use crate::sdf::{SdfId, SdfNode, SdfOp, SdfPrim, SdfShape, SdfTree};
 use crate::world::World;
 
 /// パース済み XML 要素（タグ名・属性・子要素）。
@@ -768,6 +770,10 @@ fn parse_shape(
         parse_obj_with_mtl(el, base_dir, world, mats, mat_maps, textures, normal_maps, mtl_state);
         return;
     }
+    if el.typ() == "sdf" {
+        parse_sdf_shape(el, base_dir, world, mats, mat_maps, textures, normal_maps);
+        return;
+    }
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
     let (mat, map) = if let Some(em) = shape_emitter(el) {
         (parse_emitter(em), Extra::default())
@@ -869,6 +875,127 @@ fn parse_shape(
         mtl_state.obj_cache.insert(key, world.instance_mesh_id(inst_id));
     }
     apply_end_transform(el, world, inst_id, is_emitter);
+}
+
+/// `<shape type="sdf">`: 直下の `<sdf>`（ちょうど 1 個）を木にして [`SdfShape`] を足す。
+/// 不正な指定は警告してシェープごと飛ばす。発光は非対応（bsdf があればそれを使う）。材質は球と同じ `push_material` 経由。
+fn parse_sdf_shape(
+    el: &Element,
+    base_dir: &Path,
+    world: &mut World,
+    mats: &mut Vec<Material>,
+    mat_maps: &mut Vec<Extra>,
+    textures: &mut Vec<Texture>,
+    normal_maps: &mut Vec<NormalMap>,
+) {
+    let roots: Vec<&Element> = el.children.iter().filter(|c| c.tag == "sdf").collect();
+    if roots.len() != 1 {
+        warn(&format!("sdf shape needs exactly one root <sdf> (found {}); skipped", roots.len()));
+        return;
+    }
+    let mut tree = SdfTree::new();
+    if let Err(e) = parse_sdf_node(roots[0], &mut tree) {
+        warn(&format!("sdf shape: {}; skipped", e));
+        return;
+    }
+    if el.children.iter().any(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end")) {
+        warn("to_world_end on an sdf shape is unsupported; ignored");
+    }
+    let (mat, map) = match (shape_emitter(el), el.child_tag("bsdf")) {
+        (em, Some(b)) => {
+            if em.is_some() {
+                warn("area <emitter> on an sdf shape is unsupported (an sdf is never a light source); emission ignored");
+            }
+            parse_bsdf(b, base_dir, textures, normal_maps)
+        }
+        (em, None) => {
+            if em.is_some() {
+                warn("area <emitter> on an sdf shape is unsupported (an sdf is never a light source); emission ignored");
+            } else {
+                warn("shape type 'sdf' without bsdf; defaulting to diffuse");
+            }
+            (Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }, Extra::default())
+        }
+    };
+    let mat_id = mats.len();
+    let Some(shape) = SdfShape::new(tree, shape_to_world(el), mat_id) else {
+        warn("sdf shape has empty or non-finite bounds; skipped");
+        return;
+    };
+    push_material(mats, mat_maps, mat, map);
+    world.add_sdf(shape);
+}
+
+/// `<sdf type="...">` 1 要素を木に足し、根の添字を返す。演算子の n 項は左畳み込みで 2 項にする。
+fn parse_sdf_node(el: &Element, tree: &mut SdfTree) -> Result<SdfId, String> {
+    let typ = el.typ();
+    let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+    let float = |name: &str, default: f64| el.float(name).unwrap_or(default);
+    let center = el.point("center").unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+    if !finite(center) {
+        return Err(format!("<sdf type=\"{}\"> center is not finite", typ));
+    }
+    let pos = |name: &str, v: f64| -> Result<f64, String> {
+        if v.is_finite() && v > 0.0 { Ok(v) } else { Err(format!("<sdf type=\"{}\"> {} must be positive and finite (got {})", typ, name, v)) }
+    };
+    let nonneg = |name: &str, v: f64| -> Result<f64, String> {
+        if v.is_finite() && v >= 0.0 { Ok(v) } else { Err(format!("<sdf type=\"{}\"> {} must be >= 0 and finite (got {})", typ, name, v)) }
+    };
+    let prim = match typ {
+        "sphere" => SdfPrim::Sphere { center, radius: pos("radius", float("radius", 1.0))? },
+        "box" => {
+            let half = el.vector("half").or_else(|| el.point("half")).unwrap_or(Vec3::new(1.0, 1.0, 1.0));
+            if !finite(half) || half.x <= 0.0 || half.y <= 0.0 || half.z <= 0.0 {
+                return Err("<sdf type=\"box\"> half must be positive and finite".to_string());
+            }
+            SdfPrim::Box { center, half, round: nonneg("round", float("round", 0.0))? }
+        }
+        "torus" => SdfPrim::Torus { center, major: pos("major", float("major", 1.0))?, minor: pos("minor", float("minor", 0.25))? },
+        "cylinder" => {
+            let radius = pos("radius", float("radius", 1.0))?;
+            let half_height = pos("half_height", float("half_height", 1.0))?;
+            let round = nonneg("round", float("round", 0.0))?;
+            if round > radius.min(half_height) {
+                return Err("<sdf type=\"cylinder\"> round must not exceed radius or half_height".to_string());
+            }
+            SdfPrim::Cylinder { center, radius, half_height, round }
+        }
+        "capsule" => {
+            let a = el.point("a").unwrap_or(Vec3::new(0.0, -0.5, 0.0));
+            let b = el.point("b").unwrap_or(Vec3::new(0.0, 0.5, 0.0));
+            if !finite(a) || !finite(b) {
+                return Err("<sdf type=\"capsule\"> a / b must be finite".to_string());
+            }
+            SdfPrim::Capsule { a, b, radius: pos("radius", float("radius", 0.5))? }
+        }
+        "union" | "intersection" | "difference" | "smooth_union" | "smooth_intersection" | "smooth_difference" => {
+            let kids: Vec<&Element> = el.children.iter().filter(|c| c.tag == "sdf").collect();
+            if kids.len() < 2 {
+                return Err(format!("<sdf type=\"{}\"> needs at least 2 child <sdf> (found {})", typ, kids.len()));
+            }
+            let smooth = typ.starts_with("smooth_");
+            let k = if smooth { nonneg("k", float("k", 0.2))? } else { 0.0 };
+            let mut ids = Vec::with_capacity(kids.len());
+            for kid in kids {
+                ids.push(parse_sdf_node(kid, tree)?);
+            }
+            let mut acc = ids[0];
+            for &b in &ids[1..] {
+                let op = match typ {
+                    "union" => SdfOp::Union(acc, b),
+                    "intersection" => SdfOp::Intersect(acc, b),
+                    "difference" => SdfOp::Subtract(acc, b),
+                    "smooth_union" => SdfOp::SmoothUnion(acc, b, k),
+                    "smooth_intersection" => SdfOp::SmoothIntersect(acc, b, k),
+                    _ => SdfOp::SmoothSubtract(acc, b, k),
+                };
+                acc = tree.push(SdfNode::Op(op));
+            }
+            return Ok(acc);
+        }
+        other => return Err(format!("unsupported <sdf type=\"{}\">", other)),
+    };
+    Ok(tree.push(SdfNode::Prim(prim)))
 }
 
 /// 形状の `to_world` 変換（`name="to_world"` か名前無しの `<transform>`。`to_world_end` は含まない）。無ければ恒等。
@@ -3286,5 +3413,85 @@ mod tests {
         let (s, w) = expr_scene(&metal);
         assert!(w.is_empty(), "{w:?}");
         assert!(matches!(s.shaders.shaders[0].base, Material::Metal { .. }) && s.shaders.shaders[0].albedo.is_some());
+    }
+
+    // ---- SDF shape ----
+
+    fn sdf_scene(shape: &str) -> (Scene, Vec<String>) {
+        let xml = format!(r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor>{}</scene>"#, shape);
+        let (r, w) = capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)));
+        (r.unwrap().0, w)
+    }
+
+    #[test]
+    fn sdf_shape_parses_tree_transform_and_material() {
+        let (s, w) = sdf_scene(
+            r#"<shape type="sdf">
+                 <sdf type="smooth_union"><float name="k" value="0.3"/>
+                   <sdf type="sphere"><float name="radius" value="1"/><point name="center" x="0" y="0.5" z="0"/></sdf>
+                   <sdf type="torus"><float name="major" value="1.2"/><float name="minor" value="0.3"/></sdf>
+                   <sdf type="box"><vector name="half" x="0.5" y="0.5" z="0.5"/><float name="round" value="0.1"/></sdf>
+                 </sdf>
+                 <transform name="to_world"><translate x="0" y="0" z="-5"/></transform>
+                 <bsdf type="diffuse"><rgb name="reflectance" value="0.4"/></bsdf></shape>"#,
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.world.sdfs().len(), 1);
+        let sdf = &s.world.sdfs()[0];
+        // 3 つのプリミティブ + 左畳み込みの 2 演算
+        assert_eq!(sdf.tree().len(), 5);
+        assert_eq!(s.world.instance_count(), 0);
+        // 平行移動が効いている: 原点から -Z 方向へ奥に球（半径 1、中心 (0,0.5,-5)）が見える
+        let r = crate::ray::Ray { o: Vec3::new(0.0, 0.5, 0.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
+        let h = s.world.hit(r, 0.0, 1e9).expect("hit");
+        assert!(h.t > 3.0 && h.t < 5.0, "t = {}", h.t);
+        assert_eq!(h.mat_id, sdf.mat_id);
+    }
+
+    #[test]
+    fn sdf_difference_folds_left_and_smooth_ops_accept_k() {
+        let (s, w) = sdf_scene(
+            r#"<shape type="sdf"><sdf type="difference">
+                 <sdf type="sphere"><float name="radius" value="2"/></sdf>
+                 <sdf type="sphere"><float name="radius" value="0.5"/><point name="center" x="1.5" y="0" z="0"/></sdf>
+                 <sdf type="cylinder"><float name="radius" value="0.3"/><float name="half_height" value="3"/></sdf>
+               </sdf><bsdf type="diffuse"/></shape>"#,
+        );
+        assert!(w.is_empty(), "{w:?}");
+        let t = s.world.sdfs()[0].tree();
+        // 2 番目の球で削った場所（(1.5,0,0)）と、円柱で削った軸（原点）は外側、他は内側
+        assert!(t.eval(Vec3::new(1.5, 0.0, 0.0)) > 0.0);
+        assert!(t.eval(Vec3::new(0.0, 0.5, 0.0)) > 0.0);
+        assert!(t.eval(Vec3::new(-1.0, 0.0, 0.0)) < 0.0);
+    }
+
+    #[test]
+    fn sdf_invalid_input_warns_and_skips_the_shape() {
+        for bad in [
+            r#"<shape type="sdf"><bsdf type="diffuse"/></shape>"#, // 根が無い
+            r#"<shape type="sdf"><sdf type="sphere"/><sdf type="sphere"/><bsdf type="diffuse"/></shape>"#, // 根が 2 個
+            r#"<shape type="sdf"><sdf type="union"><sdf type="sphere"/></sdf><bsdf type="diffuse"/></shape>"#, // 子が 1 個
+            r#"<shape type="sdf"><sdf type="teapot"/><bsdf type="diffuse"/></shape>"#, // 未知の型
+            r#"<shape type="sdf"><sdf type="sphere"><float name="radius" value="-1"/></sdf><bsdf type="diffuse"/></shape>"#, // 負の半径
+            r#"<shape type="sdf"><sdf type="smooth_union"><float name="k" value="-0.1"/><sdf type="sphere"/><sdf type="sphere"/></sdf><bsdf type="diffuse"/></shape>"#, // 負の k
+        ] {
+            let (s, w) = sdf_scene(bad);
+            assert!(!w.is_empty(), "no warning for {bad}");
+            assert_eq!(s.world.sdfs().len(), 0, "{bad} should be skipped: {w:?}");
+        }
+    }
+
+    #[test]
+    fn sdf_emitter_and_to_world_end_warn_but_keep_the_shape() {
+        let (s, w) = sdf_scene(
+            r#"<shape type="sdf"><sdf type="sphere"/>
+                 <transform name="to_world_end"><translate x="1" y="0" z="0"/></transform>
+                 <emitter type="area"><rgb name="radiance" value="5"/></emitter>
+                 <bsdf type="diffuse"/></shape>"#,
+        );
+        assert!(w.iter().any(|m| m.contains("to_world_end")), "{w:?}");
+        assert!(w.iter().any(|m| m.contains("never a light source")), "{w:?}");
+        assert_eq!(s.world.sdfs().len(), 1);
+        assert!(s.world.lights().is_empty(), "an sdf must not become a light");
     }
 }

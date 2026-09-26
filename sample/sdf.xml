@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SDF（陰関数曲面）のデモ（tinypt の独自拡張）。sphere tracing で描く。光源にはならない。
+       左  : 2 球のスムーズ結合（ブロブ）
+       中央: 角丸の箱 − 球（くり抜き）
+       右  : ガラス（dielectric）のトーラス
+     使い方: tinypt --scene sample/sdf.xml -o sdf.png -->
+<scene version="3.0.0">
+  <integrator type="path"><integer name="max_depth" value="10"/><integer name="rr_depth" value="4"/></integrator>
+  <sampler type="independent"><integer name="sample_count" value="128"/></sampler>
+  <film type="hdrfilm"><integer name="width" value="960"/><integer name="height" value="540"/></film>
+  <sensor type="perspective">
+    <float name="fov" value="36"/><string name="fov_axis" value="y"/>
+    <transform name="to_world"><lookat origin="0, 3.2, 8.5" target="0, 0.9, 0" up="0, 1, 0"/></transform>
+  </sensor>
+
+  <emitter type="envmap"><string name="filename" value="env.exr"/><float name="scale" value="0.6"/></emitter>
+
+  <shape type="rectangle">
+    <transform name="to_world"><rotate x="1" angle="-90"/><scale x="8" y="5" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.55, 0.55, 0.5"/></bsdf>
+  </shape>
+
+  <!-- 左: スムーズ結合のブロブ -->
+  <shape type="sdf">
+    <sdf type="smooth_union"><float name="k" value="0.5"/>
+      <sdf type="sphere"><float name="radius" value="0.9"/><point name="center" x="-0.5" y="0" z="0"/></sdf>
+      <sdf type="sphere"><float name="radius" value="0.7"/><point name="center" x="0.6" y="0.5" z="0.2"/></sdf>
+      <sdf type="capsule"><point name="a" x="-0.6" y="-0.3" z="0"/><point name="b" x="0.4" y="-0.8" z="0.3"/><float name="radius" value="0.35"/></sdf>
+    </sdf>
+    <transform name="to_world"><translate x="-3.0" y="1.1" z="0"/></transform>
+    <bsdf type="roughconductor"><rgb name="specular_reflectance" value="0.95, 0.72, 0.5"/><float name="alpha" value="0.15"/></bsdf>
+  </shape>
+
+  <!-- 中央: 角丸の箱 − 球 -->
+  <shape type="sdf">
+    <sdf type="difference">
+      <sdf type="box"><vector name="half" x="0.8" y="0.8" z="0.8"/><float name="round" value="0.15"/></sdf>
+      <sdf type="sphere"><float name="radius" value="1.05"/><point name="center" x="0.2" y="0.3" z="0.6"/></sdf>
+    </sdf>
+    <transform name="to_world"><rotate y="1" angle="30"/><translate x="0" y="1.0" z="0"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.7, 0.25, 0.2"/></bsdf>
+  </shape>
+
+  <!-- 右: ガラスのトーラス -->
+  <shape type="sdf">
+    <sdf type="torus"><float name="major" value="0.9"/><float name="minor" value="0.35"/></sdf>
+    <transform name="to_world"><rotate x="1" angle="70"/><translate x="3.0" y="1.7" z="0.3"/></transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+</scene>

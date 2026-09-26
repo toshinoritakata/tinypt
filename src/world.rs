@@ -20,6 +20,7 @@ use crate::obj_loader::{MeshData, NO_NORMAL, NO_UV};
 use crate::math::{cdf_search, gamma, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::sdf::SdfShape;
 use crate::texture::AlphaMask;
 use crate::transform::{AnimatedTransform, Transform};
 
@@ -340,8 +341,13 @@ fn moving_sphere_bounds(s: &Sphere, end: Vec3, shutter: (f64, f64)) -> Aabb {
 
 /// メッシュを `xform` で配置したインスタンスの、ワールド空間の保守的な境界ボックス。
 fn instance_world_bounds(mesh: &Mesh, xform: &Transform) -> Aabb {
+    let Some(root) = mesh.bvh.root_bounds() else { return Aabb::empty() };
+    box_world_bounds(root, xform)
+}
+
+/// 物体空間の箱 `root` を `xform` でワールドへ写した、保守的な境界ボックス（8 頂点を変換し、変換の誤差上界ぶん広げる）。
+pub(crate) fn box_world_bounds(root: Aabb, xform: &Transform) -> Aabb {
     let mut b = Aabb::empty();
-    let Some(root) = mesh.bvh.root_bounds() else { return b };
     let (lo, hi) = (root.min, root.max);
     let zero = Vec3::new(0.0, 0.0, 0.0);
     for k in 0..8 {
@@ -404,14 +410,19 @@ pub struct World {
     shutter: (f64, f64),
     /// 球ごとのシャッター閉じ時点の中心（`None` は静止）。**動く球が 1 つも無ければ空**で、静止球の経路は従来のまま
     sphere_end: Vec<Option<Vec3>>,
+    /// SDF（陰関数曲面）。ヒットは `inst_id = None`・`prim_id = spheres.len() + SDF の添字`（TLAS の通し番号と同じ）。光源にはならない
+    sdfs: Vec<SdfShape>,
 }
 
-/// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、それ以外は球 `k - n_inst`
-/// （線形総当たりの走査順「インスタンス → 球」と同じ通し番号で、同値の t のタイブレークにも使う）。
+/// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、`n_inst <= k < n_inst + n_sph` は球 `k - n_inst`、
+/// それ以降は SDF `k - n_inst - n_sph`
+/// （線形総当たりの走査順「インスタンス → 球 → SDF」と同じ通し番号で、同値の t のタイブレークにも使う。
+/// SDF の `Hit::prim_id` は `n_sph + SDF の添字` で、この通し番号から `n_inst` を引いたものに等しい）。
 struct Tlas {
     bvh: Bvh,
     n_inst: usize,
     n_sph: usize,
+    n_sdf: usize,
 }
 
 /// この数以上のプリミティブ（インスタンス + 球）があるときだけ TLAS を使う。少数では総当たりのほうが速い
@@ -755,6 +766,7 @@ impl World {
             delta_lights: Vec::new(),
             shutter: (0.0, 1.0),
             sphere_end: Vec::new(),
+            sdfs: Vec::new(),
         }
     }
 
@@ -779,6 +791,9 @@ impl World {
                 b = b.grow(*end - r).grow(*end + r);
             }
         }
+        for sdf in &self.sdfs {
+            b = b.union(sdf.world_bounds());
+        }
         for inst in &self.instances {
             let Some(mesh) = self.meshes.get(inst.mesh_id) else { continue };
             let Some(root) = mesh.bvh.root_bounds() else { continue };
@@ -801,6 +816,19 @@ impl World {
         let idx = self.spheres.len();
         self.spheres.push(sphere);
         idx
+    }
+
+    /// SDF を追加し、その `World::sdfs` 上のインデックスを返す。
+    pub fn add_sdf(&mut self, sdf: SdfShape) -> usize {
+        self.tlas = OnceLock::new();
+        let idx = self.sdfs.len();
+        self.sdfs.push(sdf);
+        idx
+    }
+
+    /// SDF 一覧。ヒットの `prim_id` は `spheres().len() + ここでの添字`。
+    pub fn sdfs(&self) -> &[SdfShape] {
+        &self.sdfs
     }
 
     /// 球 `idx` にシャッター閉じ時点の中心 `end` を与え、レイの `time`（0 = 開 = `Sphere::c`、1 = 閉）で**線形補間**する
@@ -964,7 +992,7 @@ impl World {
     /// トップレベル BVH（あれば）。最初の呼び出しで構築する。プリミティブが少ない、または構築後に
     /// ジオメトリが増えて古くなっているときは `None`（呼び出し側は線形に総当たりする）。
     fn tlas(&self) -> Option<&Tlas> {
-        let n_prims = self.instances.len() + self.spheres.len();
+        let n_prims = self.instances.len() + self.spheres.len() + self.sdfs.len();
         if n_prims < TLAS_MIN_PRIMS {
             return None;
         }
@@ -977,10 +1005,11 @@ impl World {
                     Some(Some(end)) => moving_sphere_bounds(s, *end, self.shutter),
                     _ => sphere_world_bounds(s),
                 }));
-                Some(Tlas { bvh: Bvh::build_from_bounds(&bounds, 1), n_inst: self.instances.len(), n_sph: self.spheres.len() })
+                bounds.extend(self.sdfs.iter().map(|s| s.world_bounds()));
+                Some(Tlas { bvh: Bvh::build_from_bounds(&bounds, 1), n_inst: self.instances.len(), n_sph: self.spheres.len(), n_sdf: self.sdfs.len() })
             })
             .as_ref()?;
-        (t.n_inst == self.instances.len() && t.n_sph == self.spheres.len()).then_some(t)
+        (t.n_inst == self.instances.len() && t.n_sph == self.spheres.len() && t.n_sdf == self.sdfs.len()).then_some(t)
     }
 
     /// TLAS を深さ優先で辿り、葉のプリミティブ番号ごとに `visit(k)` を呼ぶ（`k` は [`Tlas`] の通し番号）。
@@ -1008,6 +1037,16 @@ impl World {
                 let c = closest.get();
                 if k < tlas.n_inst {
                     if let Some(h) = self.hit_instance(k, r, inv_d, tmin, c, k < best_k) {
+                        closest.set(h.t);
+                        best = Some(h);
+                        best_k = k;
+                    }
+                } else if k >= tlas.n_inst + tlas.n_sph {
+                    let sdf_idx = k - tlas.n_inst - tlas.n_sph;
+                    let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
+                    let cand = self.sdfs[sdf_idx].hit(r, tmin, hi).filter(|h| h.t < c || (h.t == c && k < best_k));
+                    if let Some(mut h) = cand {
+                        h.prim_id = tlas.n_sph + sdf_idx;
                         closest.set(h.t);
                         best = Some(h);
                         best_k = k;
@@ -1051,6 +1090,15 @@ impl World {
         for idx in 0..self.spheres.len() {
             if let Some(mut h) = self.sphere_hit(idx, r, tmin, closest) {
                 h.prim_id = idx;
+                closest = h.t;
+                best = Some(h);
+            }
+        }
+
+        // SDF（球の後。`prim_id` は球の数からの通し番号）
+        for (i, sdf) in self.sdfs.iter().enumerate() {
+            if let Some(mut h) = sdf.hit(r, tmin, closest) {
+                h.prim_id = self.spheres.len() + i;
                 closest = h.t;
                 best = Some(h);
             }
@@ -1168,6 +1216,8 @@ impl World {
             Self::tlas_traverse(tlas, r, tmin, &tmax_cell, |k| {
                 found = if k < tlas.n_inst {
                     self.occluded_instance(k, r, inv_d, tmin, tmax, skip)
+                } else if k >= tlas.n_inst + tlas.n_sph {
+                    self.sdfs[k - tlas.n_inst - tlas.n_sph].hit(r, tmin, tmax).is_some()
                 } else {
                     let idx = k - tlas.n_inst;
                     skip != Some((None, idx)) && self.sphere_hit(idx, r, tmin, tmax).is_some()
@@ -1198,7 +1248,8 @@ impl World {
             }
         }
 
-        false
+        // SDF は光源にならないので skip の対象外
+        self.sdfs.iter().any(|s| s.hit(r, tmin, tmax).is_some())
     }
 
     /// インスタンス `inst_id` が `(tmin, tmax)` の遮蔽になるか（[`World::occluded`] のループ本体そのまま）。
@@ -1293,7 +1344,11 @@ impl World {
                     Some(Some(end)) => hit.p - lerp_center(s.c, *end, time).0,
                     _ => hit.p - s.c,
                 },
-                None => hit.p,
+                // SDF（`prim_id` が球の数以上）: SDF の変換の逆
+                None => match hit.prim_id.checked_sub(self.spheres.len()).and_then(|i| self.sdfs.get(i)) {
+                    Some(sdf) => sdf.transform().apply_point_inv(hit.p),
+                    None => hit.p,
+                },
             },
         }
     }

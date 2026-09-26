@@ -27,9 +27,11 @@ pub struct Hit {
     /// 交差したマテリアルのインデックス
     pub mat_id: usize,
     /// ヒットしたプリミティブのインデックス（球: World::spheres 上の位置、
-    /// 三角形: メッシュ内の三角形インデックス）。呼び出し側（World::hit）が設定する。
+    /// 三角形: メッシュ内の三角形インデックス、SDF: `spheres.len()` + World::sdfs 上の位置）。
+    /// 呼び出し側（World::hit）が設定する。
     pub prim_id: usize,
-    /// メッシュインスタンス経由のヒットなら Some(inst_id)、球なら None。
+    /// メッシュインスタンス経由のヒットなら Some(inst_id)、球・SDF なら None
+    /// （`None` のときの `prim_id` が `spheres.len()` 未満なら球、以上なら SDF）。
     /// 呼び出し側（World::hit）が設定する。
     pub inst_id: Option<usize>,
     /// 交差点 `p` の成分ごとの浮動小数点誤差の上界（ワールド空間）。真の交差点は
