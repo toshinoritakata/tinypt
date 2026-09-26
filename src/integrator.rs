@@ -1798,6 +1798,74 @@ mod map_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **`ns` と `ng` が大きく開いた面**（頂点法線が幾何法線から ~60° 傾いた粗い板）で、摂動後の法線が「`ng` の地平線の上ぎりぎり
+    /// ではなく**ちょうど地平線**（`n·ng = 0`）」にくるマップを作る。`ns` 基準では地平線の上（`n·ns > 0`）なので、
+    /// 判定の `hit.ng` を `hit.ns` に取り違えると通してしまい、`ns·ng ≈ 0` になって `offset_ray_origin`（`ng` 基準）が
+    /// 面の反対側へ出る。正しい実装は地平線すれすれの摂動を捨てて `ns` を元のままにする。
+    ///
+    /// 構成: 合成の接空間ノーマルマップ（1 テクセル）で `n_un = scale·(x t + y b) + z ns`。`n_un·ng` は `scale` の一次式
+    /// なので、`n_un·ng = 0` になる `scale` を解ける（8 ビット PNG の量子化に左右されず、地平線ちょうどを作れる）。
+    /// もう 1 本は同じ構成で地平線より十分上（`n·ng` が正）にして、正しい実装は**採用する**こと（常に捨てる実装を落とす）。
+    ///
+    /// ミューテーション検出（実際に確かめた。報告参照）: 判定を `n_pert.dot(hit.ns)` にする、`face_forward(n_pert, hit.ns)` にする、
+    /// 判定を外す、比較の向きを変える、のどれでも落ちる。
+    #[test]
+    fn horizon_test_uses_the_geometric_normal_when_ns_and_ng_diverge() {
+        use crate::normal_map::NormalMap;
+        use crate::texture::{Texture, Wrap};
+        let dir = tmpdir();
+        // 頂点法線 (0.87, 0, 0.5) の板（z = 0 平面、UV あり、幾何法線は +z）。ns·ng ≈ 0.5
+        let obj = "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn 0.87 0 0.5\n\
+                   f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n";
+        std::fs::write(dir.join("tilted.obj"), obj).unwrap();
+        let xml = r#"<scene version="3.0.0"><shape type="obj"><string name="filename" value="tilted.obj"/><bsdf type="diffuse"/></shape></scene>"#;
+        let mut s = scene(xml, &dir);
+        let orig = s.world.hit(down_ray(0.3, 0.2), 0.0, 1e30).unwrap();
+        // 構成の条件: ns と ng が大きく開いている
+        let open = orig.ns.dot(orig.ng);
+        assert!(orig.is_smooth() && open > 0.3 && open < 0.6, "ns·ng = {open}（開きが足りない / 開きすぎ）");
+
+        // 摂動と同じ接空間（`perturb_shading_normal` と同じ手順）
+        let (dpdu, dpdv) = s.world.surface_tangents(&orig, 0.0).expect("UV 付きのメッシュ");
+        let (t, b) = orthonormalize(dpdu, dpdv, orig.ns).expect("接空間");
+        // テクセル (255, 128, 200): x = 1, y ≈ 0.004, z ≈ 0.57（`ns` の側へ傾ける）
+        let texel = [255u8, 128, 200];
+        let (x, y, z) = (2.0 * texel[0] as f64 / 255.0 - 1.0, 2.0 * texel[1] as f64 / 255.0 - 1.0, 2.0 * texel[2] as f64 / 255.0 - 1.0);
+        let d = x * t.dot(orig.ng) + y * b.dot(orig.ng); // n_un·ng = scale·d + z·(ns·ng)
+        assert!(d.abs() > 0.1, "接ベクトルが ng にほぼ直交していて scale が解けない: d = {d}");
+        let scale_for = |target: f64| (target - z * open) / d; // n_un·ng = target になる scale
+        let mut run = |scale: f64| {
+            let mut h = orig;
+            let id = s.shaders.normal_maps.len() as MapId;
+            s.shaders.normal_maps.push(NormalMap::Tangent { tex: Texture::from_texels_u8(1, 1, texel.to_vec(), false, Wrap::Repeat), scale });
+            perturb_shading_normal(&s.world, &s.shaders, id, &mut h, 0.0);
+            // 摂動前の n_un（比較用）: 地平線ちょうどの構成になっていることを確かめる
+            let n_un = t * (x * scale) + b * (y * scale) + orig.ns * z;
+            (h, n_un.norm())
+        };
+
+        // (1) 地平線ちょうど: `ng` 基準では捨てられる。`ns` 基準では通る（n·ns = z/|n_un| > 0）ので取り違えを検出できる
+        let (h, n) = run(scale_for(0.0));
+        assert!(n.dot(orig.ng).abs() < 1e-12, "構成が地平線ちょうどになっていない: n·ng = {}", n.dot(orig.ng));
+        assert!(n.dot(orig.ns) > 0.3, "ns 基準でも地平線の下になっている（取り違えで差が出ない）: n·ns = {}", n.dot(orig.ns));
+        assert!(h.ns.dot(h.ng) > NS_NG_MIN, "ns·ng = {} ≤ NS_NG_MIN: 地平線の摂動を通した（判定が ng 基準でない）", h.ns.dot(h.ng));
+        let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+        assert_eq!(bits(h.ns), bits(orig.ns), "地平線すれすれの摂動は捨てて ns を元のままにするはず");
+
+        // (2) 地平線より十分上（n_un·ng = 0.5·|n_un| 程度）: 採用される
+        let (h, n) = run(scale_for(0.6));
+        assert!(n.dot(orig.ng) > 0.1);
+        assert!((h.ns - orig.ns).len() > 0.05 && h.ns.dot(h.ng) > NS_NG_MIN, "採用されるはずの摂動が捨てられた");
+
+        // (3) 地平線を少し越えた（n_un·ng < 0）が、`ns` 基準ではまだ表（n·ns > 0）: 正しい実装は `ng` 基準で裏返して採用する
+        //     （裏返すと n·ng > 0）。`face_forward(n_pert, hit.ns)` に取り違えると裏返さず、負の n·ng が判定で捨てられて `ns` が変わらない。
+        let (h, n) = run(scale_for(-0.5));
+        assert!(n.dot(orig.ng) < -0.05 && n.dot(orig.ns) > 0.3, "構成: n·ng = {}, n·ns = {}", n.dot(orig.ng), n.dot(orig.ns));
+        assert!((h.ns - orig.ns).len() > 0.05, "ng 基準で裏返して採用されるはずの摂動が捨てられた（face_forward が ng 基準でない）");
+        assert!(h.ns.dot(h.ng) > NS_NG_MIN && (h.ns + n).len() < 1e-9, "裏返した n（= −n_un）になっていない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 強い（z 成分が負の）マップと鏡像インスタンスでも、全ヒットで摂動が効き（`ns` が変わる）、`ns · ng > 0`。
     ///
     /// ミューテーション検出: `face_forward(n_pert, hit.ng)` を外すと、`n_pert · ng < 0` になった摂動が
