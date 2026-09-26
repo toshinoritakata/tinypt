@@ -365,7 +365,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<shape type="sphere">` | `center` / `radius` / `center_end` (独自拡張: モーションブラー、[詳細](#モーションブラー)) |
 | `<shape type="obj">` | `filename` (XML からの相対パス) + `to_world` + `face_normals` (下記) |
 | `<shape type="rectangle"\|"cube"\|"disk">` | Mitsuba 正準形メッシュ + `to_world` |
-| `<shape type="sdf">` | 陰関数曲面 (独自拡張、`sample/sdf.xml`)。直下の `<sdf>` 木 (`sphere` `radius` / `box` `half` `round` / `torus` `major` `minor` (軸 Y) / `cylinder` `radius` `half_height` `round` (軸 Y) / `capsule` `a` `b` `radius`、各 `center` 平行移動つき。`union` / `intersection` / `difference` / `smooth_union` / `smooth_intersection` / `smooth_difference` (`k`) は子 2 個以上を左畳み込み) + `to_world` + `bsdf`。スフィアトレーシングで描き、**光源にならない** (emitter は警告して無視)。UV が無いので法線マップは効かない |
+| `<shape type="sdf">` | 陰関数曲面 (独自拡張、`sample/sdf.xml`)。直下の `<sdf>` 木 (`sphere` `radius` / `box` `half` `round` / `torus` `major` `minor` (軸 Y) / `cylinder` `radius` `half_height` `round` (軸 Y) / `capsule` `a` `b` `radius`、各 `center` 平行移動つき。`union` / `intersection` / `difference` / `smooth_union` / `smooth_intersection` / `smooth_difference` (`k`) は子 2 個以上を左畳み込み) + `to_world` + `bsdf`。スフィアトレーシングで描き、**光源にならない** (emitter は警告して無視)。UV が無いので法線マップは効かない。`to_world_end` (独自拡張、[モーションブラー](#モーションブラー)) で動かせる |
 | `<transform>` | `translate` / `rotate` (任意軸) / `scale` (均一・非均一) / `matrix` (4×4) |
 | `<texture type="bitmap">` | `diffuse` の `reflectance` に指定 (`filename` / `wrap_mode` / `raw`) ([詳細](#テクスチャ)) |
 | `<bsdf>` | `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric`・`thindielectric`・`roughdielectric` (いずれも `Dielectric`、独自拡張の `absorption` 対応) / `twosided`。未知の型は警告して `diffuse` にフォールバック |

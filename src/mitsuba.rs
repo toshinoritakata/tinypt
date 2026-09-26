@@ -7,7 +7,7 @@
 //! ## 対応要素
 //! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
 //! - `shape type="sphere"`: `center` / `radius`
-//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。スフィアトレーシング、光源にはならない
+//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。`to_world_end`（モーションブラー）対応。スフィアトレーシング、光源にはならない
 //! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
 //! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `thindielectric`・`roughdielectric`(dielectric 扱い) / `twosided`(unwrap)。未知の型は警告して diffuse
 //! - `emitter type="area"`: `radiance`（shape に付随）
@@ -898,9 +898,6 @@ fn parse_sdf_shape(
         warn(&format!("sdf shape: {}; skipped", e));
         return;
     }
-    if el.children.iter().any(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end")) {
-        warn("to_world_end on an sdf shape is unsupported; ignored");
-    }
     let (mat, map) = match (shape_emitter(el), el.child_tag("bsdf")) {
         (em, Some(b)) => {
             if em.is_some() {
@@ -918,10 +915,15 @@ fn parse_sdf_shape(
         }
     };
     let mat_id = mats.len();
-    let Some(shape) = SdfShape::new(tree, shape_to_world(el), mat_id) else {
+    let Some(mut shape) = SdfShape::new(tree, shape_to_world(el), mat_id) else {
         warn("sdf shape has empty or non-finite bounds; skipped");
         return;
     };
+    // シャッター閉の変換（独自拡張。インスタンスと同じ `AnimatedTransform`）。不正なら警告して静止のまま
+    let end_el = el.children.iter().find(|c| c.tag == "transform" && c.attr("name") == Some("to_world_end"));
+    if end_el.is_some_and(|e| !shape.set_end_transform(parse_transform(e))) {
+        warn("to_world / to_world_end is singular, mirrored (negative determinant) or not decomposable; the shape stays static");
+    }
     push_material(mats, mat_maps, mat, map);
     world.add_sdf(shape);
 }
@@ -3482,16 +3484,36 @@ mod tests {
     }
 
     #[test]
-    fn sdf_emitter_and_to_world_end_warn_but_keep_the_shape() {
+    fn sdf_emitter_warns_but_keeps_the_shape() {
         let (s, w) = sdf_scene(
             r#"<shape type="sdf"><sdf type="sphere"/>
-                 <transform name="to_world_end"><translate x="1" y="0" z="0"/></transform>
                  <emitter type="area"><rgb name="radiance" value="5"/></emitter>
                  <bsdf type="diffuse"/></shape>"#,
         );
-        assert!(w.iter().any(|m| m.contains("to_world_end")), "{w:?}");
         assert!(w.iter().any(|m| m.contains("never a light source")), "{w:?}");
         assert_eq!(s.world.sdfs().len(), 1);
         assert!(s.world.lights().is_empty(), "an sdf must not become a light");
+    }
+
+    #[test]
+    fn sdf_to_world_end_animates_without_warning_and_bad_transforms_stay_static() {
+        let sdf = |end: &str| format!(r#"<shape type="sdf"><sdf type="sphere"/>{end}<bsdf type="diffuse"/></shape>"#);
+        let (s, w) = sdf_scene(&sdf(r#"<transform name="to_world_end"><translate x="3" y="0" z="0"/></transform>"#));
+        assert!(w.is_empty(), "{w:?}");
+        assert!(s.world.sdfs()[0].is_animated());
+        // 時刻 0 は開の位置（原点）、時刻 1 は閉の位置（x = 3）に当たる
+        for (time, x) in [(0.0, 0.0), (1.0, 3.0)] {
+            let r = crate::ray::Ray { o: Vec3::new(x, 0.0, 10.0), d: Vec3::new(0.0, 0.0, -1.0), time };
+            assert!(s.world.hit(r, 0.0, 1e9).is_some(), "time {time}");
+        }
+        // 特異な閉の変換（x 方向のスケール 0）と鏡像は警告して静止
+        for bad in [
+            r#"<transform name="to_world_end"><scale x="0" y="1" z="1"/></transform>"#,
+            r#"<transform name="to_world_end"><scale x="-1" y="1" z="1"/></transform>"#,
+        ] {
+            let (s, w) = sdf_scene(&sdf(bad));
+            assert!(w.iter().any(|m| m.contains("stays static")), "{w:?}");
+            assert!(!s.world.sdfs()[0].is_animated());
+        }
     }
 }

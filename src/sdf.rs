@@ -10,7 +10,7 @@
 use crate::geometry::{Aabb, Hit};
 use crate::math::Vec3;
 use crate::ray::Ray;
-use crate::transform::Transform;
+use crate::transform::{AnimatedTransform, Transform};
 
 /// `SdfTree::nodes` への添字。
 pub type SdfId = u32;
@@ -286,8 +286,10 @@ pub struct SdfShape {
     pub mat_id: usize,
     /// 物体空間の保守的な境界（収束幅ぶん広げ済み）。マーチの開始・終了区間の切り出しに使う
     obj_bounds: Aabb,
-    /// ワールド空間の境界（TLAS の葉・`World::bounds` 用）
+    /// ワールド空間の境界（TLAS の葉・`World::bounds` 用）。アニメーションがあればシャッター区間の掃過ボリューム
     world_bounds: Aabb,
+    /// シャッター閉の変換への補間（`None` なら静止で、従来と同じ経路・同じ演算を通る）
+    anim: Option<AnimatedTransform>,
     /// 収束幅（物体空間）
     eps_obj: f64,
     /// 法線の差分幅（物体空間）
@@ -306,7 +308,7 @@ impl SdfShape {
         let eps_obj = EPS_REL * diag;
         let obj_bounds = grow(b, ERR_BOX_EPS * eps_obj * 2.0);
         let world_bounds = crate::world::box_world_bounds(obj_bounds, &xform);
-        Some(Self { tree, xform, mat_id, obj_bounds, world_bounds, eps_obj, normal_h: (NORMAL_H_REL * diag).max(1e-9) })
+        Some(Self { tree, xform, mat_id, obj_bounds, world_bounds, anim: None, eps_obj, normal_h: (NORMAL_H_REL * diag).max(1e-9) })
     }
 
     pub fn tree(&self) -> &SdfTree {
@@ -318,6 +320,46 @@ impl SdfShape {
     pub fn world_bounds(&self) -> Aabb {
         self.world_bounds
     }
+
+    /// シャッター閉の変換 `end` を与え、レイの `time`（0 = 開 = `to_world`、1 = 閉）で補間するアニメーションにする
+    /// （インスタンスの [`crate::world::World::set_instance_end_transform`] と同じ仕組み）。開・閉のどちらかが特異・鏡像・
+    /// 非有限、または極分解が収束しないときは `false` を返し、静止のまま。`world_bounds` は
+    /// [`refresh_bounds`](Self::refresh_bounds) を呼ぶまで更新されない（`World::add_sdf` が呼ぶ）。
+    pub fn set_end_transform(&mut self, end: Transform) -> bool {
+        match AnimatedTransform::new(self.xform, end) {
+            Some(a) => {
+                self.anim = Some(a);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn is_animated(&self) -> bool {
+        self.anim.is_some()
+    }
+
+    /// 時刻 `time` の物体 → ワールド変換（静止なら `to_world` そのもの）。
+    pub fn transform_at(&self, time: f64) -> Transform {
+        match &self.anim {
+            Some(a) => a.at(time),
+            None => self.xform,
+        }
+    }
+
+    /// ワールド境界を作り直す。静止なら `to_world` で写した箱、アニメーションがあればシャッター区間 `shutter` の
+    /// 掃過ボリューム（物体空間の箱の中心と半対角線の球を `AnimatedTransform::swept_bounds` に渡す。
+    /// `World::refresh_swept_bounds` と同じやり方）。
+    pub fn refresh_bounds(&mut self, shutter: (f64, f64)) {
+        self.world_bounds = match &self.anim {
+            Some(a) => {
+                let b = self.obj_bounds;
+                let c = (b.min + b.max) * 0.5;
+                a.swept_bounds(c, (b.max - c).len(), shutter.0, shutter.1)
+            }
+            None => crate::world::box_world_bounds(self.obj_bounds, &self.xform),
+        };
+    }
     pub fn eps_obj(&self) -> f64 {
         self.eps_obj
     }
@@ -328,8 +370,17 @@ impl SdfShape {
     /// （非一様スケールでもそのまま正しい）。1 歩は `|f| / |d_obj|`（`|∇f| ≤ 1` なので、その距離だけ進んでも
     /// 面を越えない）。`|f|` で進めるので、内側から始まるレイ（誘電体の透過）も同じ式で反対側の面に届く。
     pub fn hit(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
-        let o_obj = self.xform.apply_point_inv(r.o);
-        let d_obj = self.xform.apply_vec_inv(r.d);
+        // アニメーションのある SDF だけ、レイの時刻で補間した変換を使う（静止は `self.xform` をそのまま参照する）
+        let anim_xf;
+        let xf: &Transform = match &self.anim {
+            Some(a) => {
+                anim_xf = a.at(r.time);
+                &anim_xf
+            }
+            None => &self.xform,
+        };
+        let o_obj = xf.apply_point_inv(r.o);
+        let d_obj = xf.apply_vec_inv(r.d);
         let d_len = d_obj.len();
         if d_len <= 0.0 || !d_len.is_finite() {
             return None;
@@ -348,7 +399,7 @@ impl SdfShape {
             let af = f.abs();
             if af < eps {
                 if t > tmin {
-                    return Some(self.make_hit(t, p));
+                    return Some(self.make_hit(xf, t, p));
                 }
                 // tmin の帯の中（自己交差回避の内側）にある面は飛ばして先へ進む
                 t += eps / d_len;
@@ -359,15 +410,15 @@ impl SdfShape {
         None
     }
 
-    fn make_hit(&self, t: f64, p_obj: Vec3) -> Hit {
+    fn make_hit(&self, xf: &Transform, t: f64, p_obj: Vec3) -> Hit {
         // 収束は面から eps_obj 以内なので、真の面は `p_obj ± eps_obj`（成分ごと）の箱に入る。余裕を見て
         // ERR_BOX_EPS·eps_obj の箱をワールドへ写す（線形部の |A| × 箱 + 通常の浮動小数点誤差）。
         // `offset_ray_origin` は `|n|·p_error` だけ法線方向へ押し出す。これは物体空間で少なくとも
         // ERR_BOX_EPS·eps_obj（= 4·eps_obj > eps_obj）の深さに相当し、反射・透過の再ヒットで
         // `|f| < eps_obj` に再び当たらない。
         let b = ERR_BOX_EPS * self.eps_obj;
-        let (p, p_error) = self.xform.apply_point_with_error(p_obj, Vec3::new(b, b, b));
-        let n = self.xform.apply_normal(self.tree.normal(p_obj, self.normal_h));
+        let (p, p_error) = xf.apply_point_with_error(p_obj, Vec3::new(b, b, b));
+        let n = xf.apply_normal(self.tree.normal(p_obj, self.normal_h));
         Hit {
             t,
             p,
@@ -666,5 +717,98 @@ mod tests {
     fn empty_tree_or_non_finite_bounds_make_no_shape() {
         assert!(SdfShape::new(SdfTree::new(), Transform::identity(), 0).is_none());
         assert!(SdfShape::new(sphere_tree(Vec3::new(f64::NAN, 0.0, 0.0), 1.0), Transform::identity(), 0).is_none());
+    }
+
+    // ---- モーションブラー ----
+
+    fn moving_sphere(end_x: f64) -> SdfShape {
+        let mut s = SdfShape::new(sphere_tree(Vec3::new(0.0, 0.0, 0.0), 1.0), Transform::identity(), 2).unwrap();
+        assert!(s.set_end_transform(Transform::translate(Vec3::new(end_x, 0.0, 0.0))));
+        s
+    }
+
+    #[test]
+    fn moving_sdf_sphere_hits_the_interpolated_position() {
+        let shape = moving_sphere(4.0);
+        assert!(shape.is_animated());
+        for time in [0.0, 0.25, 0.5, 1.0] {
+            let cx = 4.0 * time;
+            let r = Ray { o: Vec3::new(cx, 0.0, 10.0), d: Vec3::new(0.0, 0.0, -1.0), time };
+            let h = shape.hit(r, 0.0, 1e9).unwrap_or_else(|| panic!("no hit at time {time}"));
+            assert!((h.t - 9.0).abs() < 1e-5, "time {time}: t = {}", h.t);
+            // 別の時刻の位置には当たらない（球の外）
+            let far = Ray { o: Vec3::new(cx + 3.0, 0.0, 10.0), d: Vec3::new(0.0, 0.0, -1.0), time };
+            assert!(shape.hit(far, 0.0, 1e9).is_none(), "time {time}");
+        }
+        // 静止形は time を見ない
+        let still = SdfShape::new(sphere_tree(Vec3::new(0.0, 0.0, 0.0), 1.0), Transform::identity(), 0).unwrap();
+        assert!(!still.is_animated());
+        let r = Ray { o: Vec3::new(0.0, 0.0, 10.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.9 };
+        assert!(still.hit(r, 0.0, 1e9).is_some());
+    }
+
+    #[test]
+    fn swept_bounds_contain_the_shape_at_every_time_for_either_call_order() {
+        let contains = |b: Aabb, p: Vec3| (0..3).all(|k| [p.x, p.y, p.z][k] >= [b.min.x, b.min.y, b.min.z][k] && [p.x, p.y, p.z][k] <= [b.max.x, b.max.y, b.max.z][k]);
+        for shutter_first in [true, false] {
+            let mut w = World::new();
+            if shutter_first {
+                w.set_shutter(0.0, 1.0);
+            }
+            let shape = {
+                let mut s = SdfShape::new(sphere_tree(Vec3::new(0.0, 0.0, 0.0), 1.0), Transform::identity(), 0).unwrap();
+                // 動きは平行移動 + 回転
+                assert!(s.set_end_transform(Transform::translate(Vec3::new(5.0, 1.0, 0.0)).compose(Transform::rotate(Vec3::new(0.0, 1.0, 0.0), 90.0))));
+                s
+            };
+            w.add_sdf(shape);
+            if !shutter_first {
+                w.set_shutter(0.0, 1.0);
+            }
+            let b = w.sdfs()[0].world_bounds();
+            for k in 0..=20 {
+                let time = k as f64 / 20.0;
+                let xf = w.sdfs()[0].transform_at(time);
+                for d in [Vec3::new(1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, -1.0)] {
+                    assert!(contains(b, xf.apply_point(d)), "shutter_first={shutter_first} time={time}: {:?} outside {:?}", xf.apply_point(d), b);
+                }
+            }
+            assert!(contains(w.bounds(), Vec3::new(5.0, 1.0, 0.0)), "World::bounds covers the end position");
+        }
+        // シャッターを狭めると境界も縮む（作り直されている）
+        let mut w = World::new();
+        w.add_sdf(moving_sphere(10.0));
+        let wide = w.sdfs()[0].world_bounds().max.x;
+        w.set_shutter(0.0, 0.2);
+        assert!(w.sdfs()[0].world_bounds().max.x < wide - 5.0);
+    }
+
+    #[test]
+    fn moving_sdf_agrees_between_linear_and_tlas() {
+        let mut w = World::new();
+        w.add_sdf(moving_sphere(6.0));
+        let rays: Vec<Ray> = (0..40)
+            .map(|i| {
+                let time = (i % 5) as f64 / 4.0;
+                Ray { o: Vec3::new(6.0 * time + 0.3 * (i as f64 * 0.7).sin(), 0.4 * (i as f64).cos(), 8.0), d: Vec3::new(0.0, 0.0, -1.0), time }
+            })
+            .collect();
+        let lin: Vec<_> = rays.iter().map(|&r| (w.hit(r, 0.0, 1e9).map(|h| h.t), w.occluded(r, 0.0, 1e9, None))).collect();
+        for k in 0..25 {
+            w.add_sphere(Sphere { c: Vec3::new(30.0 + 3.0 * k as f64, 0.0, 0.0), r: 1.0, mat_id: 0 });
+        }
+        let tlas: Vec<_> = rays.iter().map(|&r| (w.hit(r, 0.0, 1e9).map(|h| h.t), w.occluded(r, 0.0, 1e9, None))).collect();
+        assert_eq!(lin, tlas);
+        assert!(lin.iter().any(|(h, _)| h.is_some()));
+    }
+
+    #[test]
+    fn object_space_point_follows_the_hit_time() {
+        let mut w = World::new();
+        w.add_sdf(moving_sphere(4.0));
+        let r = Ray { o: Vec3::new(2.0, 0.0, 10.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.5 };
+        let h = w.hit(r, 0.0, 1e9).unwrap();
+        let p = w.object_space_point(&h, 0.5);
+        assert!((p - Vec3::new(0.0, 0.0, 1.0)).len() < 1e-4, "{p:?}"); // 中心 x=2 の球の上端 → 物体空間 (0, 0, 1)
     }
 }

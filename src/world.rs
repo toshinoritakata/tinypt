@@ -819,8 +819,9 @@ impl World {
     }
 
     /// SDF を追加し、その `World::sdfs` 上のインデックスを返す。
-    pub fn add_sdf(&mut self, sdf: SdfShape) -> usize {
+    pub fn add_sdf(&mut self, mut sdf: SdfShape) -> usize {
         self.tlas = OnceLock::new();
+        sdf.refresh_bounds(self.shutter); // 動く SDF は現在のシャッター区間の掃過ボリューム（set_shutter との順序を問わない）
         let idx = self.sdfs.len();
         self.sdfs.push(sdf);
         idx
@@ -920,6 +921,11 @@ impl World {
     pub fn set_shutter(&mut self, open: f64, close: f64) {
         self.tlas = OnceLock::new();
         self.shutter = (open, close);
+        for sdf in &mut self.sdfs {
+            if sdf.is_animated() {
+                sdf.refresh_bounds((open, close));
+            }
+        }
         for id in 0..self.instances.len() {
             if self.instances[id].anim.is_some() {
                 self.refresh_swept_bounds(id);
@@ -1344,9 +1350,9 @@ impl World {
                     Some(Some(end)) => hit.p - lerp_center(s.c, *end, time).0,
                     _ => hit.p - s.c,
                 },
-                // SDF（`prim_id` が球の数以上）: SDF の変換の逆
+                // SDF（`prim_id` が球の数以上）: ヒットの時刻の SDF の変換の逆
                 None => match hit.prim_id.checked_sub(self.spheres.len()).and_then(|i| self.sdfs.get(i)) {
-                    Some(sdf) => sdf.transform().apply_point_inv(hit.p),
+                    Some(sdf) => sdf.transform_at(time).apply_point_inv(hit.p),
                     None => hit.p,
                 },
             },
