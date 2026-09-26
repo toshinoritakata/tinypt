@@ -455,6 +455,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 <sensor type="perspective">
   <float name="shutter_open" value="0"/>     <!-- 既定 0、[0, 1] -->
   <float name="shutter_close" value="1"/>    <!-- 既定 1。0.5 にすると動きが半分になる -->
+  <float name="shutter_angle" value="180"/>  <!-- 独自拡張。1 フレーム中の割合: close = open + angle/360。180 = フィルムの標準 -->
   <transform name="to_world">     <lookat origin="6.4, 3.15, 0" target="0, 0.55, 0" up="0, 1, 0"/></transform>
   <transform name="to_world_end"> <lookat origin="6.2, 3.15, 1.6" target="0, 0.55, 0" up="0, 1, 0"/></transform>  <!-- 独自拡張。省略で静止 -->
 </sensor>
@@ -467,6 +468,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - `to_world_end` は回転・スケール・せん断を含む**一般のアフィン変換**に対応する。行列を直接補間すると回転が縮むので、読み込み時に極分解 (`A = R·S`) して、平行移動は線形・回転は四元数 slerp・伸縮は成分ごとに線形補間する。省略した形状は静止で、従来と出力がビット単位で同じ。
 - `to_world_end` と `filename_end` は**併用できる** (頂点の変形と変換の動きが両方効く)。
 - 開・閉どちらかの変換が**特異または鏡像** (行列式が負) のときは補間できないので、警告して静止のままにする。
+- `shutter_angle` (度、[0, 360]、独自拡張) を書くと `shutter_close = shutter_open + angle/360` になり、`shutter_close` は無視される (警告)。時刻 0..1 が 1 フレームなので、180 でブラーの長さが 360 (既定) の半分、0 でブラー無し。範囲外・非有限は警告して無視する。
 - `shutter_open > shutter_close` は入れ替え、`shutter_open == shutter_close` は時刻固定 (ブラー無し) で有効。範囲外は [0, 1] に収める (頂点モーションの鍵が時刻 0 と 1 のため)。
 - 動かせるのはメッシュ (`obj` / `rectangle` / `cube` / `disk`)・**球**・カメラ。**面光源 (発光するメッシュ・球) は動かせない** (警告して静止)。キーフレームは 2 つだけ。
 - **球**は `<point name="center_end" .../>` (独自拡張) でシャッター閉じ時点の**中心**を与える。中心を time で**線形補間**するだけで、`to_world_end` は使えない (警告)。球は回転しても見た目が変わらず、拡大縮小は半径で表せるので、動きは平行移動だけで足りる。`radius` のアニメーションは未対応 (半径は固定)。`center_end` の無い球は出力がビット単位で変わらない。

@@ -5,7 +5,7 @@
 //! `docs/adr/0002-mitsuba-xml-scene-format.md` を参照。
 //!
 //! ## 対応要素
-//! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
+//! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance` / `shutter_open` / `shutter_close` / `shutter_angle`（独自拡張、度。`close = open + angle/360`）
 //! - `shape type="sphere"`: `center` / `radius`
 //! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。`to_world_end`（モーションブラー）対応。各プリミティブは `center_end`（カプセルは `a_end` / `b_end`）で個別に動かせる（時刻で線形補間）。スフィアトレーシング、光源にはならない
 //! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
@@ -699,6 +699,20 @@ fn parse_sensor(el: &Element, aspect: f64) -> Camera {
     // open > close は入れ替える。open == close はブラー無し（時刻固定）で有効な指定
     let mut open = el.float("shutter_open").unwrap_or(0.0);
     let mut close = el.float("shutter_close").unwrap_or(1.0);
+    // 独自拡張: `shutter_angle`（度）。時刻 0..1 が 1 フレームなので、フィルムのシャッター角がそのまま
+    // `close = open + angle / 360`（180° = 標準の半分、360° = 既定）になる。`shutter_close` より優先する。
+    // 有限で [0, 360] でないものは警告して従来どおり（`shutter_close` か既定）にする
+    if el.prop("float", "shutter_angle").is_some() {
+        match el.float("shutter_angle") {
+            Some(a) if a.is_finite() && (0.0..=360.0).contains(&a) => {
+                if el.prop("float", "shutter_close").is_some() {
+                    warn("shutter_close is ignored because shutter_angle is given");
+                }
+                close = open + a / 360.0;
+            }
+            _ => warn("shutter_angle must be a finite number of degrees in [0, 360]; ignored"),
+        }
+    }
     if !(open.is_finite() && close.is_finite()) {
         warn("shutter_open / shutter_close must be finite; using 0 and 1");
         (open, close) = (0.0, 1.0);
@@ -3187,6 +3201,50 @@ mod tests {
         let (s, w) = with_sensor(r#"<float name="shutter_open" value="-1"/><float name="shutter_close" value="4"/>"#);
         assert!(w.iter().any(|m| m.contains("clamped")));
         assert_eq!(s.cam.shutter(), (0.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `shutter_angle`（度）: close = open + angle / 360。`shutter_close` より優先、範囲外・非有限は警告して従来どおり。
+    #[test]
+    fn sensor_shutter_angle() {
+        let dir = motion_dir("shang");
+        let with_sensor = |props: &str| {
+            let xml = format!(
+                r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/>{props}</sensor>{}</scene>"#,
+                obj_shape("a.obj", 0.0, DIFFUSE_A, END_TRANSFORM)
+            );
+            capture_warnings(|| load_scene_from_str(&xml, &dir, &cfg(), (None, None)).unwrap().0)
+        };
+        let ang = |a: &str| format!(r#"<float name="shutter_angle" value="{a}"/>"#);
+        let (s, w) = with_sensor(&ang("180"));
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.cam.shutter(), (0.0, 0.5));
+        let (s, w) = with_sensor(&format!(r#"<float name="shutter_open" value="0.25"/>{}"#, ang("90")));
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.cam.shutter(), (0.25, 0.5));
+        let (s, w) = with_sensor(&ang("0"));
+        assert!(w.is_empty(), "{w:?}");
+        let (o, c) = s.cam.shutter();
+        assert_eq!(o, c);
+        let (s, w) = with_sensor(&ang("360"));
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.cam.shutter(), (0.0, 1.0));
+        // shutter_close と併記: 警告して角度が勝つ
+        let (s, w) = with_sensor(&format!(r#"<float name="shutter_close" value="0.9"/>{}"#, ang("90")));
+        assert!(w.iter().any(|m| m.contains("shutter_close is ignored")), "{w:?}");
+        assert_eq!(s.cam.shutter(), (0.0, 0.25));
+        // 負・360 超・NaN: 警告して従来どおり（shutter_close か既定）
+        for bad in ["-10", "400", "nan"] {
+            let (s, w) = with_sensor(&ang(bad));
+            assert!(w.iter().any(|m| m.contains("shutter_angle must be")), "{bad}: {w:?}");
+            assert_eq!(s.cam.shutter(), (0.0, 1.0), "{bad}");
+            let (s, _) = with_sensor(&format!(r#"<float name="shutter_close" value="0.4"/>{}"#, ang(bad)));
+            assert_eq!(s.cam.shutter(), (0.0, 0.4), "{bad} falls back to shutter_close");
+        }
+        // open + angle/360 > 1: 収めて警告
+        let (s, w) = with_sensor(&format!(r#"<float name="shutter_open" value="0.8"/>{}"#, ang("180")));
+        assert!(w.iter().any(|m| m.contains("clamped")), "{w:?}");
+        assert_eq!(s.cam.shutter(), (0.8, 1.0));
         std::fs::remove_dir_all(&dir).ok();
     }
 
