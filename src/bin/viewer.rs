@@ -40,6 +40,8 @@ use tinypt::{
 
 /// レンダー用スレッドの状態（GUI が読む）。
 enum Phase {
+    /// シーン未選択（`--scene` なしの起動）。ワーカーは無く、何も描かない
+    Idle,
     Loading,
     Rendering { probe: Arc<RenderProbe>, config: Arc<RenderConfig>, start: Instant },
     Finished { probe: Arc<RenderProbe>, config: Arc<RenderConfig>, elapsed: Duration, cancelled: bool },
@@ -96,6 +98,11 @@ impl Job {
         Job { phase, cancel, handle: Some(handle), path }
     }
 
+    /// シーン未選択のジョブ（ワーカー無し）。組み込みシーンは描かない。
+    fn idle() -> Self {
+        Job { phase: Arc::new(Mutex::new(Phase::Idle)), cancel: Arc::new(AtomicBool::new(false)), handle: None, path: None }
+    }
+
     fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Phase::Rendering { probe, .. } = &*self.phase.lock().unwrap() {
@@ -115,6 +122,7 @@ fn resolved_pixels(probe: &RenderProbe, config: &RenderConfig, denoise_it: bool)
 
 /// 1 フレーム分のフェーズのスナップショット（ロックは短く）。
 enum Snap {
+    Idle,
     Loading,
     Live { probe: Arc<RenderProbe>, config: Arc<RenderConfig>, elapsed: Duration, finished: bool, cancelled: bool },
     Failed(String),
@@ -254,7 +262,8 @@ struct App {
 impl App {
     fn new(base: RenderConfig, overrides: CliOverrides) -> Self {
         let overrides = Arc::new(overrides);
-        let job = Job::start(base.clone(), overrides.clone(), None);
+        // `--scene` なしなら組み込みシーンを描かず、シーンが選ばれるまで待つ（CLI の tinypt は従来どおり組み込みを描く）
+        let job = if base.scene_path.is_some() { Job::start(base.clone(), overrides.clone(), None) } else { Job::idle() };
         Self {
             view: View { tonemap: base.tonemap, exposure: base.exposure, denoise: base.denoise_enabled },
             shown_view: None,
@@ -314,6 +323,10 @@ impl App {
     /// UI は待たない）。CLI 由来の上書き（`--res` / `--spp` など）は `load_with_overrides` が同じ規則で適用する。
     /// 表示中のテクスチャは、新しいシーンが描き始めるまで（失敗したらそのまま）残す。
     fn open_scene(&mut self, path: Option<String>) {
+        // シーン未選択のまま Reload / 適用が来ても、組み込みシーンにはフォールバックせず何もしない
+        if path.is_none() {
+            return;
+        }
         self.job.cancel();
         let prev = self.job.handle.take();
         let mut config = self.base.clone();
@@ -352,6 +365,9 @@ impl App {
         self.base.adaptive_threshold = e.threshold;
         self.overrides = Arc::new(ov);
         let p = self.job.path.clone();
+        if p.is_none() {
+            self.active = self.edit; // シーン未選択: 描き直しは無いが、値は次に開くシーンから効く
+        }
         self.open_scene(p);
     }
 
@@ -409,6 +425,7 @@ impl App {
 
     fn snapshot(&self) -> Snap {
         match &*self.job.phase.lock().unwrap() {
+            Phase::Idle => Snap::Idle,
             Phase::Loading => Snap::Loading,
             Phase::Rendering { probe, config, start } => Snap::Live {
                 probe: probe.clone(),
@@ -656,7 +673,7 @@ impl eframe::App for App {
                         self.open_scene(Some(sc));
                     }
                 }
-                if ui.button("Reload").clicked() {
+                if ui.add_enabled(self.job.path.is_some(), egui::Button::new("Reload")).clicked() {
                     let p = self.job.path.clone();
                     self.open_scene(p);
                 }
@@ -666,6 +683,9 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.one_to_one, "1:1");
             });
             ui.horizontal(|ui| match &snap {
+                Snap::Idle => {
+                    ui.label("no scene selected — enter a path, or use Open… / the scenes list");
+                }
                 Snap::Loading => {
                     ui.label(format!("loading {}…", self.job.path.as_deref().unwrap_or("built-in scene")));
                 }
@@ -799,7 +819,12 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(tex) = &self.texture else { return };
+            let Some(tex) = &self.texture else {
+                if matches!(snap, Snap::Idle) {
+                    ui.centered_and_justified(|ui| ui.weak("No scene selected"));
+                }
+                return;
+            };
             let [w, h] = tex.size();
             // 常に 1 行出す（生 / デノイズで画像の位置がずれないように）。古さもここに出す
             let cur = match &snap {
