@@ -24,9 +24,10 @@ use crate::medium::{hg_eval, hg_sample, Medium, MediumEvent};
 use crate::ray::Ray;
 use crate::rng::Rng;
 use crate::sampler::{bounce_dim, role};
-use crate::normal_map::{orthonormalize, MapId, NormalMap};
-use crate::noise::NoiseTexture;
-use crate::texture::Texture;
+use crate::normal_map::{orthonormalize, MapId};
+use crate::shader::{ShadeCtx, ShaderSet};
+#[cfg(test)]
+use crate::shader::TexRef;
 use crate::world::{DeltaLight, World};
 
 /// デフォルトの空色を返す（環境マップ未使用時のフォールバック）。
@@ -70,8 +71,7 @@ pub struct PathLimits {
 /// MIS で重みを統合して蓄積する。
 pub fn radiance(
     world: &World,
-    mats: &[Material],
-    surfaces: &Surfaces,
+    shaders: &ShaderSet,
     env: Option<&EnvMap>,
     medium: Option<&Medium>,
     ray: Ray,
@@ -180,15 +180,16 @@ pub fn radiance(
             }
         };
 
-        // テクスチャはここで 1 度だけ交差点の UV で評価し、以降の BSDF はテクスチャを知らない
-        let mat = mats[hit.mat_id].resolve_textures(surfaces.textures, surfaces.noises, |local| if local { world.object_space_point(&hit, ray.time) } else { hit.p }, hit.uv);
+        // 材質のパラメータ（テクスチャ・ノイズなどの式）はここで 1 度だけ交差点で評価して具体的な `Material` にし、
+        // 以降の BSDF は式を知らない。式が無い材質は基底の `Material` をそのまま返す（早道）
+        let mat = shaders.evaluate(hit.mat_id, &ShadeCtx { world, hit: &hit, time: ray.time });
 
         // 法線マップ／バンプマップ: シェーディング法線 `ns` だけを摂動する（1 か所。NEE も `Material::sample` も
         // この後の `hit.ns` を見るので、両方が同じ摂動後の法線になる）。`ng` / `p` / `p_error` には触れない
         // （原点ずらし・表裏判定・光源の面積と pdf は幾何法線基準のまま）。
         let mut hit = hit;
-        if let Some(map_id) = surfaces.map_for(hit.mat_id) {
-            perturb_shading_normal(world, surfaces, map_id, &mut hit, ray.time);
+        if let Some(map_id) = shaders.normal_map(hit.mat_id) {
+            perturb_shading_normal(world, shaders, map_id, &mut hit, ray.time);
         }
         let hit = hit;
 
@@ -296,40 +297,10 @@ pub fn radiance(
     accumulated_radiance
 }
 
-/// 材質ごとのサーフェス属性（色テクスチャと法線マップ）への参照の束。
-pub struct Surfaces<'a> {
-    pub textures: &'a [Texture],
-    pub noises: &'a [NoiseTexture],
-    pub normal_maps: &'a [NormalMap],
-    /// `mat_id` → `normal_maps` の添字。空ならマップ無し（[`Scene::mat_maps`](crate::scene::Scene::mat_maps) の不変条件）
-    pub mat_maps: &'a [Option<MapId>],
-}
-
-impl<'a> Surfaces<'a> {
-    /// マップ無し・テクスチャ無し（テスト用）。
-    pub const fn none() -> Surfaces<'static> {
-        Surfaces { textures: &[], noises: &[], normal_maps: &[], mat_maps: &[] }
-    }
-
-    /// 色テクスチャだけ（法線マップ無し）。
-    pub const fn textures_only(textures: &'a [Texture]) -> Surfaces<'a> {
-        Surfaces { textures, noises: &[], normal_maps: &[], mat_maps: &[] }
-    }
-
-    /// 材質 `mat_id` の法線マップ。テーブルが空なら即 `None`（マップを使わないシーンのコストは分岐 1 つ）。
-    #[inline]
-    fn map_for(&self, mat_id: usize) -> Option<MapId> {
-        if self.mat_maps.is_empty() {
-            return None;
-        }
-        self.mat_maps.get(mat_id).copied().flatten()
-    }
-}
-
 /// `hit.ns` を材質のマップで摂動する（`ng` などは不変）。接空間を作れない（球・UV 無し・UV 縮退・退化）、
 /// または摂動後が幾何法線の地平線を割る場合は何もしない（元の `ns` のまま）。
-fn perturb_shading_normal(world: &World, surfaces: &Surfaces, map_id: MapId, hit: &mut Hit, time: f64) {
-    let Some(map) = surfaces.normal_maps.get(map_id as usize) else { return };
+fn perturb_shading_normal(world: &World, shaders: &ShaderSet, map_id: MapId, hit: &mut Hit, time: f64) {
+    let Some(map) = shaders.normal_maps.get(map_id as usize) else { return };
     let Some((dpdu, dpdv)) = world.surface_tangents(hit, time) else { return };
     let Some((t, b)) = orthonormalize(dpdu, dpdv, hit.ns) else { return };
     let n_pert = map.perturb(hit.uv, t, b, hit.ns, dpdu.len(), dpdv.len());
@@ -655,7 +626,7 @@ mod tests {
     }
 
     fn floor_setup() -> (Material, Vec3, Vec3, Ray) {
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
         let p = Vec3::new(0.0, 0.0, 0.0);
         let n = Vec3::new(0.0, 1.0, 0.0);
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
@@ -762,7 +733,7 @@ mod tests {
     fn floor_under_sphere_light() -> (World, Vec<Material>, EnvMap) {
         use crate::geometry::Sphere;
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None },
+            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) },
             Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) },
         ];
         let mut world = World::new();
@@ -780,7 +751,7 @@ mod tests {
         use crate::transform::Transform;
         use crate::world::test_meshes::tilted_quad;
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None },
+            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) },
             Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) },
         ];
         let mut world = World::new();
@@ -819,7 +790,7 @@ mod tests {
         let mut s2 = 0.0;
         for i in 0..n {
             let mut rng = Rng::sobol(seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15), seed as u32, i as u32);
-            let x = radiance(world, mats, &Surfaces::none(), Some(env), None, ray, &mut rng, limits).r();
+            let x = radiance(world, &ShaderSet::from_materials(mats), Some(env), None, ray, &mut rng, limits).r();
             s += x;
             s2 += x * x;
         }
@@ -838,9 +809,9 @@ mod tests {
         let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
 
         let mut rng = Rng::new(1);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(0)).r(), 0.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(1)).r(), 4.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_floor, &mut rng, limits(1)).r(), 0.0);
+        assert_eq!(radiance(&world, &ShaderSet::from_materials(&mats), Some(&env), None, to_light, &mut rng, limits(0)).r(), 0.0);
+        assert_eq!(radiance(&world, &ShaderSet::from_materials(&mats), Some(&env), None, to_light, &mut rng, limits(1)).r(), 4.0);
+        assert_eq!(radiance(&world, &ShaderSet::from_materials(&mats), Some(&env), None, to_floor, &mut rng, limits(1)).r(), 0.0);
 
         let exact = 0.5 * 4.0 / 9.0;
         for max_depth in [2usize, 3, 8, usize::MAX] {
@@ -934,7 +905,7 @@ mod tests {
         let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
         for (mat, expect) in [
             (Material::Dielectric { ior: 1.5, absorption: Color::new(0.0, 0.0, 0.0) }, 1.0),
-            (Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }, 0.8),
+            (Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }, 0.8),
         ] {
             for (k, offset) in [(1e-3, 0.0), (1e3, 0.0), (1.0, 1e8), (1e-3, 1e8)] {
                 let mats = vec![mat];
@@ -980,7 +951,7 @@ mod tests {
     #[test]
     fn area_light_nee_shadow_ray_starts_from_the_geometric_offset() {
         let (hit, ng, ns, ray) = tilted_hit();
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
         // ns 側にも ng 側にもある方向（どちらの半球でも表）に光源を置く
         let light_p = Vec3::new(1.0, 0.0, 1.0);
         let ls = LightSample {
@@ -1013,7 +984,7 @@ mod tests {
     #[test]
     fn env_nee_shadow_ray_starts_from_the_geometric_offset() {
         let (hit, ng, ns, ray) = tilted_hit();
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
         let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
         let mut rng = Rng::new(4);
         let seen: Cell<Option<(Vec3, Vec3)>> = Cell::new(None);
@@ -1045,7 +1016,7 @@ mod tests {
     #[test]
     fn nee_contributions_below_the_geometry_are_dropped() {
         let (hit, ng, ns, ray) = tilted_hit();
-        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) };
         // ns から見て表（cos > 0）だが ng から見て裏（z < 0）の方向にある光源。
         // 面は 1 枚ポリゴンなので、遮蔽判定（closest_hit）は何も返さない = 遮られない。
         let wedge = Vec3::new(0.9, 0.0, -0.436).norm();
@@ -1100,7 +1071,7 @@ mod tests {
         use crate::world::test_meshes::tilted_quad;
         let ns = Vec3::new(0.866_025_403_784_438_6, 0.0, 0.5); // 面法線 +z から 60 度
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None },
+            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) },
             Material::DiffuseLight { emit: Color::new(40.0, 40.0, 40.0) },
         ];
         let mut world = World::new();
@@ -1132,7 +1103,7 @@ mod tests {
         use crate::transform::Transform;
         use crate::world::test_meshes::tilted_quad;
         let mats = vec![
-            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None },
+            Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) },
             Material::DiffuseLight { emit: Color::new(60.0, 60.0, 60.0) },
         ];
         let mut world = World::new();
@@ -1220,7 +1191,7 @@ mod tests {
         // 反射率だけが違う 2 つの一様テクスチャ
         let mean_for = |reflectance: f64| {
             let mats = vec![
-                Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: Some(0) },
+                Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) },
                 Material::DiffuseLight { emit: Color::new(60.0, 60.0, 60.0) },
             ];
             let v = (reflectance * 255.0).round() as u8;
@@ -1230,10 +1201,15 @@ mod tests {
                 tilted_quad(8.0, Vec3::new(0.0, 0.0, 1.0), 0), Transform::identity(), None);
             world.add_sphere(Sphere { c: light_dir * 6.0, r: 0.3, mat_id: 1 });
             world.build_lights(&mats);
+            // 反射率 = 定数（白）× 一様テクスチャ（式 `Mul(Const, Texture)`）
+            let mut sh = ShaderSet::default();
+            sh.textures = textures;
+            sh.push(mats[0], Some(TexRef::Image(0)), None);
+            sh.push(mats[1], None, None);
             let mut rng = Rng::new(3);
             let (mut sum, n) = (0.0, 20_000);
             for _ in 0..n {
-                sum += radiance(&world, &mats, &Surfaces::textures_only(&textures), Some(&env), None, ray, &mut rng,
+                sum += radiance(&world, &sh, Some(&env), None, ray, &mut rng,
                                 PathLimits { max_depth: 2, rr_depth: 8 }).r();
             }
             sum / n as f64
@@ -1260,7 +1236,7 @@ mod tests {
     fn smooth_sphere_mesh_white_furnace_loses_little_energy() {
         use crate::transform::Transform;
         use crate::world::test_meshes::uv_sphere;
-        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }];
         let env = EnvMap::constant(Color::new(1.0, 1.0, 1.0));
         let mut means = Vec::new();
         for smooth in [true, false] {
@@ -1286,7 +1262,7 @@ mod tests {
     #[test]
     fn lambert_sphere_white_furnace_is_unbiased_with_russian_roulette() {
         use crate::geometry::Sphere;
-        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }];
         let mut world = World::new();
         world.add_sphere(Sphere { c: Vec3::new(0.0, 0.0, 0.0), r: 1.0, mat_id: 0 });
         world.build_lights(&mats);
@@ -1318,7 +1294,7 @@ mod tests {
         for (k, offset) in [(1.0, 0.0), (1e-3, 0.0), (1.0, 1e8)] {
             let base = Vec3::new(offset, -0.5 * offset, 0.25 * offset);
             let mats = vec![
-                Material::Lambert { albedo: Color::new(albedo, albedo, albedo), albedo_tex: None },
+                Material::Lambert { albedo: Color::new(albedo, albedo, albedo) },
                 Material::DiffuseLight { emit: Color::new(emit, emit, emit) },
             ];
             let mut world = World::new();
@@ -1356,7 +1332,7 @@ mod tests {
         let (mut s, mut s2) = ([0.0; 3], [0.0; 3]);
         for i in 0..n {
             let mut rng = Rng::sobol(seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15), seed as u32, i as u32);
-            let c = radiance(world, mats, &Surfaces::none(), Some(env), Some(med), ray, &mut rng, limits);
+            let c = radiance(world, &ShaderSet::from_materials(mats), Some(env), Some(med), ray, &mut rng, limits);
             for (i, x) in [c.r(), c.g(), c.b()].into_iter().enumerate() {
                 s[i] += x;
                 s2[i] += x * x;
@@ -1505,7 +1481,7 @@ mod tests {
 
     const RHO: f64 = 0.6;
     fn lambert() -> Vec<Material> {
-        vec![Material::Lambert { albedo: Color::new(RHO, RHO, RHO), albedo_tex: None }]
+        vec![Material::Lambert { albedo: Color::new(RHO, RHO, RHO) }]
     }
     fn black_env() -> EnvMap {
         EnvMap::constant(Color::new(0.0, 0.0, 0.0))
@@ -1516,7 +1492,7 @@ mod tests {
         let ray = Ray { o: from, d: (target - from).norm(), time: 0.0 };
         let mut rng = Rng::new(1);
         let env = black_env();
-        radiance(world, mats, &Surfaces::none(), Some(&env), medium, ray, &mut rng, PathLimits { max_depth: 3, rr_depth: 1000 }).r()
+        radiance(world, &ShaderSet::from_materials(mats), Some(&env), medium, ray, &mut rng, PathLimits { max_depth: 3, rr_depth: 1000 }).r()
     }
 
     fn close(a: f64, b: f64, rel: f64) -> bool {
@@ -1744,10 +1720,6 @@ mod map_tests {
         load_scene_from_str(xml, dir, &RenderConfig::default(), (None, None)).unwrap().0
     }
 
-    fn surfaces(s: &Scene) -> Surfaces<'_> {
-        Surfaces { textures: &s.textures, noises: &s.noises, normal_maps: &s.normal_maps, mat_maps: &s.mat_maps }
-    }
-
     /// `tf`（`<transform>` の中身）を付けた 1 枚の板（法線 +z、UV = (x+1)/2, (y+1)/2）に、`bsdf` を貼る。
     fn plate_xml(tf: &str, bsdf: &str, extra: &str) -> String {
         format!(
@@ -1775,11 +1747,10 @@ mod map_tests {
         let dir = tmpdir();
         write_png(&dir, "n.png", 1, 1, &[[230, 128, 190]]);
         let s = scene(&plate_xml("", &normalmap_bsdf("n.png"), ""), &dir);
-        let sf = surfaces(&s);
         let orig = s.world.hit(down_ray(0.3, 0.2), 0.0, 1e30).unwrap();
         let mut h = orig;
-        let id = sf.map_for(h.mat_id).expect("材質にマップが付いていない");
-        perturb_shading_normal(&s.world, &sf, id, &mut h, 0.0);
+        let id = s.shaders.normal_map(h.mat_id).expect("材質にマップが付いていない");
+        perturb_shading_normal(&s.world, &s.shaders, id, &mut h, 0.0);
         let bits = |v: Vec3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
         assert_eq!(bits(h.ng), bits(orig.ng), "ng が変わった");
         assert_eq!(bits(h.p), bits(orig.p), "p が変わった");
@@ -1799,13 +1770,12 @@ mod map_tests {
         write_png(&dir, "n.png", 1, 1, &[[255, 128, 60]]);
         for tf in [r#"<scale x="-5" y="5" z="1"/>"#, r#"<scale x="5" y="-5" z="1"/>"#, r#"<scale x="5" y="5" z="-1"/>"#] {
             let s = scene(&plate_xml(tf, &normalmap_bsdf("n.png"), ""), &dir);
-            let sf = surfaces(&s);
             for &(x, y) in &[(0.3, 0.2), (-1.0, 0.7), (2.0, -1.5)] {
                 for &zs in &[3.0, -3.0] {
                     let r = Ray { o: Vec3::new(x, y, zs), d: Vec3::new(0.0, 0.0, -zs.signum()), time: 0.0 };
                     let orig = s.world.hit(r, 0.0, 1e30).unwrap();
                     let mut h = orig;
-                    perturb_shading_normal(&s.world, &sf, sf.map_for(h.mat_id).unwrap(), &mut h, 0.0);
+                    perturb_shading_normal(&s.world, &s.shaders, s.shaders.normal_map(h.mat_id).unwrap(), &mut h, 0.0);
                     assert!(h.ns.dot(h.ng) > 0.0, "{}: ns·ng = {}", tf, h.ns.dot(h.ng));
                     assert!((h.ns - orig.ns).len() > 0.1, "{}: 摂動が捨てられた", tf);
                 }
@@ -1826,13 +1796,12 @@ mod map_tests {
         write_png(&dir, "n.png", 1, 1, &[rgb]);
         let env = r#"<emitter type="constant"><rgb name="radiance" value="1,1,1"/></emitter>"#;
         let s = scene(&plate_xml("", &normalmap_bsdf("n.png"), env), &dir);
-        let sf = surfaces(&s);
         let limits = PathLimits { max_depth: 2, rr_depth: 8 };
         let mut rng = Rng::new(11);
         let n = 60_000;
         let mut sum = 0.0;
         for _ in 0..n {
-            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits).g();
+            sum += radiance(&s.world, &s.shaders, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits).g();
         }
         let got = sum / n as f64;
 
@@ -1871,11 +1840,10 @@ mod map_tests {
         let limits = PathLimits { max_depth: 2, rr_depth: 8 };
         let run = |xml: &str| {
             let s = scene(xml, &dir);
-            let sf = surfaces(&s);
             let mut rng = Rng::new(3);
             let mut sum = 0.0;
             for _ in 0..4000 {
-                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits).g();
+                sum += radiance(&s.world, &s.shaders, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits).g();
             }
             sum
         };
@@ -1908,12 +1876,11 @@ mod map_tests {
         }
         write_png(&dir, "n.png", n as u32, n as u32, &px);
         let s = scene(&plate_xml("", &normalmap_bsdf("n.png"), ""), &dir);
-        let sf = surfaces(&s);
         for row in 0..n {
             for col in 0..n {
                 let (u, v) = ((col as f64 + 0.5) / n as f64, 1.0 - (row as f64 + 0.5) / n as f64);
                 let mut h = s.world.hit(down_ray(2.0 * u - 1.0, 2.0 * v - 1.0), 0.0, 1e30).unwrap();
-                perturb_shading_normal(&s.world, &sf, sf.map_for(h.mat_id).unwrap(), &mut h, 0.0);
+                perturb_shading_normal(&s.world, &s.shaders, s.shaders.normal_map(h.mat_id).unwrap(), &mut h, 0.0);
                 let w = want[row * n + col];
                 assert!((h.ns - w).len() < 1e-6, "({},{}): {:?} vs {:?}", row, col, (h.ns.x, h.ns.y, h.ns.z), (w.x, w.y, w.z));
             }
@@ -1938,12 +1905,11 @@ mod map_tests {
             normalmap_bsdf("n.png")
         );
         let s = scene(&xml, &dir);
-        let sf = surfaces(&s);
         let mut rng = Rng::new(9);
         let limits = PathLimits { max_depth: 6, rr_depth: 8 };
         for _ in 0..20_000 {
             let d = crate::rng::uniform_sphere_dir(&mut rng);
-            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits);
+            let c = radiance(&s.world, &s.shaders, s.env.as_ref(), None, Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits);
             assert_eq!(c.r(), 0.0, "立方体の内側に光が漏れた");
         }
         std::fs::remove_dir_all(&dir).ok();

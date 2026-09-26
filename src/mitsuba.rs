@@ -35,7 +35,8 @@ use crate::env::EnvMap;
 use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
-use crate::material::{TexId, NOISE_TEX_FLAG};
+use crate::material::TexId;
+use crate::shader::{ShaderSet, TexRef};
 use crate::noise::{NoiseTexture, Pattern};
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
 use crate::constants::normal_map::MTL_BUMP_K;
@@ -333,7 +334,7 @@ pub fn load_scene_from_str(
     let mut textures: Vec<Texture> = Vec::new();
     let mut mtl_state = MtlState::default();
     let mut normal_maps: Vec<NormalMap> = Vec::new();
-    let mut mat_maps: Vec<Option<MapId>> = Vec::new();
+    let mut mat_maps: Vec<Extra> = Vec::new();
     let mut cam: Option<Camera> = None;
     let mut env: Option<EnvMap> = None;
     let mut medium: Option<Medium> = None;
@@ -403,18 +404,21 @@ pub fn load_scene_from_str(
     let (shutter_open, shutter_close) = cam.shutter();
     world.set_shutter(shutter_open, shutter_close);
     world.build_lights(&mats);
-    // マップを持つ材質が 1 つも無ければテーブルを空にする（積分器は空テーブルなら何も引かない）
-    if mat_maps.iter().all(|m| m.is_none()) {
-        mat_maps.clear();
-    }
-    debug_assert!(mat_maps.is_empty() || mat_maps.len() == mats.len());
     let load_stats = crate::scene::LoadStats {
         obj_parse: OBJ_PARSE_TIME.with(|c| c.get()),
         mesh_build: world.mesh_build_time(),
         texture_load: TEXTURE_LOAD_TIME.with(|c| c.get()),
     };
-    let noises = NOISES.with(|n| std::mem::take(&mut *n.borrow_mut()));
-    Ok((Scene { cam, world, mats, textures, normal_maps, mat_maps, noises, env, medium, load_stats }, settings))
+    // 材質・式・テクスチャ・ノイズ・法線マップを 1 つの `ShaderSet` にまとめる
+    debug_assert_eq!(mats.len(), mat_maps.len());
+    let mut shaders = ShaderSet::default();
+    shaders.textures = textures;
+    shaders.noises = NOISES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+    shaders.normal_maps = normal_maps;
+    for (m, e) in mats.iter().zip(&mat_maps) {
+        shaders.push(*m, e.tex, e.map);
+    }
+    Ok((Scene { cam, world, shaders, env, medium, load_stats }, settings))
 }
 
 /// ファイルパスから Mitsuba シーンを読み込む（[`load_scene_from_str`] の薄いファイル I/O
@@ -737,7 +741,7 @@ fn parse_shape(
     base_dir: &Path,
     world: &mut World,
     mats: &mut Vec<Material>,
-    mat_maps: &mut Vec<Option<MapId>>,
+    mat_maps: &mut Vec<Extra>,
     textures: &mut Vec<Texture>,
     normal_maps: &mut Vec<NormalMap>,
     mtl_state: &mut MtlState,
@@ -762,12 +766,12 @@ fn parse_shape(
     }
     // area emitter があれば面光源、なければ bsdf、どちらも無ければ拡散にフォールバック。
     let (mat, map) = if let Some(em) = shape_emitter(el) {
-        (parse_emitter(em), None)
+        (parse_emitter(em), Extra::default())
     } else if let Some(b) = el.child_tag("bsdf") {
         parse_bsdf(b, base_dir, textures, normal_maps)
     } else {
         warn(&format!("shape type '{}' without bsdf or emitter; defaulting to diffuse", el.typ()));
-        (Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }, None)
+        (Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }, Extra::default())
     };
     let mat_id = mats.len();
 
@@ -889,11 +893,19 @@ fn apply_end_transform(el: &Element, world: &mut World, inst_id: usize, is_emitt
 
 /// 材質を `mats` に積む**唯一の入口**。`mat_maps` は常に `mats` と同じ長さに保つ
 /// （ずれると別の材質にマップが掛かる）。返り値は `mat_id`。
-fn push_material(mats: &mut Vec<Material>, mat_maps: &mut Vec<Option<MapId>>, mat: Material, map: Option<MapId>) -> usize {
+fn push_material(mats: &mut Vec<Material>, mat_maps: &mut Vec<Extra>, mat: Material, map: Extra) -> usize {
     debug_assert_eq!(mats.len(), mat_maps.len(), "mats and mat_maps out of sync");
     mats.push(mat);
     mat_maps.push(map);
     mats.len() - 1
+}
+
+/// 材質ごとの、`Material`（BSDF の値）の外にある付随情報: 法線マップと、アルベドを変調するテクスチャ / ノイズ。
+/// ローダーの内部だけで使い、最後に `ShaderSet::push` で式（`Mul(Const, Texture | Noise)`）に組み立てる。
+#[derive(Clone, Copy, Default)]
+struct Extra {
+    map: Option<MapId>,
+    tex: Option<TexRef>,
 }
 
 /// 法線マップの種別（キャッシュのキー）。
@@ -932,7 +944,7 @@ fn parse_obj_with_mtl(
     base_dir: &Path,
     world: &mut World,
     mats: &mut Vec<Material>,
-    mat_maps: &mut Vec<Option<MapId>>,
+    mat_maps: &mut Vec<Extra>,
     textures: &mut Vec<Texture>,
     normal_maps: &mut Vec<NormalMap>,
     state: &mut MtlState,
@@ -979,7 +991,7 @@ fn parse_obj_with_mtl(
     let base = mats.len();
     // 材質ごとのアルファ（マスク, d）。`mat_names` と同じ添字
     let mut alphas: Vec<Option<(Arc<AlphaMask>, f32)>> = Vec::with_capacity(mat_names.len());
-    let mut maps: Vec<Option<MapId>> = Vec::with_capacity(mat_names.len());
+    let mut maps: Vec<Extra> = Vec::with_capacity(mat_names.len());
     for (mi, name) in mat_names.iter().enumerate() {
         let found = libs.iter().find_map(|(dir, f)| f.get(name).map(|m| (dir, m)));
         let mat = match found {
@@ -991,11 +1003,11 @@ fn parse_obj_with_mtl(
             }
             None => {
                 alphas.push(None);
-                maps.push(None);
+                maps.push(Extra::default());
                 if !name.is_empty() && !mtllibs.is_empty() {
                     warn(&format!("material '{}' not found in mtl; defaulting to diffuse", name));
                 }
-                Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }
+                Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }
             }
         };
         push_material(mats, mat_maps, mat, maps[mi]);
@@ -1115,7 +1127,7 @@ fn mtl_to_material(
     textures: &mut Vec<Texture>,
     normal_maps: &mut Vec<NormalMap>,
     state: &mut MtlState,
-) -> (Material, Option<(Arc<AlphaMask>, f32)>, Option<MapId>) {
+) -> (Material, Option<(Arc<AlphaMask>, f32)>, Extra) {
     let mut unsupported: Vec<&str> = Vec::new();
     if m.map_ka.is_some() { unsupported.push("map_Ka"); }
     if m.ke.iter().any(|&c| c != 0.0) { unsupported.push("Ke (emission)"); }
@@ -1159,14 +1171,14 @@ fn mtl_to_material(
     // ここでは扱わない（優先順位で解く）。
     if let Some(p) = m.map_kd.as_deref() {
         let tex = load_mtl_texture(dir, p, textures, state);
-        return (Material::Lambert { albedo: kd, albedo_tex: tex }, alpha, map);
+        return (Material::Lambert { albedo: kd }, alpha, Extra { map, tex: tex.map(TexRef::Image) });
     }
     if ks.luminance() > 0.05 && m.ns > 1.0 {
         // Blinn-Phong 指数 → GGX の粗さ: alpha = sqrt(2 / (Ns + 2))
         let rough = (2.0 / (m.ns + 2.0)).sqrt().clamp(1e-3, 1.0);
-        return (Material::Ggx { albedo: ks, alpha: rough }, alpha, map);
+        return (Material::Ggx { albedo: ks, alpha: rough }, alpha, Extra { map, tex: None });
     }
-    (Material::Lambert { albedo: kd, albedo_tex: None }, alpha, map)
+    (Material::Lambert { albedo: kd }, alpha, Extra { map, tex: None })
 }
 
 /// Mitsuba `rectangle`: 中心原点・法線 +Z・頂点 [-1,1]² の正方形（2 三角形）。
@@ -1356,9 +1368,9 @@ fn parse_texture(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> 
     }
 }
 
-/// `<texture type="noise">`（**独自拡張**）: 手続き的な 3D ソリッドノイズ。`NOISES` に積み、`NOISE_TEX_FLAG` 付きの
+/// `<texture type="noise">`（**独自拡張**）: 手続き的な 3D ソリッドノイズ。`NOISES` に積み、
 /// 添字を返す。不正な `pattern` は警告して `fbm`、範囲外の値は丸める（`NoiseTexture::sanitized`）。
-fn parse_noise_texture(el: &Element) -> Option<TexId> {
+fn parse_noise_texture(el: &Element) -> Option<TexRef> {
     let pattern = match el.string("pattern") {
         None => Pattern::Fbm,
         Some(s) => Pattern::parse(s).unwrap_or_else(|| {
@@ -1392,7 +1404,7 @@ fn parse_noise_texture(el: &Element) -> Option<TexId> {
     NOISES.with(|n| {
         let mut n = n.borrow_mut();
         n.push(fixed);
-        Some(((n.len() - 1) as TexId) | NOISE_TEX_FLAG)
+        Some(TexRef::Noise((n.len() - 1) as u32))
     })
 }
 
@@ -1437,26 +1449,26 @@ fn parse_bsdf(
     base_dir: &Path,
     textures: &mut Vec<Texture>,
     normal_maps: &mut Vec<NormalMap>,
-) -> (Material, Option<MapId>) {
-    let default_mat = || Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None };
+) -> (Material, Extra) {
+    let default_mat = || Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
     match el.typ() {
         // 両面 BSDF はラッパーなので内側を展開（内側にマップのラッパーがあればそのまま素通し）
         "twosided" => el
             .child_tag("bsdf")
             .map(|c| parse_bsdf(c, base_dir, textures, normal_maps))
-            .unwrap_or((default_mat(), None)),
+            .unwrap_or((default_mat(), Extra::default())),
         // Mitsuba 準拠: `<bsdf type="normalmap">` は子のテクスチャ（タンジェント空間ノーマルマップ）を
         // 内側の `<bsdf>` に適用する。テクスチャは**リニア（raw）固定**で読む
         "normalmap" | "bumpmap" => {
             let is_normal = el.typ() == "normalmap";
-            let (mat, inner_map) = match el.child_tag("bsdf") {
+            let (mat, inner) = match el.child_tag("bsdf") {
                 Some(inner) => parse_bsdf(inner, base_dir, textures, normal_maps),
                 None => {
                     warn(&format!("{} without an inner <bsdf>; defaulting to diffuse", el.typ()));
-                    (default_mat(), None)
+                    (default_mat(), Extra::default())
                 }
             };
-            if inner_map.is_some() {
+            if inner.map.is_some() {
                 // 1 材質スロットに 1 マップ: 外側を採用し、内側のマップは捨てる（登録済みの分は参照されないまま残る）
                 warn(&format!("nested {} inside {}; the outer map is used", el.typ(), el.typ()));
             }
@@ -1491,18 +1503,22 @@ fn parse_bsdf(
             match map {
                 Some(m) => {
                     normal_maps.push(m);
-                    (mat, Some((normal_maps.len() - 1) as MapId))
+                    (mat, Extra { map: Some((normal_maps.len() - 1) as MapId), tex: inner.tex })
                 }
-                None => (mat, inner_map),
+                None => (mat, inner),
             }
         }
-        _ => (parse_leaf_bsdf(el, base_dir, textures), None),
+        _ => {
+            let (mat, tex) = parse_leaf_bsdf(el, base_dir, textures);
+            (mat, Extra { map: None, tex })
+        }
     }
 }
 
 /// マップのラッパーではない通常の `bsdf` をマテリアルにマップする。
-fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> Material {
-    match el.typ() {
+fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -> (Material, Option<TexRef>) {
+    let mut tex_ref: Option<TexRef> = None;
+    let mat = match el.typ() {
         "diffuse" => {
             // `reflectance` はテクスチャか定数色。テクスチャがある場合、定数色は色の倍率になる
             // （両方あれば掛け合わせる。片方だけなら他方は白 = 1 倍）。
@@ -1510,13 +1526,13 @@ fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -
                 if t.typ() == "noise" {
                     parse_noise_texture(t)
                 } else {
-                    parse_texture(t, base_dir, textures)
+                    parse_texture(t, base_dir, textures).map(TexRef::Image)
                 }
             });
             let default = if tex.is_some() { Color::new(1.0, 1.0, 1.0) } else { Color::new(0.5, 0.5, 0.5) };
+            tex_ref = tex;
             Material::Lambert {
                 albedo: el.color("reflectance").unwrap_or(default),
-                albedo_tex: tex,
             }
         }
         "conductor" => Material::Metal {
@@ -1543,10 +1559,10 @@ fn parse_leaf_bsdf(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>) -
             warn(&format!("unsupported bsdf type '{}'; defaulting to diffuse", other));
             Material::Lambert {
                 albedo: el.color("reflectance").unwrap_or(Color::new(0.5, 0.5, 0.5)),
-                albedo_tex: None,
             }
         }
-    }
+    };
+    (mat, tex_ref)
 }
 
 #[cfg(test)]
@@ -1612,10 +1628,10 @@ mod tests {
         );
 
         assert_eq!(scene.world.spheres().len(), 3);
-        assert_eq!(scene.mats.len(), 3);
-        assert!(matches!(scene.mats[0], Material::Lambert { .. }));
-        assert!(matches!(scene.mats[1], Material::Ggx { alpha, .. } if (alpha - 0.25).abs() < 1e-12));
-        assert!(matches!(scene.mats[2], Material::DiffuseLight { .. }));
+        assert_eq!(scene.shaders.shaders.len(), 3);
+        assert!(matches!(scene.shaders.shaders[0].base, Material::Lambert { .. }));
+        assert!(matches!(scene.shaders.shaders[1].base, Material::Ggx { alpha, .. } if (alpha - 0.25).abs() < 1e-12));
+        assert!(matches!(scene.shaders.shaders[2].base, Material::DiffuseLight { .. }));
         // area emitter は build_lights でライトとして登録される
         assert_eq!(scene.world.lights().len(), 1);
     }
@@ -1632,8 +1648,8 @@ mod tests {
               </shape>
             </scene>"#,
         );
-        let srgb = match scene.mats[0] { Material::Lambert { albedo, .. } => albedo, _ => panic!() };
-        let lin = match scene.mats[1] { Material::Lambert { albedo, .. } => albedo, _ => panic!() };
+        let srgb = match scene.shaders.shaders[0].base { Material::Lambert { albedo, .. } => albedo, _ => panic!() };
+        let lin = match scene.shaders.shaders[1].base { Material::Lambert { albedo, .. } => albedo, _ => panic!() };
         // srgb 0.8 はガンマ展開で約 0.603、rgb 0.8 はそのまま 0.8
         assert!((srgb.r() - Color::from_srgb(0.8, 0.8, 0.8).r()).abs() < 1e-12);
         assert!((lin.r() - 0.8).abs() < 1e-12);
@@ -1789,14 +1805,14 @@ mod tests {
             );
             load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
         });
-        assert_eq!(scene.textures.len(), 1, "テクスチャが積まれていない");
-        match scene.mats[0] {
-            Material::Lambert { albedo, albedo_tex: Some(id) } => {
-                assert_eq!(id, 0);
+        assert_eq!(scene.shaders.textures.len(), 1, "テクスチャが積まれていない");
+        assert!(scene.shaders.shaders[0].albedo.is_some(), "アルベドの式（Mul(Const, Texture)）が付いていない");
+        match scene.shaders.shaders[0].base {
+            Material::Lambert { albedo } => {
                 // テクスチャがある場合、定数側は倍率なので白（1 倍）
                 assert!((albedo.r() - 1.0).abs() < 1e-12, "既定の倍率は白のはず: {}", albedo.r());
                 // 赤 255 は sRGB デコードでリニア 1.0
-                let c = scene.textures[0].sample((0.5, 0.5));
+                let c = scene.shaders.textures[0].sample((0.5, 0.5));
                 assert!((c.r() - 1.0).abs() < 1e-9 && c.g().abs() < 1e-12, "{:?}", (c.r(), c.g(), c.b()));
             }
             _ => panic!("diffuse がテクスチャ付き Lambert になっていない"),
@@ -1822,10 +1838,9 @@ mod tests {
             );
             load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
         });
-        let mat = scene.mats[0];
-        let resolved = mat.resolve_textures(&scene.textures, &scene.noises, |_| Vec3::new(0.0, 0.0, 0.0), (0.5, 0.5));
+        let resolved = scene.shaders.eval_at(0, &scene.world, Vec3::new(0.0, 0.0, 0.0), (0.5, 0.5));
         match resolved {
-            Material::Lambert { albedo, albedo_tex: None } => {
+            Material::Lambert { albedo } => {
                 assert!((albedo.r() - 0.25).abs() < 1e-9 && (albedo.b() - 1.0).abs() < 1e-9,
                         "倍率が掛かっていない: {:?}", (albedo.r(), albedo.g(), albedo.b()));
             }
@@ -1847,8 +1862,8 @@ mod tests {
               </shape>
             </scene>"#;
         let (scene, warnings) = capture_warnings(|| load_scene_from_str(xml, &dir, &cfg(), (None, None)).unwrap().0);
-        assert!(scene.textures.is_empty());
-        assert!(matches!(scene.mats[0], Material::Lambert { albedo_tex: None, .. }));
+        assert!(scene.shaders.textures.is_empty());
+        assert!(matches!(scene.shaders.shaders[0].base, Material::Lambert { .. }));
         assert!(warnings.iter().any(|w| w.contains("failed to load texture")), "警告が出ていない: {:?}", warnings);
     }
 
@@ -1899,7 +1914,7 @@ mod tests {
             );
             load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0
         });
-        let c = scene.textures[0].sample((0.5, 0.5));
+        let c = scene.shaders.textures[0].sample((0.5, 0.5));
         assert!((c.r() - 128.0 / 255.0).abs() < 1e-12, "raw なのに sRGB デコードされている: {}", c.r());
     }
 
@@ -2019,7 +2034,7 @@ mod tests {
         assert_eq!(scene.world.meshes().len(), 1);
         assert_eq!(scene.world.instances().len(), 1);
         assert_eq!(scene.world.meshes()[0].tris.len(), 1);
-        assert_eq!(scene.mats.len(), 1);
+        assert_eq!(scene.shaders.shaders.len(), 1);
         // 頂点 v0=(0,0,0) は translate(10,0,0) でワールド (10,0,0) になる
         let inst = scene.world.instances()[0];
         let p = inst.xform.apply_point(Vec3::new(0.0, 0.0, 0.0));
@@ -2094,8 +2109,8 @@ mod tests {
               </shape>
             </scene>"#,
         );
-        assert_eq!(scene.mats.len(), 1);
-        assert!(matches!(scene.mats[0], Material::Lambert { .. }));
+        assert_eq!(scene.shaders.shaders.len(), 1);
+        assert!(matches!(scene.shaders.shaders[0].base, Material::Lambert { .. }));
     }
 
     // ---- MTL / usemtl（T2） ----
@@ -2145,7 +2160,7 @@ mod tests {
                 load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap()
             });
             // 面に使われた名前だけ: 既定("")・A・B・C
-            assert_eq!(scene.mats.len(), 4);
+            assert_eq!(scene.shaders.shaders.len(), 4);
             assert_eq!(scene.world.meshes().len(), 1, "usemtl でメッシュを割ってはいけない");
             let ids: Vec<usize> = scene.world.meshes()[0].tris.iter().map(|t| t.mat_id).collect();
             assert_eq!(ids, vec![0, 1, 1, 1, 1, 2, 2, 2, 3]);
@@ -2153,11 +2168,11 @@ mod tests {
             // A: テクスチャ付き Lambert。B は明るい Ks かつ Ns>1 だが map_Kd を持つので、
             // テクスチャ付き Lambert が優先される（map_Kd があれば Ks/Ns は使わない。不具合修正）。
             // C・既定: 灰色 Lambert
-            assert!(matches!(scene.mats[1], Material::Lambert { albedo_tex: Some(_), .. }));
-            assert!(matches!(scene.mats[2], Material::Lambert { albedo_tex: Some(_), .. }), "map_Kd がある B は Lambert のはず");
-            assert!(matches!(scene.mats[3], Material::Lambert { albedo_tex: None, .. }));
+            assert!(matches!(scene.shaders.shaders[1].base, Material::Lambert { .. }) && scene.shaders.shaders[1].albedo.is_some());
+            assert!(matches!(scene.shaders.shaders[2].base, Material::Lambert { .. }) && scene.shaders.shaders[2].albedo.is_some(), "map_Kd がある B は Lambert のはず");
+            assert!(matches!(scene.shaders.shaders[3].base, Material::Lambert { .. }) && scene.shaders.shaders[3].albedo.is_none());
             // 同じ a.png を A の map_Kd / map_Ka / map_d と B の map_Kd が指しているが、読むのは 1 回（キャッシュ）
-            assert_eq!(scene.textures.len(), 1);
+            assert_eq!(scene.shaders.textures.len(), 1);
             // 警告: map_Ka はマテリアル A に 1 回だけ。定数 d<1 はシーンで 1 回だけ。面ごとには出ない
             let n = |pat: &str| warnings.iter().filter(|w| w.contains(pat)).count();
             assert_eq!(n("map_Ka"), 1, "{:?}", warnings);
@@ -2179,14 +2194,20 @@ mod tests {
             )
             .unwrap();
             let scene = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(scene.textures.len(), 1);
-            match (&scene.mats[1], &scene.mats[2]) {
-                (
-                    Material::Lambert { albedo_tex: Some(a), .. },
-                    Material::Lambert { albedo_tex: Some(b), .. },
-                ) => assert_eq!(a, b),
-                _ => panic!("A / B ともテクスチャ付き Lambert のはず"),
-            }
+            assert_eq!(scene.shaders.textures.len(), 1);
+            // A / B ともテクスチャ付き Lambert で、同じ画像を指す（式 `Mul(Const, Texture(id))` の id が同じ）
+            let tex_of = |m: usize| {
+                let sh = &scene.shaders.shaders[m];
+                assert!(matches!(sh.base, Material::Lambert { .. }));
+                match scene.shaders.value(sh.albedo.expect("式がある")) {
+                    crate::shader::ValueNode::Mul(_, r) => match scene.shaders.value(r) {
+                        crate::shader::ValueNode::Texture(id) => id,
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                }
+            };
+            assert_eq!(tex_of(1), tex_of(2));
         });
     }
 
@@ -2196,8 +2217,8 @@ mod tests {
         with_mtl_dir(|dir| {
             let xml = obj_scene_xml(r#"<bsdf type="diffuse"><rgb name="reflectance" value="0.2,0.3,0.4"/></bsdf>"#);
             let scene = load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(scene.mats.len(), 1);
-            assert!(scene.textures.is_empty(), "MTL のテクスチャを読んではいけない");
+            assert_eq!(scene.shaders.shaders.len(), 1);
+            assert!(scene.shaders.textures.is_empty(), "MTL のテクスチャを読んではいけない");
             assert!(scene.world.meshes()[0].tris.iter().all(|t| t.mat_id == 0));
         });
     }
@@ -2208,8 +2229,8 @@ mod tests {
         with_mtl_dir(|dir| {
             let xml = obj_scene_xml(r#"<boolean name="use_mtl" value="false"/>"#);
             let (scene, warnings) = capture_warnings(|| load_scene_from_str(&xml, dir, &cfg(), (None, None)).unwrap().0);
-            assert_eq!(scene.mats.len(), 1);
-            assert!(scene.textures.is_empty());
+            assert_eq!(scene.shaders.shaders.len(), 1);
+            assert!(scene.shaders.textures.is_empty());
             assert!(warnings.iter().any(|w| w.contains("without bsdf")), "{:?}", warnings);
         });
     }
@@ -2222,13 +2243,13 @@ mod tests {
             let (scene, warnings) = capture_warnings(|| {
                 load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0
             });
-            assert_eq!(scene.mats.len(), 4);
-            assert!(scene.mats.iter().all(|m| matches!(m, Material::Lambert { albedo_tex: None, .. })));
+            assert_eq!(scene.shaders.shaders.len(), 4);
+            assert!(scene.shaders.shaders.iter().map(|sh| &sh.base).all(|m| matches!(m, Material::Lambert { .. })));
             assert!(warnings.iter().any(|w| w.contains("failed to read mtl")), "{:?}", warnings);
 
             std::fs::write(dir.join("m.mtl"), "").unwrap();
             let scene = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(scene.mats.len(), 4);
+            assert_eq!(scene.shaders.shaders.len(), 4);
         });
     }
 
@@ -2280,13 +2301,13 @@ mod tests {
             n = NMAP, d = DIFF
         );
         map_scene(&body, |s, w| {
-            assert_eq!(s.mats.len(), 5);
-            assert_eq!(s.mat_maps.len(), s.mats.len());
-            let some: Vec<bool> = s.mat_maps.iter().map(|m| m.is_some()).collect();
+            assert_eq!(s.shaders.shaders.len(), 5);
+            assert_eq!(s.mat_maps().len(), s.shaders.shaders.len());
+            let some: Vec<bool> = s.mat_maps().iter().map(|m| m.is_some()).collect();
             assert_eq!(some, vec![false, true, true, true, false]);
-            assert_eq!(s.normal_maps.len(), 3);
-            assert!(matches!(s.normal_maps[0], NormalMap::Tangent { .. }));
-            assert!(matches!(s.normal_maps[2], NormalMap::Height { strength, .. } if strength == 2.0));
+            assert_eq!(s.shaders.normal_maps.len(), 3);
+            assert!(matches!(s.shaders.normal_maps[0], NormalMap::Tangent { .. }));
+            assert!(matches!(s.shaders.normal_maps[2], NormalMap::Height { strength, .. } if strength == 2.0));
             assert!(w.iter().all(|m| m.contains("sensor")), "{:?}", w);
         });
     }
@@ -2295,7 +2316,7 @@ mod tests {
     #[test]
     fn scenes_without_maps_have_empty_tables() {
         let s = load(r#"<scene version="3.0.0"><shape type="sphere"><bsdf type="diffuse"/></shape></scene>"#);
-        assert!(s.mat_maps.is_empty() && s.normal_maps.is_empty());
+        assert!(s.mat_maps().iter().all(|m| m.is_none()) && s.shaders.normal_maps.is_empty());
     }
 
     /// MTL 経路（マップ無し）と混在しても表がずれない。
@@ -2307,9 +2328,9 @@ mod tests {
                 <shape type="rectangle"><bsdf type="normalmap"><texture type="bitmap"><string name="filename" value="textures/a.png"/></texture><bsdf type="diffuse"/></bsdf></shape>
               </scene>"#;
             let s = load_scene_from_str(xml, dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(s.mat_maps.len(), s.mats.len());
-            assert_eq!(s.mat_maps.iter().filter(|m| m.is_some()).count(), 1);
-            assert!(s.mat_maps.last().unwrap().is_some());
+            assert_eq!(s.mat_maps().len(), s.shaders.shaders.len());
+            assert_eq!(s.mat_maps().iter().filter(|m| m.is_some()).count(), 1);
+            assert!(s.mat_maps().last().unwrap().is_some());
         });
     }
 
@@ -2324,7 +2345,7 @@ mod tests {
         map_scene(&raw_false, |s, w| {
             assert!(w.iter().any(|m| m.contains("raw=false")), "{:?}", w);
             // (128,128,255) をリニアで読んだ値（sRGB デコードされていない）
-            match &s.normal_maps[0] {
+            match &s.shaders.normal_maps[0] {
                 NormalMap::Tangent { tex, .. } => {
                     let c = tex.sample((0.5, 0.5));
                     assert!((c.r() - 128.0 / 255.0).abs() < 1e-12, "sRGB で読まれている: {}", c.r());
@@ -2335,7 +2356,7 @@ mod tests {
         let no_inner = format!(r#"<shape type="rectangle"><bsdf type="normalmap">{}</bsdf></shape>"#, NMAP);
         map_scene(&no_inner, |s, w| {
             assert!(w.iter().any(|m| m.contains("without an inner")), "{:?}", w);
-            assert!(matches!(s.mats[0], Material::Lambert { .. }));
+            assert!(matches!(s.shaders.shaders[0].base, Material::Lambert { .. }));
         });
         let nested = format!(
             r#"<shape type="rectangle"><bsdf type="normalmap">{n}<bsdf type="normalmap">{n}{d}</bsdf></bsdf></shape>"#,
@@ -2343,9 +2364,9 @@ mod tests {
         );
         map_scene(&nested, |s, w| {
             assert!(w.iter().any(|m| m.contains("nested")), "{:?}", w);
-            assert_eq!(s.mat_maps.len(), 1);
+            assert_eq!(s.mat_maps().len(), 1);
             // 外側のマップ（2 番目に登録されたもの）が使われる
-            assert_eq!(s.mat_maps[0], Some(1));
+            assert_eq!(s.mat_maps()[0], Some(1));
         });
     }
 
@@ -2365,10 +2386,10 @@ mod tests {
         with_mtl_dir(|dir| {
             write_uv_obj_and_mtl(dir, "newmtl A\n\tKd 1 1 1\n\tmap_bump -bm 2 textures\\a.png\nnewmtl B\n\tKd 1 1 1\n");
             let (s, w) = capture_warnings(|| load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0);
-            assert_eq!(s.mats.len(), 2);
-            assert_eq!(s.mat_maps.len(), s.mats.len());
-            assert_eq!((s.mat_maps[0].is_some(), s.mat_maps[1].is_some()), (true, false));
-            match &s.normal_maps[s.mat_maps[0].unwrap() as usize] {
+            assert_eq!(s.shaders.shaders.len(), 2);
+            assert_eq!(s.mat_maps().len(), s.shaders.shaders.len());
+            assert_eq!((s.mat_maps()[0].is_some(), s.mat_maps()[1].is_some()), (true, false));
+            match &s.shaders.normal_maps[s.mat_maps()[0].unwrap() as usize] {
                 NormalMap::Height { strength, .. } => assert!((strength - 2.0 * MTL_BUMP_K).abs() < 1e-12),
                 _ => panic!("ハイトマップのはず"),
             }
@@ -2383,10 +2404,10 @@ mod tests {
             write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tmap_bump textures\\a.png\n");
             let over = obj_scene_xml(r#"<bsdf type="diffuse"/>"#);
             let s = load_scene_from_str(&over, dir, &cfg(), (None, None)).unwrap().0;
-            assert!(s.mat_maps.is_empty() && s.normal_maps.is_empty());
+            assert!(s.mat_maps().iter().all(|m| m.is_none()) && s.shaders.normal_maps.is_empty());
             let off = obj_scene_xml(r#"<boolean name="use_mtl" value="false"/>"#);
             let s = load_scene_from_str(&off, dir, &cfg(), (None, None)).unwrap().0;
-            assert!(s.mat_maps.is_empty() && s.normal_maps.is_empty());
+            assert!(s.mat_maps().iter().all(|m| m.is_none()) && s.shaders.normal_maps.is_empty());
         });
     }
 
@@ -2396,8 +2417,8 @@ mod tests {
         with_mtl_dir(|dir| {
             write_uv_obj_and_mtl(dir, "newmtl A\n\tKs 0.9 0.9 0.9\n\tNs 100\n\tmap_bump textures\\a.png\nnewmtl B\n\tKd 1 1 1\n");
             let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert!(matches!(s.mats[0], Material::Ggx { .. }));
-            assert!(s.mat_maps[0].is_some());
+            assert!(matches!(s.shaders.shaders[0].base, Material::Ggx { .. }));
+            assert!(s.mat_maps()[0].is_some());
         });
     }
 
@@ -2413,9 +2434,9 @@ mod tests {
                  newmtl B\n\tKs 0.9 0.9 0.9\n\tNs 100\n\tmap_bump textures\\a.png\n",
             );
             let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert!(matches!(s.mats[0], Material::Lambert { albedo_tex: Some(_), .. }), "map_Kd 付き材質は Lambert のはず");
-            assert!(matches!(s.mats[1], Material::Ggx { .. }), "map_Kd の無い材質は従来どおり Ggx のはず");
-            assert!(s.mat_maps[0].is_some() && s.mat_maps[1].is_some(), "どちらの経路でもバンプマップが付くはず");
+            assert!(matches!(s.shaders.shaders[0].base, Material::Lambert { .. }) && s.shaders.shaders[0].albedo.is_some(), "map_Kd 付き材質は Lambert のはず");
+            assert!(matches!(s.shaders.shaders[1].base, Material::Ggx { .. }), "map_Kd の無い材質は従来どおり Ggx のはず");
+            assert!(s.mat_maps()[0].is_some() && s.mat_maps()[1].is_some(), "どちらの経路でもバンプマップが付くはず");
         });
     }
 
@@ -2428,7 +2449,7 @@ mod tests {
                 "newmtl A\n\tnorm textures\\a.png\n\tmap_bump textures\\a.png\nnewmtl B\n\tnorm textures\\a.png\n\tmap_bump textures\\a.png\n",
             );
             let (s, w) = capture_warnings(|| load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0);
-            assert!(s.normal_maps.iter().all(|m| matches!(m, NormalMap::Tangent { .. })));
+            assert!(s.shaders.normal_maps.iter().all(|m| matches!(m, NormalMap::Tangent { .. })));
             assert_eq!(w.iter().filter(|m| m.contains("both norm and map_bump")).count(), 2, "{:?}", w);
         });
     }
@@ -2439,14 +2460,14 @@ mod tests {
         with_mtl_dir(|dir| {
             write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tmap_bump textures/a.png\n");
             let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(s.normal_maps.len(), 1);
-            assert_eq!(s.mat_maps[0], s.mat_maps[1]);
+            assert_eq!(s.shaders.normal_maps.len(), 1);
+            assert_eq!(s.mat_maps()[0], s.mat_maps()[1]);
             write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tmap_bump -bm 3 textures/a.png\n");
             let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(s.normal_maps.len(), 2, "強度違いが同じ登録を共有した");
+            assert_eq!(s.shaders.normal_maps.len(), 2, "強度違いが同じ登録を共有した");
             write_uv_obj_and_mtl(dir, "newmtl A\n\tmap_bump textures\\a.png\nnewmtl B\n\tnorm textures/a.png\n");
             let s = load_scene_from_str(&obj_scene_xml(""), dir, &cfg(), (None, None)).unwrap().0;
-            assert_eq!(s.normal_maps.len(), 2, "種別違いが同じ登録を共有した");
+            assert_eq!(s.shaders.normal_maps.len(), 2, "種別違いが同じ登録を共有した");
         });
     }
 
@@ -2586,7 +2607,7 @@ mod tests {
             .collect();
         let scene = share_scene(&dir, &shapes);
         assert_eq!((scene.world.mesh_count(), scene.world.instance_count()), (1, 3));
-        assert_eq!(scene.mats.len(), 3, "材質は形状ごとに 1 つ");
+        assert_eq!(scene.shaders.shaders.len(), 3, "材質は形状ごとに 1 つ");
         for i in 0..3 {
             let ray = Ray { o: Vec3::new(0.2 + 3.0 * i as f64, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
             let hit = scene.world.hit(ray, 0.0, 1e30).expect("hit");
@@ -2631,8 +2652,8 @@ mod tests {
         let scene = share_scene(&dir, &format!("{}{}", obj_shape("a.obj", 0.0, DIFFUSE_A, ""), obj_shape("a.obj", 3.0, "", emitter)));
         assert_eq!(scene.world.mesh_count(), 1);
         let ray = |x: f64| Ray { o: Vec3::new(x + 0.2, 0.2, 5.0), d: Vec3::new(0.0, 0.0, -1.0), time: 0.0 };
-        assert!(scene.mats[scene.world.hit(ray(0.0), 0.0, 1e30).unwrap().mat_id].emitted().is_none());
-        assert!(scene.mats[scene.world.hit(ray(3.0), 0.0, 1e30).unwrap().mat_id].emitted().is_some());
+        assert!(scene.shaders.shaders[scene.world.hit(ray(0.0), 0.0, 1e30).unwrap().mat_id].base.emitted().is_none());
+        assert!(scene.shaders.shaders[scene.world.hit(ray(3.0), 0.0, 1e30).unwrap().mat_id].base.emitted().is_some());
         let mut rng = crate::rng::Rng::new(1);
         for _ in 0..50 {
             let ls = scene.world.sample_light(&mut rng, 0.0, Vec3::new(1.0, 1.0, 3.0)).expect("light");
@@ -2767,7 +2788,7 @@ mod tests {
         // 形状の中: 警告して無視（形状は拡散のまま残り、光源にはならない）
         let s = warned(r#"<shape type="sphere"><bsdf type="diffuse"/><emitter type="point"><rgb name="intensity" value="5"/></emitter></shape>"#, "inside a <shape>");
         assert!(s.world.delta_lights().is_empty());
-        assert!(s.mats[0].emitted().is_none());
+        assert!(s.shaders.shaders[0].base.emitted().is_none());
     }
 
     // ---- モーション（to_world_end / filename_end / shutter）----
@@ -2999,8 +3020,8 @@ mod tests {
         capture_warnings(|| load_scene_from_str(&xml, Path::new("."), &cfg(), (None, None)).unwrap().0)
     }
     fn albedo_at(s: &Scene, p: Vec3) -> f64 {
-        match s.mats[0].resolve_textures(&s.textures, &s.noises, |_| p, (0.5, 0.5)) {
-            Material::Lambert { albedo, albedo_tex: None } => albedo.r(),
+        match s.shaders.eval_at(0, &s.world, p, (0.5, 0.5)) {
+            Material::Lambert { albedo } => albedo.r(),
             _ => panic!("ノイズが畳み込まれていない"),
         }
     }
@@ -3011,7 +3032,7 @@ mod tests {
         let ok = r#"<string name="pattern" value="marble"/><float name="scale" value="3"/><rgb name="color0" value="0"/><rgb name="color1" value="1"/>"#;
         let (s, w) = noise_scene(ok);
         assert!(w.is_empty(), "{w:?}");
-        assert_eq!(s.noises.len(), 1);
+        assert_eq!(s.shaders.noises.len(), 1);
         let vals: Vec<f64> = (0..20).map(|i| albedo_at(&s, Vec3::new(0.1 * i as f64, 0.3, 0.2))).collect();
         assert!(vals.iter().all(|v| (0.0..=0.5 + 1e-12).contains(v)), "0.5 倍の範囲");
         assert!(vals.iter().cloned().fold(0.0, f64::max) - vals.iter().cloned().fold(1.0, f64::min) > 0.1, "位置で変わる");
@@ -3046,7 +3067,7 @@ mod tests {
         };
         let (pw, nw) = (xf.apply_point(local), xf.apply_normal(Vec3::new(0.0, 0.0, 1.0)));
         let h = s.world.hit(Ray { o: pw + nw * 2.0, d: -nw, time: 0.0 }, 1e-9, 1e30).expect("hit");
-        match s.mats[h.mat_id].resolve_textures(&s.textures, &s.noises, |local| if local { s.world.object_space_point(&h, 0.0) } else { h.p }, h.uv) {
+        match s.shaders.evaluate(h.mat_id, &crate::shader::ShadeCtx { world: &s.world, hit: &h, time: 0.0 }) {
             Material::Lambert { albedo, .. } => albedo.r(),
             _ => panic!(),
         }
@@ -3062,9 +3083,9 @@ mod tests {
         assert!((rect_albedo(&s, 0) - rect_albedo(&s, 1)).abs() > 1e-3, "offset が違えば別の模様");
         let s = placed_noise_scene(r#"<string name="space" value="world"/>"#, "");
         assert!((rect_albedo(&s, 0) - rect_albedo(&s, 1)).abs() > 1e-3, "world は配置で変わる");
-        assert!(!s.noises[0].local);
+        assert!(!s.shaders.noises[0].local);
         let xml = r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor><shape type="sphere"><bsdf type="diffuse"><texture type="noise" name="reflectance"><string name="space" value="sideways"/></texture></bsdf></shape></scene>"#;
         let (s, w) = capture_warnings(|| load_scene_from_str(xml, Path::new("."), &cfg(), (None, None)).unwrap().0);
-        assert!(s.noises[0].local && w.iter().any(|m| m.contains("noise space")), "{w:?}");
+        assert!(s.shaders.noises[0].local && w.iter().any(|m| m.contains("noise space")), "{w:?}");
     }
 }

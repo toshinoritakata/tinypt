@@ -352,7 +352,7 @@ fn main() -> std::io::Result<()> {
             scene.world.instances().len(),
             scene.world.spheres().len(),
             scene.world.lights().len(),
-            scene.textures.len(),
+            scene.shaders.textures.len(),
         );
         eprintln!(
             "Loaded in {:.2}s (obj parse {:.2}s, mesh + BVH build {:.2}s, textures {:.2}s)",

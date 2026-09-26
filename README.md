@@ -97,7 +97,7 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
   - シーンを k 倍すると模様も k 倍になる (`scale` は空間周波数。模様が物体に固定されているので正しい挙動)。
   - 不正な `pattern` は警告して `fbm`、範囲外の値・不正な `space` は警告して丸める（`space` は `local`）。置換表はコンパイル時に固定なので、レンダリングは再現する。ノイズを使わないシーンの出力は変わらない。
 - **OBJ の `usemtl` / MTL**: OBJ の `<shape>` に `<bsdf>` も `<emitter>` も書かないと、`mtllib` の MTL から材質を作る (1 メッシュのまま、`usemtl` ごとに三角形の材質が変わる。BVH は割らない)。`<bsdf>` があれば従来どおり**全体を上書き**し MTL は読まない (`sample/sponza.xml` はこちら)。`<boolean name="use_mtl" value="false"/>` でも MTL を無視できる。例: `sample/sponza_textured.xml`。
-  - MTL → BSDF: **`map_Kd` があれば常に** `Lambert { albedo: Kd, albedo_tex }` (sRGB デコード。`Kd` は倍率として掛かる)。`map_Kd` が無く、`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。どちらでもなければ `Lambert { albedo: Kd }`。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
+  - MTL → BSDF: **`map_Kd` があれば常に** `Lambert { albedo: Kd }` + アルベドの式 `Kd × テクスチャ` (sRGB デコード。`Kd` は倍率として掛かる)。`map_Kd` が無く、`Ks` の輝度 > 0.05 かつ `Ns` > 1 なら `Ggx { albedo: Ks, alpha = sqrt(2/(Ns+2)) }` (alpha は [1e-3, 1])。どちらでもなければ `Lambert { albedo: Kd }`。`usemtl` 前の面と MTL に無い名前は灰色の拡散。
     (`map_Kd` を優先するのは、拡散テクスチャと明るい鏡面反射を両方持つ材質を先に GGX 化すると拡散テクスチャがまるごと捨てられてしまうため — 拡散 + 光沢の合成 BSDF は `Material` に新しい variant が要るので扱わない。)
   - `map_d` はアルファマスク、`map_bump` / `norm` は法線の摂動 ([詳細](#法線マップ--バンプマップ))。未対応: 定数の `d < 1` (シーンで 1 回だけ警告)、`map_Ka` / 非ゼロの `Ke` (材質ごとに 1 回警告)。
   - MTL の癖に対応: タブ字下げ、テクスチャパスの `\` (→ `/`)、未知キー、`newmtl` の重複 (最初の定義を残す)。テクスチャは解決済み絶対パスでキャッシュし、同じ画像を 2 度読まない。
@@ -109,7 +109,7 @@ OBJ の `vt` を重心座標で補間し (`Hit.uv`)、`diffuse` の `reflectance
 
 | 種類 | パラメータ | 概要 |
 |---|---|---|
-| `Lambert` | `albedo`, `albedo_tex?` | 完全拡散反射。コサイン重み付き半球サンプリング。テクスチャを貼れる ([テクスチャ](#テクスチャ)) |
+| `Lambert` | `albedo` | 完全拡散反射。コサイン重み付き半球サンプリング。テクスチャ・ノイズはシェーダーの式（`albedo` の手前）で掛ける ([テクスチャ](#テクスチャ)) |
 | `Metal` | `albedo` | 完全鏡面反射（デルタ BSDF） |
 | `Dielectric` | `ior`, `absorption` | 屈折体。フレネル + Beer-Lambert 吸収（デルタ BSDF） |
 | `Ggx` | `albedo`, `alpha` | GGX マイクロファセット反射（下記参照） |

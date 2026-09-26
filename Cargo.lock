@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "tinypt"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "crossbeam",
  "crossbeam-channel",

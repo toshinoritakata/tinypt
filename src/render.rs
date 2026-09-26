@@ -22,8 +22,8 @@ use crate::checkpoint::{load_checkpoint, save_checkpoint};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
 use crate::env::EnvMap;
-use crate::integrator::{radiance, PathLimits, Surfaces};
-use crate::material::Material;
+use crate::integrator::{radiance, PathLimits};
+use crate::shader::ShaderSet;
 use crate::math::Color;
 use crate::medium::Medium;
 use crate::ray::Camera;
@@ -111,8 +111,7 @@ fn sample_pixel(
     inv_h: f64,
     t: &Task,
     world: &World,
-    mats: &[Material],
-    surfaces: &Surfaces,
+    shaders: &ShaderSet,
     env: Option<&EnvMap>,
     medium: Option<&Medium>,
     cam: &Camera,
@@ -133,7 +132,7 @@ fn sample_pixel(
         let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
         let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
         let ray = cam.ray(sx, sy, &mut rng);
-        radiance(world, mats, surfaces, env, medium, ray, &mut rng, limits)
+        radiance(world, shaders, env, medium, ray, &mut rng, limits)
     };
 
     if config.adaptive_enabled {
@@ -253,17 +252,9 @@ fn render_with_threads(
 
     let limits = PathLimits { max_depth: config.max_depth, rr_depth: config.rr_depth };
 
-    let surfaces_val = Surfaces {
-        textures: &scene.textures,
-        normal_maps: &scene.normal_maps,
-        mat_maps: &scene.mat_maps,
-        noises: &scene.noises,
-    };
-    let surfaces_ref = &surfaces_val;
-
     scope(|sp| {
         let world_ref = &scene.world;
-        let mats_ref = &scene.mats;
+        let shaders_ref = &scene.shaders;
         let cam_ref = &scene.cam;
         let env_ref = scene.env.as_ref();
         let medium_ref = scene.medium.as_ref();
@@ -272,8 +263,7 @@ fn render_with_threads(
             let rx = rx.clone();
             let rtx = rtx.clone();
             let world = world_ref;
-            let mats = mats_ref;
-            let surfaces = surfaces_ref;
+            let shaders = shaders_ref;
             let cam = cam_ref;
             let env = env_ref;
             let medium = medium_ref;
@@ -288,7 +278,7 @@ fn render_with_threads(
                     for y in t.y0..t.y1 {
                         for x in t.x0..t.x1 {
                             let local_idx = (y - t.y0) * tile_w + (x - t.x0);
-                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, mats, surfaces, env, medium, cam, limits, config);
+                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, shaders, env, medium, cam, limits, config);
                             sum[local_idx] = c;
                             wsum[local_idx] = n;
                         }
@@ -408,11 +398,7 @@ mod tests {
         Scene {
             cam,
             world: World::new(),
-            mats: Vec::new(),
-            textures: Vec::new(),
-            normal_maps: Vec::new(),
-            mat_maps: Vec::new(),
-            noises: Vec::new(),
+            shaders: ShaderSet::default(),
             env: None,
             medium: None,
             load_stats: Default::default(),
@@ -658,7 +644,7 @@ mod tests {
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
     /// `RENDER_REVISION` は `Cargo.toml` の `version` から導出されるので、実質的には
     /// 「このハッシュを記録したときの `Cargo.toml` のバージョン」を数値で持っているのと同じ。
-    const GOLDEN_REVISION: u32 = 13000;
+    const GOLDEN_REVISION: u32 = 13001;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。

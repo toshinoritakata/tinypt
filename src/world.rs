@@ -2274,7 +2274,7 @@ mod tests {
             Transform::identity(),
             None,
         );
-        let mats = vec![Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) }, Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let mats = vec![Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) }, Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
         world.build_lights(&mats);
 
         let mut rng = Rng::new(9);
@@ -3513,7 +3513,7 @@ mod tests {
             Vec3::new(-1.0, 1.0, 1.0),  // 鏡像
             Vec3::new(-2.0, 0.5, 3.0),  // 鏡像 + 非一様
         ] {
-            let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+            let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
             let mut world = World::new();
             let xform = Transform::scale(scale);
             world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 24, 12, 0, true), xform, None);
@@ -3711,7 +3711,7 @@ mod tests {
     /// 大きいほど逆転置による向きの入れ替わりが起きやすいから。
     #[test]
     fn shading_normal_stays_on_the_geometric_side_through_shearing_transforms() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
         for (name, xform) in tricky_transforms() {
             let mut world = World::new();
             world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 8, 4, 0, true), xform, None);
@@ -3745,7 +3745,7 @@ mod tests {
     /// （オブジェクト空間の法線でも両方の条件を満たしてしまうため）。
     #[test]
     fn instance_transform_actually_transforms_the_shading_normal() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
         // 面法線 +z から 50 度傾けた一様な頂点法線。回転・非一様・せん断で「変換しない」と
         // 明確に違う向きになる。
         let ns_obj = Vec3::new(0.766, 0.0, 0.643).norm();
@@ -3798,7 +3798,7 @@ mod tests {
     /// 幾何法線は自己交差回避・表裏判定・光源 pdf の基準なので、ここが補間値に化けると静かに壊れる。
     #[test]
     fn instance_geometric_normal_is_unaffected_by_vertex_normals() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
         for (name, xform) in tricky_transforms() {
             let mut smooth_world = World::new();
             smooth_world.add_mesh_data_instance(uv_sphere(Vec3::new(0.0, 0.0, 0.0), 1.0, 12, 6, 0, true), xform, None);
@@ -3900,7 +3900,7 @@ mod tests {
     /// インスタンス変換は UV を変えない（UV はオブジェクト空間の属性）。
     #[test]
     fn instance_transform_does_not_change_uv() {
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
         let tris = vec![Triangle::new_static(
             Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 0)];
         let data = MeshData::with_uv(
@@ -3979,7 +3979,7 @@ mod tests {
         assert_eq!(h_flat.ns.z.to_bits(), h_flat.ng.z.to_bits(), "法線なしの三角形は ns == ng");
 
         // インスタンス経由（World::hit）でも同じ。変換つきでも番兵の分岐を踏む
-        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None }];
+        let mats = vec![Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) }];
         let mut world = World::new();
         world.add_mesh_data_instance(
             MeshData {

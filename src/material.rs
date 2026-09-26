@@ -23,25 +23,17 @@ use crate::geometry::{face_forward, offset_ray_origin, Hit};
 use crate::math::{reflect, refract, Color, Vec3};
 use crate::ray::Ray;
 use crate::rng::Rng;
-use crate::noise::NoiseTexture;
-use crate::texture::Texture;
 
 /// テクスチャ配列（[`crate::scene::Scene::textures`]）への添字。
 /// `Material` を `Copy` のまま保つために、テクスチャ本体ではなく添字を持たせている
 /// （マテリアルは交差ごとにコピーされるので、`Vec` を抱えさせたくない）。
 pub type TexId = u32;
 
-/// `TexId` の最上位ビット。立っていれば画像テクスチャ（[`crate::scene::Scene::textures`]）ではなく、
-/// 手続き的ノイズ（[`crate::scene::Scene::noises`]）への添字（下位 31 ビット）。暫定の相乗り
-/// （`Material` を `Copy` のまま、variant を増やさずに済ませるため。統一的な仕組みに載せ替えるまでの措置）。
-pub const NOISE_TEX_FLAG: TexId = 1 << 31;
-
 #[derive(Clone, Copy)]
 /// 積分器が対応するマテリアルモデル。各 variant が一つの BSDF を表す。
 pub enum Material {
     /// 完全拡散反射（Lambertian BRDF）。
-    /// `albedo_tex` がある場合、実際の反射率は `albedo`（色の倍率）× テクスチャの値になる。
-    Lambert { albedo: Color, albedo_tex: Option<TexId> },
+    Lambert { albedo: Color },
     /// 完全鏡面反射（デルタ BRDF）
     Metal   { albedo: Color },
     /// 誘電体（屈折 + フレネル反射 + Beer-Lambert 吸収）
@@ -90,30 +82,22 @@ fn reflects_above(ng: Vec3, d: Vec3) -> bool {
 }
 
 impl Material {
-    /// テクスチャを交差点の UV で評価し、テクスチャを持たない等価なマテリアルに畳み込む。
-    ///
-    /// **テクスチャの評価はここ 1 回だけ**にして、`sample` / `eval` はテクスチャを知らないままにする
-    /// （BSDF の実装に UV やテクスチャ配列を持ち込まない）。積分器は交差ごとに 1 度これを呼ぶ。
-    /// 添字が範囲外のときはテクスチャ無しとして扱う（読み込みに失敗したシーンでも落とさない）。
-    ///
-    /// 手続き的ノイズ（`NOISE_TEX_FLAG` 付きの添字）は、UV ではなく交差点の**位置**で評価する（3D なので球の極や
-    /// UV の継ぎ目で破綻しない）。`p_of(local)` が位置を返す: `local` ならその物体の空間、そうでなければワールド空間。
-    /// ノイズを持つ材質のときだけ呼ばれる（物体空間への逆変換のコストを、ノイズを使わない材質に払わせない）。ノイズを使わない材質は、この分岐に入らず従来と同じ。
-    pub fn resolve_textures(self, textures: &[Texture], noises: &[NoiseTexture], p_of: impl FnOnce(bool) -> Vec3, uv: (f64, f64)) -> Self {
+    /// 反射率（アルベド）を持つ材質ならその色（`Lambert` / `Metal` / `Ggx` / `Subsurface`）。
+    pub fn albedo(&self) -> Option<Color> {
+        match *self {
+            Material::Lambert { albedo } | Material::Metal { albedo } | Material::Ggx { albedo, .. } | Material::Subsurface { albedo } => Some(albedo),
+            Material::Dielectric { .. } | Material::DiffuseLight { .. } => None,
+        }
+    }
+
+    /// 反射率だけを `albedo` に置き換えた材質（反射率を持たない材質はそのまま）。シェーダーの式の評価結果を
+    /// 具体的な `Material` にするのに使う（[`crate::shader::Shader`]）。
+    pub fn with_albedo(self, albedo: Color) -> Self {
         match self {
-            Material::Lambert { albedo, albedo_tex: Some(id) } if id & NOISE_TEX_FLAG != 0 => {
-                match noises.get((id & !NOISE_TEX_FLAG) as usize) {
-                    Some(n) => Material::Lambert { albedo: albedo.hadamard(n.eval(p_of(n.local))), albedo_tex: None },
-                    None => Material::Lambert { albedo, albedo_tex: None },
-                }
-            }
-            Material::Lambert { albedo, albedo_tex: Some(id) } => {
-                let tex = match textures.get(id as usize) {
-                    Some(t) => t.sample(uv),
-                    None => return Material::Lambert { albedo, albedo_tex: None },
-                };
-                Material::Lambert { albedo: albedo.hadamard(tex), albedo_tex: None }
-            }
+            Material::Lambert { .. } => Material::Lambert { albedo },
+            Material::Metal { .. } => Material::Metal { albedo },
+            Material::Ggx { alpha, .. } => Material::Ggx { albedo, alpha },
+            Material::Subsurface { .. } => Material::Subsurface { albedo },
             other => other,
         }
     }
@@ -469,7 +453,7 @@ mod tests {
     /// sample() が報告する PDF は、同じ方向に対する eval() の PDF と一致する（Lambert）。
     #[test]
     fn lambert_sample_pdf_matches_eval() {
-        let mat = Material::Lambert { albedo: Color::new(0.6, 0.4, 0.2), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.6, 0.4, 0.2) };
         let (ray, hit) = floor_hit();
         let mut rng = Rng::new(1);
         let n = hit.ng; // 入射なので向き付き法線 = 幾何法線
@@ -642,7 +626,7 @@ mod tests {
     #[test]
     fn lambert_weight_is_albedo() {
         let albedo = Color::new(0.5, 0.7, 0.3);
-        let mat = Material::Lambert { albedo, albedo_tex: None };
+        let mat = Material::Lambert { albedo };
         let (ray, hit) = floor_hit();
         let mut rng = Rng::new(3);
         let s = mat.sample(&ray, &hit, &mut rng).unwrap();
@@ -669,7 +653,7 @@ mod tests {
     /// 一様半球サンプリングによるモンテカルロ推定（pdf_uniform = 1/2π）。
     #[test]
     fn lambert_pdf_integrates_to_one() {
-        let mat = Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) };
         let n = Vec3::new(0.0, 1.0, 0.0);
         let wo = Vec3::new(0.0, 1.0, 0.0);
         let mut rng = Rng::new(99);
@@ -829,12 +813,12 @@ mod tests {
     fn classification_is_correct() {
         assert!(Material::Metal { albedo: Color::new(1.0, 1.0, 1.0) }.is_delta());
         assert!(Material::Dielectric { ior: 1.5, absorption: Color::new(0.0, 0.0, 0.0) }.is_delta());
-        assert!(!Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: None }.is_delta());
+        assert!(!Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) }.is_delta());
         assert!(!Material::Ggx { albedo: Color::new(1.0, 1.0, 1.0), alpha: 0.2 }.is_delta());
 
         let emit = Color::new(3.0, 3.0, 3.0);
         assert!(Material::DiffuseLight { emit }.emitted().is_some());
-        assert!(Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0), albedo_tex: None }.emitted().is_none());
+        assert!(Material::Lambert { albedo: Color::new(1.0, 1.0, 1.0) }.emitted().is_none());
     }
 
     // ---- スムーズシェーディング: 幾何法線とシェーディング法線の分離 ----
@@ -861,7 +845,7 @@ mod tests {
             uv: (0.0, 0.0),
         };
         let ray = Ray { o: hit.p + Vec3::new(0.3, 1.0, 0.2), d: Vec3::new(-0.3, -1.0, -0.2).norm(), time: 0.0 };
-        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
         let mut rng = Rng::new(5);
         let mut checked = 0;
         for _ in 0..200 {
@@ -902,7 +886,7 @@ mod tests {
             Vec3::new(-0.4, -1.0, 0.3).norm(),
         ];
         let cases: [(&str, Material, bool); 5] = [
-            ("Lambert", Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8), albedo_tex: None }, false),
+            ("Lambert", Material::Lambert { albedo: Color::new(0.8, 0.8, 0.8) }, false),
             ("Metal", Material::Metal { albedo: Color::new(0.9, 0.9, 0.9) }, false),
             ("Ggx", Material::Ggx { albedo: Color::new(0.9, 0.9, 0.9), alpha: 0.35 }, false),
             ("Subsurface", Material::Subsurface { albedo: Color::new(0.7, 0.7, 0.7) }, false),
@@ -957,7 +941,7 @@ mod tests {
             p_error: Vec3::new(1e-15, 1e-15, 1e-15), bary: (0.25, 0.25), uv: (0.0, 0.0),
         };
         let ray = Ray { o: Vec3::new(0.0, 1.0, 0.0), d: Vec3::new(0.0, -1.0, 0.0), time: 0.0 };
-        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None };
+        let mat = Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5) };
         let mut rng = Rng::new(9);
         let (mut kept, mut rejected) = (0, 0);
         let mut mean = Vec3::new(0.0, 0.0, 0.0);

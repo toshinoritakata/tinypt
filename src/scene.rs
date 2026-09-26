@@ -6,9 +6,7 @@ use crate::config::RenderConfig;
 use crate::env::EnvMap;
 use crate::geometry::Sphere;
 use crate::material::Material;
-use crate::noise::NoiseTexture;
-use crate::normal_map::{MapId, NormalMap};
-use crate::texture::Texture;
+use crate::shader::ShaderSet;
 use crate::math::{Color, Vec3};
 use crate::ray::Camera;
 use crate::world::World;
@@ -30,19 +28,8 @@ pub struct Scene {
     pub cam: Camera,
     /// ワールド（全ジオメトリとライト）
     pub world: World,
-    /// マテリアルリスト（インデックスで参照）
-    pub mats: Vec<Material>,
-    /// テクスチャ置き場（`Material` が `TexId` で参照する）。
-    /// マテリアルを `Copy` のまま保つため、本体はここに集約して添字で引く。
-    pub textures: Vec<Texture>,
-    /// 法線を摂動するマップ（ハイトマップ／タンジェント空間ノーマルマップ）。色テクスチャとは別に持つ
-    /// （sRGB の誤適用を型で防ぐ）。`Material` を `Copy` のまま保つため、材質側ではなく `mat_maps` から引く。
-    pub normal_maps: Vec<NormalMap>,
-    /// `mat_id` → `normal_maps` の添字。**空か、さもなくば `mats` と同じ長さ**（不変条件。空ならマップ無しで、
-    /// 積分器は何も引かない）。
-    pub mat_maps: Vec<Option<MapId>>,
-    /// 手続き的な 3D ノイズ（`Material` が `NOISE_TEX_FLAG` 付きの `TexId` で参照する。画像の `textures` とは別）
-    pub noises: Vec<NoiseTexture>,
+    /// 材質（シェーダー）・式・テクスチャ・ノイズ・法線マップ。`mat_id` が `shaders.shaders` の添字
+    pub shaders: ShaderSet,
     /// 環境マップ（None でデフォルトの空色を使用）
     pub env: Option<EnvMap>,
     /// 一様な参加媒質（None で真空）。M3 までシーンファイルからは読めず、テストとコードから直接与える
@@ -72,14 +59,12 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
     // 地面（大球）
     let id_ground = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.5, 0.5, 0.5),
-        albedo_tex: None,
     });
     world.add_sphere(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: id_ground });
 
     // Lambert（左端）
     let id_lambert = push(&mut mats, Material::Lambert {
         albedo: Color::from_srgb(0.8, 0.3, 0.3),
-        albedo_tex: None,
     });
     world.add_sphere(Sphere { c: Vec3::new(-1.8, 0.5, 0.0), r: 0.5, mat_id: id_lambert });
 
@@ -123,11 +108,19 @@ pub fn build_default_scene(config: &RenderConfig) -> Scene {
     };
 
     let load_stats = LoadStats { mesh_build: world.mesh_build_time(), ..Default::default() };
-    Scene { cam, world, mats, textures: Vec::new(), normal_maps: Vec::new(), mat_maps: Vec::new(), noises: Vec::new(), env, medium: None, load_stats }
+    Scene { cam, world, shaders: ShaderSet::from_materials(&mats), env, medium: None, load_stats }
 }
 
 fn push(mats: &mut Vec<Material>, m: Material) -> usize {
     let id = mats.len();
     mats.push(m);
     id
+}
+
+#[cfg(test)]
+impl Scene {
+    /// テスト用: 材質ごとの法線マップの添字（`mat_id` 順）。
+    pub fn mat_maps(&self) -> Vec<Option<crate::normal_map::MapId>> {
+        self.shaders.shaders.iter().map(|s| s.normal).collect()
+    }
 }
