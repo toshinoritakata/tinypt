@@ -60,11 +60,12 @@ fn main() -> std::io::Result<()> {
         let total = load_start.elapsed();
         let st = &scene.load_stats;
         eprintln!(
-            "Scene: {} ({} tris, {} instances, {} spheres, {} lights, {} textures)",
+            "Scene: {} ({} tris, {} instances, {} spheres, {} sdfs, {} lights, {} textures)",
             config.scene_path.as_deref().unwrap_or("built-in"),
             scene.world.triangle_count(),
             scene.world.instances().len(),
             scene.world.spheres().len(),
+            scene.world.sdfs().len(),
             scene.world.lights().len(),
             scene.shaders.textures.len(),
         );
