@@ -157,7 +157,9 @@ impl Camera {
     pub fn ray(&self, sx: f64, sy: f64, rng: &mut Rng) -> Ray {
         // 薄レンズモデル: レンズ上のランダムな点をサンプリング（乱数の消費順は「レンズ → time」で従来通り。
         // 姿勢が time で決まるので、レンズ点は (dx, dy) だけ先に引き、基底に掛けるのは time を引いた後）
+        rng.set_dim(crate::sampler::first::LENS);
         let lens_xy = if self.lens_radius > 0.0 { Some(sample_unit_disk(rng)) } else { None };
+        rng.set_dim(crate::sampler::first::TIME);
         // モーションブラー: シャッター間のランダムな時間を割り当て
         let time = self.shutter_open + (self.shutter_close - self.shutter_open) * rng.next_f64();
         // 動くカメラは time の姿勢の基底を使う。**レンズ点も補間後の u, v に掛ける**（固定基底だとボケが動きとずれる）
@@ -187,15 +189,20 @@ fn pose_transform((o, u, v, w): Pose) -> Transform {
     Transform::from_affine(a, -a.mul_vec(o))
 }
 
-/// 単位円内の一様ランダム点を棄却法でサンプリング（レンズ面用）。
+/// 単位円内の一様ランダム点を Shirley–Chiu の同心円写像でサンプリングする（レンズ面用）。
+/// 乱数をちょうど 2 個使い（棄却法と違って消費量が一定）、[0,1)² の層化がそのまま円盤の層化になる。
 fn sample_unit_disk(rng: &mut Rng) -> (f64, f64) {
-    loop {
-        let x = 2.0 * rng.next_f64() - 1.0;
-        let y = 2.0 * rng.next_f64() - 1.0;
-        if x * x + y * y < 1.0 {
-            return (x, y);
-        }
+    let a = 2.0 * rng.next_f64() - 1.0;
+    let b = 2.0 * rng.next_f64() - 1.0;
+    if a == 0.0 && b == 0.0 {
+        return (0.0, 0.0);
     }
+    let (r, phi) = if a * a > b * b {
+        (a, std::f64::consts::FRAC_PI_4 * (b / a))
+    } else {
+        (b, std::f64::consts::FRAC_PI_2 - std::f64::consts::FRAC_PI_4 * (a / b))
+    };
+    (r * phi.cos(), r * phi.sin())
 }
 
 #[cfg(test)]

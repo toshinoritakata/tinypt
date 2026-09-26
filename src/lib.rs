@@ -16,6 +16,7 @@ pub mod constants;   // レンダラー全体の定数定義
 pub mod math;        // ベクトル・色・数学ユーティリティ
 pub mod aces;        // sRGB ↔ ACEScg 色空間変換
 pub mod rng;         // PCG 擬似乱数生成器
+pub mod sampler;     // Owen スクランブル付き Sobol 列（層化サンプラー）
 pub mod ray;         // レイとカメラモデル
 pub mod geometry;    // 幾何プリミティブ（球・三角形・AABB）
 pub mod bvh;         // BVH（Bounding Volume Hierarchy）加速構造

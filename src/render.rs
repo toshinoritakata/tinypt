@@ -22,12 +22,12 @@ use crate::checkpoint::{load_checkpoint, save_checkpoint};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
 use crate::env::EnvMap;
-use crate::integrator::{radiance, PathLimits, Strata, Surfaces};
+use crate::integrator::{radiance, PathLimits, Surfaces};
 use crate::material::Material;
 use crate::math::Color;
 use crate::medium::Medium;
 use crate::ray::Camera;
-use crate::rng::{seed_for, Rng};
+use crate::rng::{seed_for, splitmix64, Rng};
 use crate::scene::Scene;
 use crate::task::{idx, Task, TileResult};
 use crate::world::World;
@@ -92,39 +92,17 @@ fn build_tasks(config: &RenderConfig) -> Vec<Task> {
     tasks
 }
 
-/// Fisher–Yates で `v` をその場でシャッフルする（一様な順列）。PERF-3 の層番号の割り当てに使う。
-fn shuffle(v: &mut [usize], rng: &mut Rng) {
-    for i in (1..v.len()).rev() {
-        let j = (rng.next_f64() * (i + 1) as f64) as usize % (i + 1);
-        v.swap(i, j);
-    }
-}
-
-/// PERF-3: `spp` 本のサンプルを覆う層化格子の大きさ（`nx * ny >= spp` を満たす、正方形に近い形）。
-/// `spp` が `nx` の倍数でなければ最後の行の右側にいくつか余りが出る（層 1 個あたりサンプル 0 個の
-/// セルが生じるだけで、破綻はしない — 層化はサンプルの重複や取りこぼしを防ぐ道具であって、
-/// 完全な正方格子を要求するものではない）。`spp == 0` は起きない前提（呼び出し側で 1 以上に丸める）。
-fn strata_grid(spp: usize) -> (usize, usize) {
-    let nx = (spp as f64).sqrt().ceil().max(1.0) as usize;
-    let ny = spp.div_ceil(nx).max(1);
-    (nx, ny)
-}
-
 /// 1 ピクセル分のサンプリングを行い `(放射輝度合計, 使用サンプル数)` を返す。
 ///
 /// `config.adaptive_enabled` なら Welford のオンライン分散で相対標準偏差が
 /// 閾値を下回った時点で早期終了する（`min_spp` 到達後）。ジッター・スクリーン
 /// 座標変換・カメラレイ生成・`radiance` 呼び出しは適応/固定の両方で共有される。
 ///
-/// **層化サンプリング（PERF-3）**: ピクセル内ジッターと最初のバウンスの NEE 光源サンプリングを、
-/// このピクセルのサンプル予算（`spp` = `t.sample_end - t.sample_start`。適応時は上限）に合わせた
-/// √spp × √spp の格子で層化する。層番号の `local`（0 起点のサンプル番号）への割り当ては、
-/// ピクセルごとに独立に Fisher–Yates でシャッフルした順列（`pixel_order` / `light_order`、
-/// 互いに独立）を使う — 適応的サンプリングが途中で打ち切っても、画面上のどのピクセルも
-/// 「格子の同じ一部だけ」を常に選ぶことがないようにするため（そうしないと、早期終了しやすい
-/// 明るい/低分散領域が画素内の特定のサブピクセル位置に偏り、エッジのアンチエイリアシングに
-/// ごくわずかなバイアスが乗りうる）。単純な回転では不十分だったことは `shuffle` の呼び出し元の
-/// コメント参照。
+/// **Owen スクランブル付き Sobol 列（[`crate::sampler`]）**: サンプル `s`（画素内の通し番号）ごとに Sobol モードの
+/// [`Rng`] を作り、パスの各次元（ジッター・レンズ・時刻・各バウンスの BSDF / NEE / Russian roulette / 媒質）を
+/// 同じ点集合で層化する。スクランブルの種は画素座標とユーザーシード（`--seed`）から決まる。サンプル番号は通し番号
+/// `s`（チェックポイントの再開・タスク分割でも同じ）なので、どの分割でも同じ点集合になる。
+/// 以前の √spp × √spp の層化（ジッターと最初のバウンスの面光源 NEE だけ）は、これに置き換えた。
 #[allow(clippy::too_many_arguments)]
 fn sample_pixel(
     x: usize,
@@ -141,35 +119,21 @@ fn sample_pixel(
     limits: PathLimits,
     config: &RenderConfig,
 ) -> (Color, f64) {
-    let mut rng = Rng::new(seed_for(x as u32, y as u32, t.sample_start as u32, config.seed));
     let mut c = Color::new(0.0, 0.0, 0.0);
-
     let max_spp = (t.sample_end - t.sample_start).max(1);
-    let (nx, ny) = strata_grid(max_spp);
-    let n_cells = nx * ny;
-    // ピクセルジッターと光源サンプリングの層番号を、それぞれ独立にシャッフルした順列で
-    // `local`（0 起点のサンプル番号）に割り当てる。**単純な回転（+定数、mod n_cells）では
-    // 不十分**（実測: 両方に回転だけを使うと、default.xml のような鏡面・ガラスを含むシーンで
-    // むしろ分散が悪化した — 回転は「どの層が何番目に選ばれるか」の相対順序を変えないので、
-    // 2 つの層化次元が常に足並みを揃えて進み、AA サブピクセル位置と光源上の狙い位置が
-    // 弱く相関してしまうため。詳細はレポート参照）。Fisher–Yates で完全に独立な順列にすると
-    // この相関が消え、単体でも組み合わせても分散が単調に下がることを確認した。
-    let mut pixel_order: Vec<usize> = (0..n_cells).collect();
-    shuffle(&mut pixel_order, &mut rng);
-    let mut light_order: Vec<usize> = (0..n_cells).collect();
-    shuffle(&mut light_order, &mut rng);
+    // 画素ごとのスクランブルの種（画素座標とユーザーシードから。全サンプル共通）
+    let pixel_seed = (splitmix64(seed_for(x as u32, y as u32, u32::MAX, config.seed)) >> 32) as u32;
 
-    let sample_once = |rng: &mut Rng, local: usize| -> Color {
-        let pixel_stratum = pixel_order[local];
-        let cx = pixel_stratum % nx;
-        let cy = pixel_stratum / nx;
-        let jx = (cx as f64 + rng.next_f64()) / nx as f64;
-        let jy = (cy as f64 + rng.next_f64()) / ny as f64;
+    let sample_once = |s: usize| -> Color {
+        // Sobol モード。PCG（次元の上限を超えたときのフォールバック）はサンプルごとに独立なシード
+        let mut rng = Rng::sobol(seed_for(x as u32, y as u32, s as u32, config.seed), pixel_seed, s as u32);
+        // 次元 0, 1: 画素内のジッター
+        let jx = rng.next_f64();
+        let jy = rng.next_f64();
         let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
         let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
-        let ray = cam.ray(sx, sy, rng);
-        let strata = Strata { stratum: light_order[local], nx, ny };
-        radiance(world, mats, surfaces, env, medium, ray, rng, limits, Some(strata))
+        let ray = cam.ray(sx, sy, &mut rng);
+        radiance(world, mats, surfaces, env, medium, ray, &mut rng, limits)
     };
 
     if config.adaptive_enabled {
@@ -180,7 +144,7 @@ fn sample_pixel(
         let mut mean = 0.0;
         let mut m2 = 0.0;
         for s in t.sample_start..t.sample_end {
-            let sample = sample_once(&mut rng, s - t.sample_start);
+            let sample = sample_once(s);
             c = c + sample;
             n += 1;
             // Welford: 輝度ベースのオンライン分散更新
@@ -202,7 +166,7 @@ fn sample_pixel(
         (c, n as f64)
     } else {
         for s in t.sample_start..t.sample_end {
-            c = c + sample_once(&mut rng, s - t.sample_start);
+            c = c + sample_once(s);
         }
         (c, (t.sample_end - t.sample_start) as f64)
     }
@@ -694,7 +658,7 @@ mod tests {
     /// ゴールデン値の組（`RENDER_REVISION` と対で更新する。片方だけ変えるとテストが失敗する）。
     /// `RENDER_REVISION` は `Cargo.toml` の `version` から導出されるので、実質的には
     /// 「このハッシュを記録したときの `Cargo.toml` のバージョン」を数値で持っているのと同じ。
-    const GOLDEN_REVISION: u32 = 8001;
+    const GOLDEN_REVISION: u32 = 9000;
 
     /// sample/cornell.xml を 48x48・2spp（seed 0、tile 16、Morton）で描画した蓄積バッファの
     /// 丸めハッシュと、それを `--tonemap none` 相当で書いた PPM（P6）ファイルのハッシュ。
@@ -709,10 +673,10 @@ mod tests {
     /// `map_Kd` を GGX 分岐より優先する不具合修正（RENDER_REVISION 15）でも不変: golden シーンは map_Kd と
     /// 明るい Ks/Ns の両方を持つ材質を含まない。
     /// アルファマスク導入（RENDER_REVISION 13）でも不変: マスクを持たないメッシュは従来の交差経路のまま。
-    const GOLDEN_CORNELL: (u64, u64) = (0xe8de_82ff_eefa_a3a2, 0xc919_2023_41f9_1ae4);
+    const GOLDEN_CORNELL: (u64, u64) = (0xe438_0469_8a74_3e32, 0x3b83_69c6_d80f_2425);
 
     /// [`GOLDEN_SPHERES_XML`] を 64x36・2spp で描画したもののハッシュ。
-    const GOLDEN_SPHERES: (u64, u64) = (0x97ce_d12c_3034_e527, 0xf0a2_bec4_108c_1c2a);
+    const GOLDEN_SPHERES: (u64, u64) = (0xfb2c_6720_b498_54c4, 0x1dd5_44ab_3963_055d);
 
     /// sample/default.xml 相当（Lambert・金属・GGX・吸収付きガラス・球光源・地面の大球）に、
     /// constant 環境 emitter と被写界深度（aperture_radius > 0）を加えたシーン。
@@ -814,56 +778,6 @@ mod tests {
     /// 等倍と統計的に一致する。自己交差回避（交差点の誤差上界に基づく原点のずらし、`offset_ray_origin`）が
     /// シーンのスケールに依存しないことの回帰テスト。以前の絶対オフセット 1e-4 では、1e-3 倍（箱の辺が 0.0006）で
     /// 接地部の光漏れや角の暗さが出た。
-    // ---- PERF-3: 層化サンプリング ----
-
-    /// `strata_grid` は常に `nx * ny >= spp` を満たす、正方形に近い格子を返す
-    /// （`spp` が平方数でなくても、余りは `ny` 側の最後の行に出るだけで壊れない）。
-    #[test]
-    fn strata_grid_covers_spp_with_a_near_square_layout() {
-        for spp in [1usize, 2, 3, 4, 5, 15, 16, 17, 100, 4096] {
-            let (nx, ny) = strata_grid(spp);
-            assert!(nx * ny >= spp, "spp={}: {}x{} < spp", spp, nx, ny);
-            assert!(nx >= 1 && ny >= 1);
-            // 正方形に近い（縦横比が極端に偏らない）
-            assert!(nx as f64 / ny as f64 <= 2.0 && ny as f64 / nx as f64 <= 2.0, "spp={}: {}x{} is not square-ish", spp, nx, ny);
-        }
-    }
-
-    /// `shuffle` は 0..n の一様な順列を作る（重複も欠落もない）。
-    #[test]
-    fn shuffle_produces_a_permutation() {
-        let mut rng = Rng::new(7);
-        for &n in &[1usize, 2, 5, 16, 100, 257] {
-            let mut v: Vec<usize> = (0..n).collect();
-            shuffle(&mut v, &mut rng);
-            let mut seen = vec![false; n];
-            for &x in &v {
-                assert!(x < n && !seen[x], "n={}: not a permutation ({:?})", n, v);
-                seen[x] = true;
-            }
-        }
-    }
-
-    /// ピクセル内ジッターと光源サンプリングの層番号は、`spp` 本のサンプルそれぞれに
-    /// 重複なく・格子の外を指さずに 1 つずつ割り当てられる（層化そのものの検証）。
-    /// `sample_pixel` は private だが、同じロジック（`strata_grid` + `shuffle`）を直接確認する。
-    #[test]
-    fn each_sample_gets_exactly_one_distinct_stratum() {
-        let mut rng = Rng::new(3);
-        for &spp in &[1usize, 7, 16, 30, 64] {
-            let (nx, ny) = strata_grid(spp);
-            let n_cells = nx * ny;
-            let mut order: Vec<usize> = (0..n_cells).collect();
-            shuffle(&mut order, &mut rng);
-            let assigned: Vec<usize> = (0..spp).map(|local| order[local]).collect();
-            let mut seen = std::collections::HashSet::new();
-            for &s in &assigned {
-                assert!(s < n_cells, "stratum {} out of {}x{} grid", s, nx, ny);
-                assert!(seen.insert(s), "spp={}: stratum {} assigned twice", spp, s);
-            }
-        }
-    }
-
     /// 適応的サンプリング（`--adaptive`）を有効にしても、層化を組み込んだ現在の `sample_pixel` が
     /// パニック・ハングせず、固定 spp の参照レンダーと大きくかけ離れない結果を返す
     /// （不偏性の精密な検定ではなく、layered サンプリングを混ぜても破綻しないことのスモークテスト。

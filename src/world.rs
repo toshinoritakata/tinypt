@@ -1140,6 +1140,8 @@ impl World {
             return None;
         }
         let r = rng.next_f64() * self.light_total;
+        // 光源の選択（1 次元）の後、面上の点（2 次元）は次の組の先頭から引く（Sobol の次元の表: `sampler`）
+        rng.align_pair();
         let idx = cdf_search(&self.light_cdf, r).min(self.lights.len().saturating_sub(1));
         let info = self.lights[idx];
         let pdf_select = info.weight / self.light_total;

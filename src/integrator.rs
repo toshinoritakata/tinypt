@@ -23,6 +23,7 @@ use crate::math::{Color, Vec3};
 use crate::medium::{hg_eval, hg_sample, Medium, MediumEvent};
 use crate::ray::Ray;
 use crate::rng::Rng;
+use crate::sampler::{bounce_dim, role};
 use crate::normal_map::{orthonormalize, MapId, NormalMap};
 use crate::noise::NoiseTexture;
 use crate::texture::Texture;
@@ -41,32 +42,6 @@ fn background(d: Vec3, env: Option<&EnvMap>) -> Color {
         m.sample(d)
     } else {
         sky(d)
-    }
-}
-
-/// PERF-3: 層化サンプリングの文脈。1 ピクセルの `spp` 本のサンプルのうち、いま何番目かを
-/// 「層番号」として伝える。**最初のバウンス（`bounce == 0`）の NEE 面光源サンプリングだけ**が
-/// これを使う（Sponza のように光源が小さく NEE 主体のシーンで効くのはここで、深いバウンスまで
-/// 層化しても複雑さに見合わないため。README／レポート参照）。
-#[derive(Clone, Copy)]
-pub struct Strata {
-    /// このサンプルの層番号（0 起点。ピクセルごとに乱択した回転を含む — 適応的サンプリングが
-    /// 途中で打ち切っても、常に同じ部分格子だけが選ばれて偏らないようにするため）。
-    pub stratum: usize,
-    /// 格子の横方向の層数
-    pub nx: usize,
-    /// 格子の縦方向の層数（`nx * ny >= spp` で、`spp` が `nx` の倍数でなければ余りが出る）
-    pub ny: usize,
-}
-
-impl Strata {
-    /// この層番号に対応する 2 次元乱数 [0,1)²（`rng` で層内をジッターする）。
-    fn uv(&self, rng: &mut Rng) -> (f64, f64) {
-        let cx = self.stratum % self.nx;
-        let cy = (self.stratum / self.nx) % self.ny;
-        let u = (cx as f64 + rng.next_f64()) / self.nx as f64;
-        let v = (cy as f64 + rng.next_f64()) / self.ny as f64;
-        (u, v)
     }
 }
 
@@ -102,7 +77,6 @@ pub fn radiance(
     ray: Ray,
     rng: &mut Rng,
     limits: PathLimits,
-    strata: Option<Strata>,
 ) -> Color {
     let mut accumulated_radiance = Color::new(0.0, 0.0, 0.0); // パス全体の蓄積放射輝度
     let mut path_throughput = Color::new(1.0, 1.0, 1.0);       // パスのスループット（減衰係数）
@@ -113,6 +87,7 @@ pub fn radiance(
     let mut eta_scale = 1.0;          // パス上の透過で掛かった相対屈折率 η_t/η_i の積（RR 用）
 
     for bounce in 0..limits.max_depth {
+        // Sobol の次元は役割ごとに `sampler` の表のとおり固定する（`bounce_dim(bounce, 役割)`）。PCG モードでは set_dim は何もしない
         // レイとシーンの交差判定。自己交差は、レイの原点を面の誤差の箱の外へずらしてあること
         // （`offset_ray_origin`）と、各プリミティブが「t > 計算誤差の上界」のヒットだけを返すことで
         // 防ぐので、tmin は 0 でよい
@@ -122,6 +97,7 @@ pub fn radiance(
         // `medium` が `None` なら丸ごと飛ばし、乱数も引かない（媒質の無いシーンの出力はビット単位で不変）。
         if let Some(med) = medium {
             let t_surface = hit.as_ref().map(|h| h.t).unwrap_or(RAY_T_MAX);
+            rng.set_dim(bounce_dim(bounce, role::MEDIUM_DISTANCE));
             match med.sample_distance(ray, t_surface, rng) {
                 MediumEvent::Pass { weight } => {
                     path_throughput = path_throughput.hadamard(weight);
@@ -138,17 +114,13 @@ pub fn radiance(
                     // NEE（環境光・面光源）。表面版との違い: cos 項なし・原点ずらしなし・裏面棄却なし、
                     // f = 位相関数。別関数にしてあるのは表面版のバイト一致を守るため
                     if let Some(env_map) = env {
+                        rng.set_dim(bounce_dim(bounce, role::NEE_ENV));
                         let occluded = |shadow: Ray| world.occluded(shadow, 0.0, RAY_T_MAX, None);
                         let contrib = nee_environment_phase(occluded, env_map, med, path_throughput, p, wo, ray.time, rng);
                         accumulated_radiance = accumulated_radiance + contrib;
                     }
-                    let ls = match (bounce, strata) {
-                        (0, Some(s)) => {
-                            let uv = s.uv(rng);
-                            world.sample_light_with_uv(rng, ray.time, p, uv)
-                        }
-                        _ => world.sample_light(rng, ray.time, p),
-                    };
+                    rng.set_dim(bounce_dim(bounce, role::NEE_LIGHT_SELECT));
+                    let ls = world.sample_light(rng, ray.time, p);
                     if let Some(ls) = ls {
                         let contrib = nee_area_light_phase(
                             |shadow: Ray, tmax: f64| world.occluded(shadow, 0.0, tmax, Some((ls.inst_id, ls.prim_id))),
@@ -171,6 +143,7 @@ pub fn radiance(
                     }
                     if bounce + 1 >= limits.rr_depth {
                         let p_rr = rr_survival_probability(throughput_max, eta_scale);
+                        rng.set_dim(bounce_dim(bounce, role::ROULETTE));
                         if rng.next_f64() >= p_rr {
                             break;
                         }
@@ -179,6 +152,7 @@ pub fn radiance(
 
                     // 位相関数サンプリング。HG は位相関数そのものに比例してサンプルする（完全重点サンプリング）
                     // ので weight = f / pdf = 1 で、`path_throughput` には何も掛けない
+                    rng.set_dim(bounce_dim(bounce, role::MEDIUM_PHASE));
                     let (wi, pdf) = hg_sample(wo, med.g, rng);
                     ray = Ray { o: p, d: wi, time: ray.time };
                     last_bsdf_pdf = pdf;
@@ -248,20 +222,15 @@ pub fn radiance(
             if let Some(env_map) = env {
                 // any-hit: 遮蔽の有無だけが要るので、最初に見つかった交差で打ち切る（最近接は不要）。
                 // 環境光には「除外すべき光源自身」が無いので skip は None
+                rng.set_dim(bounce_dim(bounce, role::NEE_ENV));
                 let occluded = |shadow: Ray| world.occluded(shadow, 0.0, RAY_T_MAX, None);
                 let contrib = nee_environment(occluded, env_map, &mat, path_throughput, &hit, n, ng, ray, medium, rng);
                 accumulated_radiance = accumulated_radiance + contrib;
             }
             // NEE: Area lights
-            // 最初のバウンスだけ、層化した 2 次元乱数で光源面上の点を選ぶ（PERF-3）。
-            // 深いバウンスは従来どおり rng から直接引く（層化しない）
-            let ls = match (bounce, strata) {
-                (0, Some(s)) => {
-                    let uv = s.uv(rng);
-                    world.sample_light_with_uv(rng, ray.time, hit.p, uv)
-                }
-                _ => world.sample_light(rng, ray.time, hit.p),
-            };
+            // 光源の選択と面上の点は Sobol の固定の次元（選択 1 次元 + 点 2 次元。`sample_light` が組の境界に揃える）
+            rng.set_dim(bounce_dim(bounce, role::NEE_LIGHT_SELECT));
+            let ls = world.sample_light(rng, ray.time, hit.p);
             if let Some(ls) = ls {
                 let contrib = nee_area_light(
                     // any-hit + 光源自身の除外（`(ls.inst_id, ls.prim_id)` に一致する交差は遮蔽と数えない）
@@ -301,6 +270,7 @@ pub fn radiance(
         }
         if bounce + 1 >= limits.rr_depth {
             let p = rr_survival_probability(throughput_max, eta_scale);
+            rng.set_dim(bounce_dim(bounce, role::ROULETTE));
             if rng.next_f64() >= p {
                 break;
             }
@@ -308,6 +278,7 @@ pub fn radiance(
         }
 
         // BSDF サンプリング: 散乱レイ・スループット重み・PDF を BSDF から取得
+        rng.set_dim(bounce_dim(bounce, role::BSDF));
         match mat.sample(&ray, &hit, rng) {
             Some(BsdfSample { scattered, weight, pdf, is_delta, eta }) => {
                 last_bsdf_pdf = pdf;
@@ -803,10 +774,13 @@ mod tests {
 
     /// 平均と標準誤差。
     fn estimate(world: &World, mats: &[Material], env: &EnvMap, ray: Ray, limits: PathLimits, n: usize, seed: u64) -> (f64, f64) {
-        let mut rng = Rng::new(seed);
-        let (mut s, mut s2) = (0.0, 0.0);
-        for _ in 0..n {
-            let x = radiance(world, mats, &Surfaces::none(), Some(env), None, ray, &mut rng, limits, None).r();
+        // 本番と同じ Sobol モード（画素 1 つぶん。種は `seed`、サンプル番号は 0..n）。白炉・解析解の検定を
+        // Sobol の経路でも走らせる（不偏性の本丸）。標準誤差は独立な標本の式なので、層化で実際の誤差が小さい分は保守的
+        let mut s = 0.0;
+        let mut s2 = 0.0;
+        for i in 0..n {
+            let mut rng = Rng::sobol(seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15), seed as u32, i as u32);
+            let x = radiance(world, mats, &Surfaces::none(), Some(env), None, ray, &mut rng, limits).r();
             s += x;
             s2 += x * x;
         }
@@ -825,9 +799,9 @@ mod tests {
         let limits = |max_depth| PathLimits { max_depth, rr_depth: 1000 };
 
         let mut rng = Rng::new(1);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(0), None).r(), 0.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(1), None).r(), 4.0);
-        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_floor, &mut rng, limits(1), None).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(0)).r(), 0.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_light, &mut rng, limits(1)).r(), 4.0);
+        assert_eq!(radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_floor, &mut rng, limits(1)).r(), 0.0);
 
         let exact = 0.5 * 4.0 / 9.0;
         for max_depth in [2usize, 3, 8, usize::MAX] {
@@ -846,32 +820,6 @@ mod tests {
             let (mean, se) = estimate(&world, &mats, &env, to_floor, PathLimits { max_depth: usize::MAX, rr_depth }, 200_000, 11);
             assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "rr_depth={}: {} ± {} vs exact {}", rr_depth, mean, se, exact);
         }
-    }
-
-    /// PERF-3: 最初のバウンスの NEE を層化（`Strata` 付き）しても、直接照明の理論値
-    /// （ρ·L/9）に不偏で収束する。256 層を順に一巡させながら呼ぶ（`render.rs` の
-    /// `sample_pixel` が層番号を割り当てる使い方の最小再現）。
-    #[test]
-    fn stratified_nee_is_unbiased_for_the_analytic_direct_lighting_value() {
-        let (world, mats, env) = floor_under_sphere_light();
-        let to_floor = Ray { o: Vec3::new(2.0, 1.0, 0.0), d: Vec3::new(-2.0, -1.0, 0.0).norm(), time: 0.0 };
-        let exact = 0.5 * 4.0 / 9.0;
-        let limits = PathLimits { max_depth: usize::MAX, rr_depth: 1000 };
-        let (nx, ny) = (16usize, 16usize);
-        let n_cells = nx * ny;
-
-        let mut rng = Rng::new(42);
-        let n = 200_000usize;
-        let (mut s, mut s2) = (0.0, 0.0);
-        for i in 0..n {
-            let strata = Strata { stratum: i % n_cells, nx, ny };
-            let x = radiance(&world, &mats, &Surfaces::none(), Some(&env), None, to_floor, &mut rng, limits, Some(strata)).r();
-            s += x;
-            s2 += x * x;
-        }
-        let mean = s / n as f64;
-        let se = ((s2 / n as f64 - mean * mean).max(0.0) / n as f64).sqrt();
-        assert!((mean - exact).abs() < 5.0 * se + 1e-3 * exact, "{} ± {} vs exact {}", mean, se, exact);
     }
 
     /// 生存確率は max(throughput)·η² を [0.05, 0.95] にクランプしたもの。
@@ -1247,7 +1195,7 @@ mod tests {
             let (mut sum, n) = (0.0, 20_000);
             for _ in 0..n {
                 sum += radiance(&world, &mats, &Surfaces::textures_only(&textures), Some(&env), None, ray, &mut rng,
-                                PathLimits { max_depth: 2, rr_depth: 8 }, None).r();
+                                PathLimits { max_depth: 2, rr_depth: 8 }).r();
             }
             sum / n as f64
         };
@@ -1366,10 +1314,10 @@ mod tests {
 
     /// 媒質付きの推定。全チャンネルの (平均, 標準誤差)。
     fn estimate_medium(world: &World, mats: &[Material], env: &EnvMap, med: &Medium, ray: Ray, limits: PathLimits, n: usize, seed: u64) -> ([f64; 3], [f64; 3]) {
-        let mut rng = Rng::new(seed);
         let (mut s, mut s2) = ([0.0; 3], [0.0; 3]);
-        for _ in 0..n {
-            let c = radiance(world, mats, &Surfaces::none(), Some(env), Some(med), ray, &mut rng, limits, None);
+        for i in 0..n {
+            let mut rng = Rng::sobol(seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15), seed as u32, i as u32);
+            let c = radiance(world, mats, &Surfaces::none(), Some(env), Some(med), ray, &mut rng, limits);
             for (i, x) in [c.r(), c.g(), c.b()].into_iter().enumerate() {
                 s[i] += x;
                 s2[i] += x * x;
@@ -1529,7 +1477,7 @@ mod tests {
         let ray = Ray { o: from, d: (target - from).norm(), time: 0.0 };
         let mut rng = Rng::new(1);
         let env = black_env();
-        radiance(world, mats, &Surfaces::none(), Some(&env), medium, ray, &mut rng, PathLimits { max_depth: 3, rr_depth: 1000 }, None).r()
+        radiance(world, mats, &Surfaces::none(), Some(&env), medium, ray, &mut rng, PathLimits { max_depth: 3, rr_depth: 1000 }).r()
     }
 
     fn close(a: f64, b: f64, rel: f64) -> bool {
@@ -1845,7 +1793,7 @@ mod map_tests {
         let n = 60_000;
         let mut sum = 0.0;
         for _ in 0..n {
-            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits, None).g();
+            sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits).g();
         }
         let got = sum / n as f64;
 
@@ -1888,7 +1836,7 @@ mod map_tests {
             let mut rng = Rng::new(3);
             let mut sum = 0.0;
             for _ in 0..4000 {
-                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits, None).g();
+                sum += radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, down_ray(0.0, 0.0), &mut rng, limits).g();
             }
             sum
         };
@@ -1956,7 +1904,7 @@ mod map_tests {
         let limits = PathLimits { max_depth: 6, rr_depth: 8 };
         for _ in 0..20_000 {
             let d = crate::rng::uniform_sphere_dir(&mut rng);
-            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits, None);
+            let c = radiance(&s.world, &s.mats, &sf, s.env.as_ref(), None, Ray { o: Vec3::new(0.1, -0.2, 0.05), d, time: 0.0 }, &mut rng, limits);
             assert_eq!(c.r(), 0.0, "立方体の内側に光が漏れた");
         }
         std::fs::remove_dir_all(&dir).ok();

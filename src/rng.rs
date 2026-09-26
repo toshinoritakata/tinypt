@@ -5,6 +5,7 @@
 //! 再現可能なレンダリング結果を保証する。
 
 use crate::math::Vec3;
+use crate::sampler::SobolStream;
 
 #[derive(Clone, Copy)]
 /// PCG32 ベースの乱数生成器。
@@ -12,6 +13,8 @@ pub struct Rng {
     state: u64,
     /// LCG のインクリメント（ストリーム選択子、常に奇数）
     inc: u64,
+    /// Sobol モード（[`Rng::sobol`]）。`Some` の間、`next_f64` は Sobol の次元から引き、上限を超えたら PCG にフォールバックする
+    sobol: Option<SobolStream>,
 }
 impl Rng {
     /// シードから RNG を初期化する（任意の `u64`、0 も可）。
@@ -22,15 +25,54 @@ impl Rng {
     /// ずれた部分列として重なることがない。
     pub fn new(seed: u64) -> Self {
         let inc = (splitmix64(seed ^ 0xA076_1D64_78BD_642F) << 1) | 1;
-        let mut rng = Self { state: 0, inc };
+        let mut rng = Self { state: 0, inc, sobol: None };
         rng.next_u32();
         rng.state = rng.state.wrapping_add(splitmix64(seed));
         rng.next_u32();
         rng
     }
 
+    /// Sobol モードの RNG。`next_f64` は Owen スクランブル付き Sobol 列の次元を順に返す（[`crate::sampler`]）。
+    /// `pcg_seed` は次元の上限を超えたときのフォールバック（と `next_u32`）用の PCG のシード、
+    /// `pixel_seed` は画素とユーザーシードから決めたスクランブルの種、`index` は画素内のサンプル番号。
+    pub fn sobol(pcg_seed: u64, pixel_seed: u32, index: u32) -> Self {
+        // PCG は最初に必要になるまで初期化しない（`SobolStream::pcg_seed`。`ensure_pcg` が初期化する）
+        let mut stream = SobolStream::new(pixel_seed, index);
+        stream.pcg_seed = Some(pcg_seed);
+        Self { state: 0, inc: 1, sobol: Some(stream) }
+    }
+
+    /// 次に引く Sobol 次元を `dim` にする（PCG モードでは何もしない）。役割ごとの次元は [`crate::sampler`] の表。
+    #[inline]
+    pub fn set_dim(&mut self, dim: u32) {
+        if let Some(s) = &mut self.sobol {
+            s.set_dim(dim);
+        }
+    }
+
+    /// 次に引く Sobol 次元を偶数（2 次元の組の先頭）に切り上げる（PCG モードでは何もしない）。
+    #[inline]
+    pub fn align_pair(&mut self) {
+        if let Some(s) = &mut self.sobol {
+            s.align_pair();
+        }
+    }
+
+    /// Sobol モードで PCG がまだ初期化されていなければ初期化する（PCG を使う直前に呼ぶ。PCG モードでは何もしない）。
+    #[inline]
+    fn ensure_pcg(&mut self) {
+        if let Some(s) = &mut self.sobol {
+            if let Some(seed) = s.pcg_seed.take() {
+                let sobol = self.sobol;
+                *self = Self::new(seed);
+                self.sobol = sobol;
+            }
+        }
+    }
+
     /// 次の 32 ビット値を生成する（PCG32 出力関数）。
     pub fn next_u32(&mut self) -> u32 {
+        self.ensure_pcg();
         // PCG32: LCG + XSH-RR（XorShift + Random Rotation）出力関数
         let old = self.state;
         self.state = old
@@ -43,6 +85,11 @@ impl Rng {
 
     /// [0, 1) の一様分布 `f64` を生成する。
     pub fn next_f64(&mut self) -> f64 {
+        if let Some(s) = &mut self.sobol {
+            if let Some(v) = s.next() {
+                return v;
+            }
+        }
         // 2 回の 32 ビット出力から 53 ビットの精度を得る（IEEE 754 倍精度の仮数部）
         let hi = (self.next_u32() as u64) << 21;
         let lo = (self.next_u32() as u64) & ((1u64 << 21) - 1);

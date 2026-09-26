@@ -115,13 +115,19 @@ and its retry behave as in `World::hit`; a test covers each, because neither is 
 comparisons.
 _Avoid_: reusing the closest-hit search for visibility.
 
-**Stratification** (`render::Strata`):
-How samples are spread instead of drawn independently. A pixel's sub-pixel position and the point picked on an
-area light for the first bounce's NEE are each assigned to a cell of a √spp × √spp grid, jittered within it.
-Each pixel draws its own Fisher–Yates permutation of the cells, so adaptive sampling stopping early does not
-leave every pixel missing the same part of the grid. It lowers variance (23–39% by scene) without moving the
-mean, so the samples needed for a given noise level fall by about the same fraction. BSDF direction sampling is
-not stratified.
+**Sampler** (`sampler.rs`, `Rng::sobol`, `Rng::set_dim`; replaces the earlier `Strata` grid):
+How the random numbers of one path are spread instead of drawn independently. Each pixel sample `s` gets an
+Owen-scrambled Sobol point (Burley 2020, hash-based): dimensions are taken in pairs, each pair is a (0,2) sequence
+(bit-reversed van der Corput + Sobol's second dimension, two 32×32 GF(2) matrices — no direction-number table) whose
+sample index is shuffled by a nested uniform scramble per pair (so pairs are independent) and whose two components are
+Owen-scrambled with seeds hashed from the pixel and `--seed`. The dimension of each role is **fixed** by a table in
+`sampler.rs` (0,1 jitter; 2,3 lens; 4 time; then 16 per bounce: medium distance/phase, environment NEE, light select,
+light point, Russian roulette, BSDF) and set explicitly with `Rng::set_dim` before each role, so a branch that changes
+how many numbers were consumed does not shift later roles. Beyond bounce 8 (134 dimensions) it falls back to PCG,
+which is initialised lazily. Each sample's point is uniform, so it is unbiased (white furnaces and the analytic tests
+run through Sobol); it only lowers variance (spp needed for a given MSE −11% sponza … −42% default, see the perf
+report), and gains are small where the remaining noise is high-dimensional indirect light or visibility edges.
+The lens now uses the concentric disc mapping (exactly 2 numbers) instead of rejection.
 _Avoid_: calling it "more samples" — the sample count is unchanged.
 
 **Firefly clamp**:
