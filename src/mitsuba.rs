@@ -7,7 +7,7 @@
 //! ## 対応要素
 //! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance`
 //! - `shape type="sphere"`: `center` / `radius`
-//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。`to_world_end`（モーションブラー）対応。スフィアトレーシング、光源にはならない
+//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。`to_world_end`（モーションブラー）対応。各プリミティブは `center_end`（カプセルは `a_end` / `b_end`）で個別に動かせる（時刻で線形補間）。スフィアトレーシング、光源にはならない
 //! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
 //! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `thindielectric`・`roughdielectric`(dielectric 扱い) / `twosided`(unwrap)。未知の型は警告して diffuse
 //! - `emitter type="area"`: `radiance`（shape に付随）
@@ -48,7 +48,7 @@ use std::sync::Arc;
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
-use crate::sdf::{SdfId, SdfNode, SdfOp, SdfPrim, SdfShape, SdfTree};
+use crate::sdf::{SdfId, SdfNode, SdfOp, SdfPrim, SdfPrimEnd, SdfShape, SdfTree};
 use crate::world::World;
 
 /// パース済み XML 要素（タグ名・属性・子要素）。
@@ -975,6 +975,11 @@ fn parse_sdf_node(el: &Element, tree: &mut SdfTree) -> Result<SdfId, String> {
             if kids.len() < 2 {
                 return Err(format!("<sdf type=\"{}\"> needs at least 2 child <sdf> (found {})", typ, kids.len()));
             }
+            for name in ["center_end", "a_end", "b_end"] {
+                if el.prop("point", name).is_some() {
+                    warn(&format!("<sdf type=\"{typ}\"> is an operator and does not take {name} (put it on a primitive); ignored"));
+                }
+            }
             let smooth = typ.starts_with("smooth_");
             let k = if smooth { nonneg("k", float("k", 0.2))? } else { 0.0 };
             let mut ids = Vec::with_capacity(kids.len());
@@ -997,7 +1002,35 @@ fn parse_sdf_node(el: &Element, tree: &mut SdfTree) -> Result<SdfId, String> {
         }
         other => return Err(format!("unsupported <sdf type=\"{}\">", other)),
     };
-    Ok(tree.push(SdfNode::Prim(prim)))
+    let id = tree.push(SdfNode::Prim(prim));
+    // 個別のシャッター閉の位置（独自拡張）: 球・箱・トーラス・円柱は `center_end`、カプセルは `a_end` / `b_end`。
+    // 非有限なら警告して静止のまま。時刻 0 = 開の位置、1 = 閉の位置で線形補間する
+    let end_point = |name: &str| -> Option<Option<Vec3>> {
+        el.prop("point", name)?;
+        match el.point(name) {
+            Some(v) if finite(v) => Some(Some(v)),
+            _ => {
+                warn(&format!("<sdf type=\"{typ}\"> {name} is invalid (needs finite x / y / z); the primitive stays static in that respect"));
+                Some(None)
+            }
+        }
+    };
+    let is_capsule = typ == "capsule";
+    for (name, applies) in [("center_end", !is_capsule), ("a_end", is_capsule), ("b_end", is_capsule)] {
+        if !applies && el.prop("point", name).is_some() {
+            warn(&format!("<sdf type=\"{typ}\"> does not take {name}; ignored"));
+        }
+    }
+    let end = if is_capsule {
+        let (a, b) = (end_point("a_end").flatten(), end_point("b_end").flatten());
+        (a.is_some() || b.is_some()).then_some(SdfPrimEnd::Capsule { a, b })
+    } else {
+        end_point("center_end").flatten().map(SdfPrimEnd::Center)
+    };
+    if let Some(end) = end {
+        tree.set_prim_end(id, end);
+    }
+    Ok(id)
 }
 
 /// 形状の `to_world` 変換（`name="to_world"` か名前無しの `<transform>`。`to_world_end` は含まない）。無ければ恒等。
@@ -3514,6 +3547,36 @@ mod tests {
             let (s, w) = sdf_scene(&sdf(bad));
             assert!(w.iter().any(|m| m.contains("stays static")), "{w:?}");
             assert!(!s.world.sdfs()[0].is_animated());
+        }
+    }
+
+    #[test]
+    fn sdf_primitive_motion_parses_and_bad_values_warn() {
+        let shape = |inner: &str| format!(r#"<shape type="sdf">{inner}<bsdf type="diffuse"/></shape>"#);
+        let (s, w) = sdf_scene(&shape(
+            r#"<sdf type="smooth_union"><float name="k" value="0.3"/>
+                 <sdf type="sphere"><point name="center" x="0" y="0" z="0"/><point name="center_end" x="0" y="2" z="0"/></sdf>
+                 <sdf type="capsule"><point name="a_end" x="1" y="0" z="0"/></sdf>
+               </sdf>"#,
+        ));
+        assert!(w.is_empty(), "{w:?}");
+        let t = s.world.sdfs()[0].tree();
+        // 球（半径 1）は時刻 1 で y = 2 へ: (0, 3, 0) は表面、時刻 0 では外側
+        assert!(t.eval_at(Vec3::new(0.0, 3.0, 0.0), 1.0).abs() < 1e-9);
+        assert!(t.eval_at(Vec3::new(0.0, 3.0, 0.0), 0.0) > 0.5);
+        // 非有限は警告して静止、演算子と種類違いの指定も警告
+        for (bad, needle) in [
+            (r#"<sdf type="sphere"><point name="center_end" x="nan" y="0" z="0"/></sdf>"#, "center_end is invalid"),
+            (r#"<sdf type="capsule"><point name="b_end" x="inf" y="0" z="0"/></sdf>"#, "b_end is invalid"),
+            (r#"<sdf type="sphere"><point name="a_end" x="1" y="0" z="0"/></sdf>"#, "does not take a_end"),
+            (r#"<sdf type="union"><point name="center_end" x="1" y="0" z="0"/><sdf type="sphere"/><sdf type="sphere"/></sdf>"#, "operator"),
+        ] {
+            let (s, w) = sdf_scene(&shape(bad));
+            assert!(w.iter().any(|m| m.contains(needle)), "{bad}: {w:?}");
+            assert_eq!(s.world.sdfs().len(), 1, "the shape itself is kept");
+            let t = s.world.sdfs()[0].tree();
+            let p = Vec3::new(0.3, 0.2, 0.1);
+            assert_eq!(t.eval_at(p, 1.0).to_bits(), t.eval_at(p, 0.0).to_bits(), "{bad} stays static");
         }
     }
 }

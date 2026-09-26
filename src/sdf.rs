@@ -54,10 +54,22 @@ pub enum SdfNode {
 /// `eval` のスタック評価がヒープ確保を避けられる最大ノード数（超えたら `Vec` にフォールバック）。
 const EVAL_STACK_N: usize = 32;
 
+/// プリミティブのシャッター閉の位置（時刻 0 = 開の位置、時刻 1 = これ。間は線形補間）。
+#[derive(Clone, Copy, Debug)]
+pub enum SdfPrimEnd {
+    /// `center` を持つプリミティブ（球・箱・トーラス・円柱）の閉の中心
+    Center(Vec3),
+    /// カプセルの閉の端点（動かさない端は `None`）
+    Capsule { a: Option<Vec3>, b: Option<Vec3> },
+}
+
 /// SDF ノード木。根は `nodes` の最後の要素。
 #[derive(Clone, Debug, Default)]
 pub struct SdfTree {
     nodes: Vec<SdfNode>,
+    /// ノードごとの閉の位置（`nodes` と同じ長さ）。**動くプリミティブが 1 つも無ければ空**で、その木は
+    /// 時刻を見ない従来と同じ演算で評価する（バイト一致の根拠）
+    motion: Vec<Option<SdfPrimEnd>>,
 }
 
 /// ノードが参照する子の添字（境界チェック・非循環の検証に使う）。演算以外は空。
@@ -85,7 +97,27 @@ impl SdfTree {
             assert!(child < n, "SdfTree: child {child} >= {n} (nodes must reference earlier nodes only)");
         }
         self.nodes.push(node);
+        if !self.motion.is_empty() {
+            self.motion.push(None);
+        }
         n
+    }
+
+    /// プリミティブ `id` にシャッター閉の位置を与える（線形補間で動く）。`id` がプリミティブでない、または
+    /// `end` の種類（中心 / カプセル端点）が合わない、非有限のときは `false`（静止のまま）。
+    pub fn set_prim_end(&mut self, id: SdfId, end: SdfPrimEnd) -> bool {
+        let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        let ok = match (self.nodes.get(id as usize), end) {
+            (Some(SdfNode::Prim(SdfPrim::Capsule { .. })), SdfPrimEnd::Capsule { a, b }) => a.is_none_or(finite) && b.is_none_or(finite),
+            (Some(SdfNode::Prim(SdfPrim::Capsule { .. })), _) => false,
+            (Some(SdfNode::Prim(_)), SdfPrimEnd::Center(c)) => finite(c),
+            _ => false,
+        };
+        if ok {
+            self.motion.resize(self.nodes.len(), None);
+            self.motion[id as usize] = Some(end);
+        }
+        ok
     }
 
     pub fn len(&self) -> usize {
@@ -103,6 +135,12 @@ impl SdfTree {
     /// オブジェクト空間の点 `p` での符号付き距離（内側が負）。ノードを添字の昇順に 1 回だけ評価する
     /// （非循環なので、各ノードを評価する時点で子はすでに埋まっている）。
     pub fn eval(&self, p: Vec3) -> f64 {
+        self.eval_at(p, 0.0)
+    }
+
+    /// 時刻 `time`（0 = シャッター開、1 = 閉）の `eval`。動くプリミティブは開・閉の位置を線形補間する。
+    /// 動くプリミティブが無い木は `time` を見ず、従来と同じ演算をする。
+    pub fn eval_at(&self, p: Vec3, time: f64) -> f64 {
         let n = self.nodes.len();
         if n == 0 {
             return f64::INFINITY;
@@ -116,7 +154,10 @@ impl SdfTree {
             &mut heap
         };
         for i in 0..n {
-            buf[i] = self.eval_node(&self.nodes[i], p, buf);
+            buf[i] = match (&self.nodes[i], self.motion.get(i).copied().flatten()) {
+                (SdfNode::Prim(prim), Some(end)) => eval_prim(&prim_at(prim, end, time), p),
+                (node, _) => self.eval_node(node, p, buf),
+            };
         }
         buf[n - 1]
     }
@@ -147,7 +188,12 @@ impl SdfTree {
         let mut memo: Vec<Aabb> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let bb = match node {
-                SdfNode::Prim(prim) => prim_bounds(prim),
+                // 動くプリミティブは、開と閉の位置の境界の和（固定形状の線形な平行移動なので厳密）。
+                // 区間全体 [0, 1] で取り、シャッター区間の絞り込みは見ない
+                SdfNode::Prim(prim) => match self.motion.get(memo.len()).copied().flatten() {
+                    Some(end) => prim_bounds(prim).union(prim_bounds(&prim_at(prim, end, 1.0))),
+                    None => prim_bounds(prim),
+                },
                 SdfNode::Op(op) => match *op {
                     SdfOp::Union(a, b) | SdfOp::Intersect(a, b) => {
                         let (ba, bb) = (memo[a as usize], memo[b as usize]);
@@ -167,17 +213,27 @@ impl SdfTree {
     /// 勾配（外向き法線、正規化前）を四面体中心差分で求める（4 回評価。Inigo Quilez の手法）。
     /// `h` はステップ幅（呼び出し側がシーンスケールに合わせて決める）。
     pub fn gradient(&self, p: Vec3, h: f64) -> Vec3 {
+        self.gradient_at(p, h, 0.0)
+    }
+
+    /// 時刻 `time` の `gradient`。
+    pub fn gradient_at(&self, p: Vec3, h: f64, time: f64) -> Vec3 {
         // 四面体の頂点方向（正 4 面体、各成分 ±1）
         let k1 = Vec3::new(1.0, -1.0, -1.0);
         let k2 = Vec3::new(-1.0, -1.0, 1.0);
         let k3 = Vec3::new(-1.0, 1.0, -1.0);
         let k4 = Vec3::new(1.0, 1.0, 1.0);
-        k1 * self.eval(p + k1 * h) + k2 * self.eval(p + k2 * h) + k3 * self.eval(p + k3 * h) + k4 * self.eval(p + k4 * h)
+        k1 * self.eval_at(p + k1 * h, time) + k2 * self.eval_at(p + k2 * h, time) + k3 * self.eval_at(p + k3 * h, time) + k4 * self.eval_at(p + k4 * h, time)
     }
 
     /// 単位法線（`gradient` を正規化。退化した勾配なら +Y を返す）。
     pub fn normal(&self, p: Vec3, h: f64) -> Vec3 {
-        let g = self.gradient(p, h);
+        self.normal_at(p, h, 0.0)
+    }
+
+    /// 時刻 `time` の `normal`。
+    pub fn normal_at(&self, p: Vec3, h: f64, time: f64) -> Vec3 {
+        let g = self.gradient_at(p, h, time);
         if g.len() > 0.0 { g.norm() } else { Vec3::new(0.0, 1.0, 0.0) }
     }
 }
@@ -203,6 +259,23 @@ fn smin(a: f64, b: f64, k: f64) -> f64 {
     }
     let h = (k - (a - b).abs()).max(0.0) / k;
     a.min(b) - h * h * k * 0.25
+}
+
+/// 時刻 `time` のプリミティブ（位置を開 → `end` へ線形補間したもの。`time = 0` は開の位置そのもの）。
+fn prim_at(prim: &SdfPrim, end: SdfPrimEnd, time: f64) -> SdfPrim {
+    let lerp = |a: Vec3, b: Vec3| a * (1.0 - time) + b * time;
+    match (*prim, end) {
+        (SdfPrim::Sphere { center, radius }, SdfPrimEnd::Center(e)) => SdfPrim::Sphere { center: lerp(center, e), radius },
+        (SdfPrim::Box { center, half, round }, SdfPrimEnd::Center(e)) => SdfPrim::Box { center: lerp(center, e), half, round },
+        (SdfPrim::Torus { center, major, minor }, SdfPrimEnd::Center(e)) => SdfPrim::Torus { center: lerp(center, e), major, minor },
+        (SdfPrim::Cylinder { center, radius, half_height, round }, SdfPrimEnd::Center(e)) => {
+            SdfPrim::Cylinder { center: lerp(center, e), radius, half_height, round }
+        }
+        (SdfPrim::Capsule { a, b, radius }, SdfPrimEnd::Capsule { a: ea, b: eb }) => {
+            SdfPrim::Capsule { a: ea.map_or(a, |e| lerp(a, e)), b: eb.map_or(b, |e| lerp(b, e)), radius }
+        }
+        (prim, _) => prim, // `set_prim_end` が種類の合わない組を弾いているので来ない
+    }
 }
 
 fn eval_prim(prim: &SdfPrim, p: Vec3) -> f64 {
@@ -401,15 +474,15 @@ impl SdfShape {
                 return None;
             }
             let p = o_obj + d_obj * t;
-            let f = self.tree.eval(p);
+            let f = self.tree.eval_at(p, r.time);
             let af = f.abs();
             if af < eps {
                 if t > tmin {
                     let (t, p) = match prev {
-                        Some(pv) => self.refine(o_obj, d_obj, (t, f), pv, tmin, t_end),
+                        Some(pv) => self.refine(ray_obj, (t, f), pv, tmin, t_end),
                         None => (t, p),
                     };
-                    return Some(self.make_hit(xf, t, p));
+                    return Some(self.make_hit(xf, r.time, t, p));
                 }
                 // tmin の帯の中（自己交差回避の内側）にある面は飛ばして先へ進む
                 t += eps / d_len;
@@ -426,7 +499,8 @@ impl SdfShape {
     /// 符号付きの `f` をそのまま使うので、外側から始まったレイも内側から始まったレイも同じ式でよい（どちらも
     /// `prev` と `cur` は同じ符号で、割線は面のほうへ外挿する。面を少し越えて符号が変わっても割線は続けてよい）。
     /// 採用するのは `(tmin, t_end)` の中で `|f|` が最小になった点だけ（増えたら元の点のまま）。返り値は `(t, p_obj)`。
-    fn refine(&self, o_obj: Vec3, d_obj: Vec3, cur: (f64, f64), prev: (f64, f64), tmin: f64, t_end: f64) -> (f64, Vec3) {
+    fn refine(&self, ray: Ray, cur: (f64, f64), prev: (f64, f64), tmin: f64, t_end: f64) -> (f64, Vec3) {
+        let (o_obj, d_obj, time) = (ray.o, ray.d, ray.time);
         let (mut ta, mut fa) = prev;
         let (mut tb, mut fb) = cur;
         let mut best = cur;
@@ -440,7 +514,7 @@ impl SdfShape {
             if !(tn > tmin && tn < t_end) {
                 break;
             }
-            let fnew = self.tree.eval(o_obj + d_obj * tn);
+            let fnew = self.tree.eval_at(o_obj + d_obj * tn, time);
             if !fnew.is_finite() {
                 break;
             }
@@ -456,7 +530,7 @@ impl SdfShape {
         (best.0, o_obj + d_obj * best.0)
     }
 
-    fn make_hit(&self, xf: &Transform, t: f64, p_obj: Vec3) -> Hit {
+    fn make_hit(&self, xf: &Transform, time: f64, t: f64, p_obj: Vec3) -> Hit {
         // 収束は面から eps_obj 以内なので、真の面は `p_obj ± eps_obj`（成分ごと）の箱に入る。余裕を見て
         // ERR_BOX_EPS·eps_obj の箱をワールドへ写す（線形部の |A| × 箱 + 通常の浮動小数点誤差）。
         // `offset_ray_origin` は `|n|·p_error` だけ法線方向へ押し出す。これは物体空間で少なくとも
@@ -464,7 +538,7 @@ impl SdfShape {
         // `|f| < eps_obj` に再び当たらない。
         let b = ERR_BOX_EPS * self.eps_obj;
         let (p, p_error) = xf.apply_point_with_error(p_obj, Vec3::new(b, b, b));
-        let n = xf.apply_normal(self.tree.normal(p_obj, self.normal_h));
+        let n = xf.apply_normal(self.tree.normal_at(p_obj, self.normal_h, time));
         Hit {
             t,
             p,
@@ -859,5 +933,102 @@ mod tests {
         let h = w.hit(r, 0.0, 1e9).unwrap();
         let p = w.object_space_point(&h, 0.5);
         assert!((p - Vec3::new(0.0, 0.0, 1.0)).len() < 1e-4, "{p:?}"); // 中心 x=2 の球の上端 → 物体空間 (0, 0, 1)
+    }
+
+    // ---- プリミティブごとのモーション ----
+
+    /// スムーズ結合の 2 球。右の球は時刻 0 で (2,0,0)、時刻 1 で (2,3,0)。
+    fn blob_tree() -> SdfTree {
+        let mut t = SdfTree::new();
+        let a = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(-2.0, 0.0, 0.0), radius: 0.8 }));
+        let b = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(2.0, 0.0, 0.0), radius: 0.8 }));
+        assert!(t.set_prim_end(b, SdfPrimEnd::Center(Vec3::new(2.0, 3.0, 0.0))));
+        t.push(SdfNode::Op(SdfOp::SmoothUnion(a, b, 0.4)));
+        t
+    }
+
+    #[test]
+    fn moving_primitive_in_a_smooth_union_hits_at_its_own_position_per_time() {
+        let shape = SdfShape::new(blob_tree(), Transform::identity(), 0).unwrap();
+        let down = Vec3::new(0.0, -1.0, 0.0);
+        for (time, y) in [(0.0, 0.0), (0.5, 1.5), (1.0, 3.0)] {
+            // 右の球の真上から落とす: 球の上端は y + 0.8
+            let h = shape.hit(Ray { o: Vec3::new(2.0, 10.0, 0.0), d: down, time }, 0.0, 1e9).unwrap_or_else(|| panic!("no hit at {time}"));
+            assert!((h.p.y - (y + 0.8)).abs() < 1e-6, "time {time}: y = {}", h.p.y);
+            // 左の球は動かない
+            let h = shape.hit(Ray { o: Vec3::new(-2.0, 10.0, 0.0), d: down, time }, 0.0, 1e9).unwrap();
+            assert!((h.p.y - 0.8).abs() < 1e-6, "left sphere moved at {time}: {}", h.p.y);
+        }
+        // 時刻 0 に右の球の元の位置を通る水平レイは当たり、時刻 1 では当たらない（球は上へ移った）
+        let side = |time: f64| Ray { o: Vec3::new(10.0, 0.0, 0.0), d: Vec3::new(-1.0, 0.0, 0.0), time };
+        assert!(shape.hit(side(0.0), 0.0, 1e9).is_some_and(|h| (h.p.x - 2.8).abs() < 1e-6));
+        assert!(shape.hit(side(1.0), 0.0, 1e9).is_some_and(|h| h.p.x < 0.0), "at time 1 the ray only meets the left sphere");
+    }
+
+    #[test]
+    fn moving_primitive_bounds_contain_the_surface_at_sampled_times() {
+        let mut t = blob_tree();
+        // 動くカプセルと箱も足す
+        let cap = t.push(SdfNode::Prim(SdfPrim::Capsule { a: Vec3::new(0.0, -1.0, 0.0), b: Vec3::new(0.0, -2.0, 0.0), radius: 0.3 }));
+        assert!(t.set_prim_end(cap, SdfPrimEnd::Capsule { a: None, b: Some(Vec3::new(4.0, -3.0, 1.0)) }));
+        let bx = t.push(SdfNode::Prim(SdfPrim::Box { center: Vec3::new(0.0, 5.0, 0.0), half: Vec3::new(0.5, 0.5, 0.5), round: 0.1 }));
+        assert!(t.set_prim_end(bx, SdfPrimEnd::Center(Vec3::new(-3.0, 5.0, 2.0))));
+        let u1 = t.push(SdfNode::Op(SdfOp::Union(3, cap)));
+        t.push(SdfNode::Op(SdfOp::Union(u1, bx)));
+        let bb = t.bounds();
+        let inside = |p: Vec3| p.x >= bb.min.x && p.x <= bb.max.x && p.y >= bb.min.y && p.y <= bb.max.y && p.z >= bb.min.z && p.z <= bb.max.z;
+        let mut n = 0;
+        for k in 0..=10 {
+            let time = k as f64 / 10.0;
+            for i in 0..4000 {
+                let a = i as f64;
+                let mut p = Vec3::new(8.0 * (a * 0.731).sin(), 4.0 + 8.0 * (a * 1.913).cos(), 6.0 * (a * 0.377).sin());
+                // 表面へ射影する（距離場なので f だけ勾配の逆向きへ進めばよい）
+                for _ in 0..12 {
+                    p = p - t.normal_at(p, 1e-6, time) * t.eval_at(p, time);
+                }
+                if t.eval_at(p, time).abs() < 1e-6 {
+                    n += 1;
+                    assert!(inside(p), "surface point {p:?} at time {time} outside {bb:?}");
+                }
+            }
+        }
+        assert!(n > 20, "too few surface samples: {n}");
+    }
+
+    #[test]
+    fn static_tree_ignores_time_and_set_prim_end_rejects_bad_input() {
+        let mut t = SdfTree::new();
+        let a = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(1.0, 0.0, 0.0), radius: 1.0 }));
+        let b = t.push(SdfNode::Prim(SdfPrim::Capsule { a: Vec3::new(0.0, 0.0, 0.0), b: Vec3::new(0.0, 1.0, 0.0), radius: 0.2 }));
+        let u = t.push(SdfNode::Op(SdfOp::Union(a, b)));
+        let p = Vec3::new(0.3, 0.4, 0.1);
+        assert_eq!(t.eval_at(p, 0.7).to_bits(), t.eval(p).to_bits());
+        assert!(!t.set_prim_end(u, SdfPrimEnd::Center(Vec3::new(0.0, 0.0, 0.0))), "operators cannot move");
+        assert!(!t.set_prim_end(a, SdfPrimEnd::Center(Vec3::new(f64::NAN, 0.0, 0.0))), "non-finite");
+        assert!(!t.set_prim_end(a, SdfPrimEnd::Capsule { a: None, b: None }), "wrong kind");
+        assert!(!t.set_prim_end(b, SdfPrimEnd::Center(Vec3::new(0.0, 0.0, 0.0))), "wrong kind");
+        assert_eq!(t.eval_at(p, 0.7).to_bits(), t.eval(p).to_bits(), "rejected motion must not change anything");
+    }
+
+    #[test]
+    fn primitive_motion_composes_with_shape_motion() {
+        let mut shape = SdfShape::new(blob_tree(), Transform::identity(), 0).unwrap();
+        assert!(shape.set_end_transform(Transform::translate(Vec3::new(0.0, 0.0, -6.0))));
+        shape.refresh_bounds((0.0, 1.0));
+        let b = shape.world_bounds();
+        for k in 0..=10 {
+            let time = k as f64 / 10.0;
+            let xf = shape.transform_at(time);
+            let y = 3.0 * time; // 右の球の中心の y
+            for p in [Vec3::new(2.0, y + 0.8, 0.0), Vec3::new(2.8, y, 0.0), Vec3::new(-2.8, 0.0, 0.0)] {
+                let w = xf.apply_point(p);
+                assert!(w.x >= b.min.x && w.x <= b.max.x && w.y >= b.min.y && w.y <= b.max.y && w.z >= b.min.z && w.z <= b.max.z, "{w:?} at {time} outside {b:?}");
+            }
+            // 動く球の上端と、動く変換の合成にちゃんと当たる
+            let o = xf.apply_point(Vec3::new(2.0, 10.0, 0.0));
+            let h = shape.hit(Ray { o, d: Vec3::new(0.0, -1.0, 0.0), time }, 0.0, 1e9).expect("hit");
+            assert!((h.p.y - (y + 0.8)).abs() < 1e-5 && (h.p.z - xf.apply_point(Vec3::new(2.0, 0.0, 0.0)).z).abs() < 1e-5, "{:?} at {time}", h.p);
+        }
     }
 }
