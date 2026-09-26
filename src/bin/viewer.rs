@@ -112,6 +112,27 @@ impl Job {
 }
 
 /// 保存と同じ経路でリニア RGB を作る（蓄積を解決 → 必要ならデノイズ）。
+/// `dir` の中身を (サブフォルダ, `.xml` ファイル)（名前のみ）で返す。隠しエントリ（`.` で始まる名前）は出さず、
+/// 拡張子は大文字小文字を区別せず、どちらも名前の小文字順に並べる。読めないディレクトリはエラー。
+fn list_dir(dir: &std::path::Path) -> std::io::Result<(Vec<String>, Vec<String>)> {
+    let (mut dirs, mut xmls) = (Vec::new(), Vec::new());
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = e.path();
+        if path.is_dir() {
+            dirs.push(name);
+        } else if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")) {
+            xmls.push(name);
+        }
+    }
+    dirs.sort_by_key(|n| n.to_lowercase());
+    xmls.sort_by_key(|n| n.to_lowercase());
+    Ok((dirs, xmls))
+}
+
 fn resolved_pixels(probe: &RenderProbe, config: &RenderConfig, denoise_it: bool) -> Vec<Color> {
     let mut pixels = probe.with_buffers(|acc, acc_w| resolve_pixels(config.width, config.height, acc, acc_w));
     if denoise_it {
@@ -248,6 +269,8 @@ struct App {
     save_path: String,
     message: String,
     one_to_one: bool,
+    /// アプリ内のシーンブラウザ（`Some` の間だけ表示。中身は今見ているディレクトリ）
+    browser: Option<std::path::PathBuf>,
     /// 検証用フック（環境変数）
     autosave: Option<String>,
     cancel_at_tiles: Option<usize>,
@@ -312,6 +335,7 @@ impl App {
             texture: None,
             message: String::new(),
             one_to_one: false,
+            browser: None,
             autosave: std::env::var("TINYPT_VIEWER_AUTOSAVE").ok(),
             cancel_at_tiles: std::env::var("TINYPT_VIEWER_CANCEL_AT_TILES").ok().and_then(|v| v.parse().ok()),
         }
@@ -643,20 +667,18 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("scene:");
-                let edit = ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(360.0).hint_text("path to a .xml scene"));
+                let edit = ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(360.0).hint_text("path to a .xml scene — Enter to load"));
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("Load").clicked() || enter) && !self.path_input.trim().is_empty() {
+                if enter && !self.path_input.trim().is_empty() {
                     let p = self.path_input.trim().to_string();
                     self.open_scene(Some(p));
                 }
                 if ui.button("Open…").clicked() {
-                    let mut dlg = rfd::FileDialog::new().add_filter("Mitsuba XML scene", &["xml"]);
-                    if let Some(d) = self.scenes_dir.as_ref().and_then(|d| d.canonicalize().ok()) {
-                        dlg = dlg.set_directory(d);
-                    }
-                    if let Some(f) = dlg.pick_file() {
-                        self.open_scene(Some(f.to_string_lossy().into_owned()));
-                    }
+                    // アプリ内ブラウザの開閉（ネイティブのダイアログは非対象のファイルを隠せないので使わない）
+                    self.browser = match self.browser {
+                        Some(_) => None,
+                        None => self.scenes_dir.as_ref().and_then(|d| d.canonicalize().ok()).or_else(|| std::env::current_dir().ok()),
+                    };
                 }
                 if !self.scenes.is_empty() {
                     let mut picked = None;
@@ -684,7 +706,7 @@ impl eframe::App for App {
             });
             ui.horizontal(|ui| match &snap {
                 Snap::Idle => {
-                    ui.label("no scene selected — enter a path, or use Open… / the scenes list");
+                    ui.label("no scene selected — type a path and press Enter, or use Open… / the scenes list");
                 }
                 Snap::Loading => {
                     ui.label(format!("loading {}…", self.job.path.as_deref().unwrap_or("built-in scene")));
@@ -818,6 +840,48 @@ impl eframe::App for App {
             }
         });
 
+        if let Some(dir) = self.browser.clone() {
+            let (mut close, mut goto, mut open) = (ctx.input(|i| i.key_pressed(egui::Key::Escape)), None, None);
+            egui::Window::new("Open scene").collapsible(false).default_size([440.0, 420.0]).show(ctx, |ui| {
+                ui.label(dir.display().to_string());
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    if dir.parent().is_some() && ui.selectable_label(false, "..").clicked() {
+                        goto = dir.parent().map(std::path::Path::to_path_buf);
+                    }
+                    match list_dir(&dir) {
+                        Ok((dirs, xmls)) => {
+                            for d in dirs {
+                                if ui.selectable_label(false, format!("{d}/")).clicked() {
+                                    goto = Some(dir.join(&d));
+                                }
+                            }
+                            for f in xmls {
+                                if ui.selectable_label(false, &f).clicked() {
+                                    open = Some(dir.join(&f));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, format!("cannot read this folder: {e}"));
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+            if let Some(f) = open {
+                self.browser = None;
+                self.open_scene(Some(f.to_string_lossy().into_owned()));
+            } else if close {
+                self.browser = None;
+            } else if let Some(d) = goto {
+                self.browser = Some(d);
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(tex) = &self.texture else {
                 if matches!(snap, Snap::Idle) {
@@ -890,4 +954,26 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("tinypt viewer", options, Box::new(move |_cc| Ok(Box::new(App::new(config, overrides)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_dir;
+
+    #[test]
+    fn list_dir_shows_folders_then_xml_sorted_and_hides_dotfiles() {
+        let dir = std::env::temp_dir().join(format!("tinypt_viewer_ls_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("beta")).unwrap();
+        std::fs::create_dir_all(dir.join("Alpha")).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden_dir")).unwrap();
+        for f in ["b.xml", "A.XML", "c.Xml", ".dot.xml", "notes.txt", "scene.obj", "xml"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let (dirs, xmls) = list_dir(&dir).unwrap();
+        assert_eq!(dirs, ["Alpha", "beta"]);
+        assert_eq!(xmls, ["A.XML", "b.xml", "c.Xml"]);
+        assert!(list_dir(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
