@@ -272,10 +272,14 @@ const MAX_STEPS: usize = 512;
 /// 収束判定 `|f| < eps_obj` の、バウンディングボックス対角に対する比。
 const EPS_REL: f64 = 1e-6;
 /// 勾配（法線）の差分幅の、バウンディングボックス対角に対する比。
-const NORMAL_H_REL: f64 = 1e-5;
+const NORMAL_H_REL: f64 = 1e-7;
 /// 近似ヒットの誤差箱の大きさ（`eps_obj` の倍数）。`offset_ray_origin` が面から `eps_obj` より遠くへ
 /// 押し出せるよう、収束幅より大きく取る（下の `hit` のコメント参照）。
 const ERR_BOX_EPS: f64 = 4.0;
+/// 収束後の t の仕上げ（割線法）の最大反復数。
+const REFINE_STEPS: usize = 5;
+/// 仕上げを打ち切る `|f|` の、収束幅 `eps_obj` に対する比。
+const REFINE_DONE_REL: f64 = 1e-6;
 
 /// SDF で表す 1 つの形状。ワールド空間のレイを物体空間へ写し、`|f|` の大きさだけ進める。
 #[derive(Clone, Debug)]
@@ -390,6 +394,8 @@ impl SdfShape {
         let mut t = t_in.max(tmin);
         let t_end = t_out.min(tmax);
         let eps = self.eps_obj;
+        // 直前のマーチ位置（t, f）。収束点の手前で、f は収束点と同じ符号（外側から始まれば正、内側から始まれば負）
+        let mut prev: Option<(f64, f64)> = None;
         for _ in 0..MAX_STEPS {
             if t >= t_end {
                 return None;
@@ -399,15 +405,55 @@ impl SdfShape {
             let af = f.abs();
             if af < eps {
                 if t > tmin {
+                    let (t, p) = match prev {
+                        Some(pv) => self.refine(o_obj, d_obj, (t, f), pv, tmin, t_end),
+                        None => (t, p),
+                    };
                     return Some(self.make_hit(xf, t, p));
                 }
                 // tmin の帯の中（自己交差回避の内側）にある面は飛ばして先へ進む
                 t += eps / d_len;
+                prev = None;
                 continue;
             }
+            prev = Some((t, f));
             t += af / d_len;
         }
         None
+    }
+
+    /// 収束点 `cur = (t, f)` を、直前のマーチ位置 `prev` との割線法で面の根へ寄せる（最大 `REFINE_STEPS` 回）。
+    /// 符号付きの `f` をそのまま使うので、外側から始まったレイも内側から始まったレイも同じ式でよい（どちらも
+    /// `prev` と `cur` は同じ符号で、割線は面のほうへ外挿する。面を少し越えて符号が変わっても割線は続けてよい）。
+    /// 採用するのは `(tmin, t_end)` の中で `|f|` が最小になった点だけ（増えたら元の点のまま）。返り値は `(t, p_obj)`。
+    fn refine(&self, o_obj: Vec3, d_obj: Vec3, cur: (f64, f64), prev: (f64, f64), tmin: f64, t_end: f64) -> (f64, Vec3) {
+        let (mut ta, mut fa) = prev;
+        let (mut tb, mut fb) = cur;
+        let mut best = cur;
+        let done = self.eps_obj * REFINE_DONE_REL;
+        for _ in 0..REFINE_STEPS {
+            let denom = fb - fa;
+            if denom == 0.0 || !denom.is_finite() {
+                break;
+            }
+            let tn = tb - fb * (tb - ta) / denom;
+            if !(tn > tmin && tn < t_end) {
+                break;
+            }
+            let fnew = self.tree.eval(o_obj + d_obj * tn);
+            if !fnew.is_finite() {
+                break;
+            }
+            if fnew.abs() <= best.1.abs() {
+                best = (tn, fnew);
+            }
+            if fnew.abs() < done {
+                break;
+            }
+            (ta, fa) = (tb, fb);
+            (tb, fb) = (tn, fnew);
+        }
+        (best.0, o_obj + d_obj * best.0)
     }
 
     fn make_hit(&self, xf: &Transform, t: f64, p_obj: Vec3) -> Hit {
@@ -618,9 +664,9 @@ mod tests {
             let r = ray(o, target - o);
             let (Some(h), Some(e)) = (shape.hit(r, 0.0, 1e9), sph.hit(r, 0.0, 1e9)) else { continue };
             n += 1;
-            // 収束幅 eps_obj（= 1e-6 × bbox 対角）だけ手前で止まるので、斜めに当たるほど誤差が大きい（相対 1e-5 まで許す）
-            assert!((h.t - e.t).abs() <= 1e-5 * e.t, "t {} vs {}", h.t, e.t);
-            assert!((h.ng - e.ng).len() < 1e-4, "normal {:?} vs {:?}", h.ng, e.ng);
+            // 収束後に割線法で仕上げるので、収束幅 eps_obj（1e-6 × bbox 対角）よりずっと精密に一致する
+            assert!((h.t - e.t).abs() <= 1e-9 * e.t, "t {} vs {}", h.t, e.t);
+            assert!((h.ng - e.ng).len() < 2e-6, "normal {:?} vs {:?}", h.ng, e.ng);
             assert_eq!(h.mat_id, 5);
             assert_eq!(h.inst_id, None);
         }
@@ -638,7 +684,10 @@ mod tests {
             let Some(h) = shape.hit(r, 0.0, 1e9) else { continue };
             // 面上（楕円体 (x/2)² + (y/0.5)² + z² = 1）にあり、それより手前に面が無い
             let q = |p: Vec3| (p.x / 2.0).powi(2) + (p.y / 0.5).powi(2) + p.z * p.z - 1.0;
-            assert!(q(h.p).abs() < 1e-4, "not on surface: {}", q(h.p));
+            assert!(q(h.p).abs() < 1e-8, "not on surface: {}", q(h.p));
+            // 物体空間の |f| は収束幅 eps_obj よりずっと小さい
+            let f_obj = shape.tree().eval(xf.apply_point_inv(h.p));
+            assert!(f_obj.abs() < 1e-3 * shape.eps_obj(), "|f| = {} vs eps_obj {}", f_obj.abs(), shape.eps_obj());
             let mut t = 0.0;
             while t < h.t - 1e-3 {
                 assert!(q(r.at(t)) > 0.0, "surface crossed before the reported hit at t={t}");
@@ -646,7 +695,7 @@ mod tests {
             }
             // 法線は楕円体の勾配（逆転置）と同じ向き
             let g = Vec3::new(h.p.x / 4.0, h.p.y / 0.25, h.p.z).norm();
-            assert!((h.ng - g).len() < 1e-4, "{:?} vs {:?}", h.ng, g);
+            assert!((h.ng - g).len() < 2e-6, "{:?} vs {:?}", h.ng, g);
         }
     }
 
