@@ -801,6 +801,10 @@ mod tests {
         let (mw, sw) = estimate(&world, &mats, &env, ray, limits, 400_000, 101);
         world.force_light_weighting(false);
         let (mu, su) = estimate(&world, &mats, &env, ray, limits, 400_000, 202);
+        // 光源 BVH も同じ平均（直接照明の不偏性）
+        world.set_light_select(crate::world::LightSelect::Bvh);
+        let (mb, sb) = estimate(&world, &mats, &env, ray, limits, 400_000, 303);
+        assert!((mb - mu).abs() < 5.0 * (sb * sb + su * su).sqrt() + 1e-4 * mu, "BVH {} ± {} vs power CDF {} ± {}", mb, sb, mu, su);
         let se = (sw * sw + su * su).sqrt();
         assert!(mw > 0.0 && (mw - mu).abs() < 5.0 * se + 1e-4 * mu, "weighted {} ± {} vs power CDF {} ± {}", mw, sw, mu, su);
         // 分散も下がっている（同じ光線・同じ回数で、重み付けのほうが標準誤差が小さい）
