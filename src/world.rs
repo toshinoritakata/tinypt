@@ -383,6 +383,9 @@ pub struct World {
     light_cdf: Vec<f64>,
     /// CDF の総重み
     light_total: f64,
+    /// 光源のまとまり（発光球・発光インスタンス）が 2 つ以上のとき true: 光源選択を参照点からの重み（[`World::selection_weight`]）で行う。
+    /// false（まとまりが 1 つ以下、または多すぎる）のときは従来の出力パワーだけの CDF（選択確率が変わりようがない場合や、O(N) が引き合わない場合）
+    light_weighted: bool,
     /// 球インデックス → lights 上の ID（発光体でなければ None）。
     /// `light_pdf` が BSDF サンプリングで命中した発光体を逆引きするために使う。
     sphere_light_id: Vec<Option<usize>>,
@@ -413,6 +416,12 @@ struct Tlas {
 /// （決め方は tlas_report.md 参照）。
 const TLAS_MIN_PRIMS: usize = 20;
 
+/// 参照点に応じた重みで光源を選ぶ光源のまとまり（発光球・発光インスタンス）の最大数。これを超えると従来の出力パワーだけの CDF に
+/// 落とす（`light_pdf` も同じ判定 `World::light_weighted` に従う）。実測（light_select_report.md）: NEE ごとの O(N) は N = 46 の
+/// spiral で 1 spp あたり +5% になるのに、選択の分散は下がらず（MSE 比 1.0）差し引きで損。N = 10 では得、N ≥ 200 では分散が
+/// 半分以下に下がるがコストも +25% 以上。損得が N だけでは決まらないので、損をしない小さい側だけを有効にする。
+const LIGHT_SELECT_MAX_GROUPS: usize = 32;
+
 impl World {
     /// 空のワールドを生成する。
     pub fn new() -> Self {
@@ -423,6 +432,7 @@ impl World {
             lights: Vec::new(),
             light_cdf: Vec::new(),
             light_total: 0.0,
+            light_weighted: false,
             sphere_light_id: Vec::new(),
             mesh_build_time: std::time::Duration::ZERO,
             tri_light_id: std::collections::HashMap::new(),
@@ -986,12 +996,13 @@ impl World {
         let mut sphere_light_id: Vec<Option<usize>> = vec![None; self.spheres.len()];
         let mut tri_light_id: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
 
-        let mut add = |light: Light, emit: Color, area: f64, p_error: Vec3| -> Option<usize> {
+        let mut n_groups = 0usize;
+        let mut add = |light: Light, emit: Color, area: f64, p_error: Vec3, geo: (Vec3, f64, Vec3, Vec3, bool)| -> Option<usize> {
             let weight = area * emit.luminance();
             if weight > 0.0 {
                 total += weight;
                 let id = lights.len();
-                lights.push(LightInfo { light, emit, weight, p_error });
+                lights.push(LightInfo { light, emit, weight, p_error, center: geo.0, r2: geo.1, plane_p: geo.2, normal: geo.3, one_sided: geo.4 });
                 cdf.push(total);
                 Some(id)
             } else {
@@ -1007,8 +1018,10 @@ impl World {
                 // 球面上の点 c + n·r の誤差上界（どの点でも |c| + r で抑えられる）
                 let m = s.c.abs() + Vec3::new(s.r, s.r, s.r);
                 let p_error = m * (gamma(4) + gamma(2));
-                if let Some(id) = add(light, emit, area, p_error) {
+                let geo = (s.c, s.r * s.r, s.c, Vec3::new(0.0, 0.0, 0.0), false);
+                if let Some(id) = add(light, emit, area, p_error, geo) {
                     sphere_light_id[idx] = Some(id);
+                    n_groups += 1;
                 }
             }
         }
@@ -1019,6 +1032,27 @@ impl World {
                 Some(m) => m,
                 None => continue,
             };
+            // このインスタンスの発光三角形の境界球（光源選択の距離の項。インスタンス全体で共有）
+            let mut bb = Aabb::empty();
+            let mut any = false;
+            for (tri_id, tri) in mesh.tris.iter().enumerate() {
+                let mat_id = inst.mat_override.unwrap_or(tri.mat_id);
+                if mats.get(mat_id).and_then(|m| m.emitted()).is_some() {
+                    if let Some((a, b, c)) = tri_world_verts(self, inst.mesh_id, tri_id, inst_id, 0.5) {
+                        bb = bb.grow(a).grow(b).grow(c);
+                        any = true;
+                    }
+                }
+            }
+            if !any {
+                continue;
+            }
+            let center = bb.centroid();
+            let r2 = {
+                let h = bb.max - center;
+                h.dot(h)
+            };
+            let mut group_has_light = false;
             for (tri_id, tri) in mesh.tris.iter().enumerate() {
                 let mat_id = inst.mat_override.unwrap_or(tri.mat_id);
                 if let Some(emit) = mats.get(mat_id).and_then(|m| m.emitted()) {
@@ -1028,16 +1062,30 @@ impl World {
                     let e0 = tri_point_error(self, inst.mesh_id, tri_id, inst_id, 0.0);
                     let e1 = tri_point_error(self, inst.mesh_id, tri_id, inst_id, 1.0);
                     let p_error = Vec3::new(e0.x.max(e1.x), e0.y.max(e1.y), e0.z.max(e1.z));
-                    if let Some(id) = add(light, emit, area, p_error) {
+                    let (plane_p, normal) = match tri_world_verts(self, inst.mesh_id, tri_id, inst_id, 0.5) {
+                        Some((a, b, c)) => {
+                            let n = (b - a).cross(c - a);
+                            let len = n.len();
+                            // Light::sample と同じ向き（cross(v1 − v0, v2 − v0)）と退化時の既定
+                            ((a + b + c) / 3.0, if len > 0.0 { n / len } else { Vec3::new(0.0, 1.0, 0.0) })
+                        }
+                        None => (center, Vec3::new(0.0, 1.0, 0.0)),
+                    };
+                    if let Some(id) = add(light, emit, area, p_error, (center, r2, plane_p, normal, true)) {
                         tri_light_id.insert((inst_id, tri_id), id);
+                        group_has_light = true;
                     }
                 }
+            }
+            if group_has_light {
+                n_groups += 1;
             }
         }
 
         self.lights = lights;
         self.light_cdf = cdf;
         self.light_total = total;
+        self.light_weighted = n_groups >= 2 && n_groups <= LIGHT_SELECT_MAX_GROUPS;
         self.sphere_light_id = sphere_light_id;
         self.tri_light_id = tri_light_id;
     }
@@ -1060,8 +1108,64 @@ impl World {
             None => return 0.0,
         };
         let info = &self.lights[light_id];
-        let pdf_select = info.weight / self.light_total;
+        // 選択確率は sample_light と同じ関数（`selection_total` と `selection_prob`）で求める
+        let total = self.selection_total(from);
+        if !(total > 0.0) {
+            return 0.0;
+        }
+        let pdf_select = self.selection_prob(light_id, from, total);
         pdf_select * info.light.pdf_omega(self, time, from, hit.p, hit.ng)
+    }
+
+    /// テスト用: 光源選択の重み付けを強制的に切り替える（重み付けの有無で平均が変わらないこと＝不偏性の検定に使う）。
+    #[cfg(test)]
+    pub(crate) fn force_light_weighting(&mut self, on: bool) {
+        self.light_weighted = on;
+    }
+
+    /// 光源 `info` の、参照点 `from` から見た選択の重み: `Φ / max(d², r²)`（`Φ` = 出力パワー、`d` = 光源のまとまりの
+    /// 境界球の中心までの距離、`r` = その半径。近すぎて `d → 0` でも発散しない）。片面発光の三角形は、
+    /// 参照点が裏側（`normal · (from − 重心) ≤ 0`）なら 0（裏側からは `pdf_omega` も 0 でサンプルが無駄になるだけ）。
+    ///
+    /// **`sample_light` と `light_pdf` の両方がこの関数だけを使う**（式を 2 か所に書かない）。MIS は `light_pdf` が
+    /// `sample_light` の使った選択確率とビット単位で一致することに依存する。
+    #[inline]
+    fn selection_weight(info: &LightInfo, from: Vec3) -> f64 {
+        if info.one_sided && info.normal.dot(from - info.plane_p) <= 0.0 {
+            return 0.0;
+        }
+        let d = from - info.center;
+        info.weight / d.dot(d).max(info.r2).max(f64::MIN_POSITIVE)
+    }
+
+    /// 選択確率の分母（全光源の重みの和）。重み付けなしなら従来の `light_total`。**加算は光源の番号順**
+    /// （`sample_light` の累積和と同じ順序・同じ丸め）。
+    #[inline]
+    fn selection_total(&self, from: Vec3) -> f64 {
+        if !self.light_weighted {
+            return self.light_total;
+        }
+        let mut total = 0.0;
+        for info in &self.lights {
+            total += Self::selection_weight(info, from);
+        }
+        total
+    }
+
+    /// 光源 `id` を選ぶ確率（`total` は [`Self::selection_total`]）。
+    #[inline]
+    fn selection_prob(&self, id: usize, from: Vec3, total: f64) -> f64 {
+        let info = &self.lights[id];
+        if !self.light_weighted {
+            return info.weight / total;
+        }
+        Self::prob_of_weight(Self::selection_weight(info, from), total)
+    }
+
+    /// 重み `w` の光源を選ぶ確率 `w / total`（`selection_prob` と `sample_light` の両方がこの 1 か所を通る）。
+    #[inline(always)]
+    fn prob_of_weight(w: f64, total: f64) -> f64 {
+        w / total
     }
 
     /// CDF を使ってライトを重点的にサンプリングし、位置・法線・放射輝度・PDF を返す。
@@ -1086,12 +1190,58 @@ impl World {
         if self.light_total <= 0.0 || self.lights.is_empty() {
             return None;
         }
-        let r = rng.next_f64() * self.light_total;
-        // 光源の選択（1 次元）の後、面上の点（2 次元）は次の組の先頭から引く（Sobol の次元の表: `sampler`）
-        rng.align_pair();
-        let idx = cdf_search(&self.light_cdf, r).min(self.lights.len().saturating_sub(1));
+        // 選択: 重み付けありなら参照点からの重みの累積和（番号順）で、なしなら従来の CDF
+        let (idx, total, pdf_select) = if self.light_weighted {
+            // 重みは光源ごとに 1 回だけ計算して持つ（`selection_weight` の値は決定的なので、`light_pdf` が
+            // 別に計算した値とビット単位で同じ）。光源が多すぎて配列に入らないときは 2 回に分けて計算する
+            const CACHE: usize = 64;
+            let n = self.lights.len();
+            let mut ws = [0.0f64; CACHE];
+            let mut total = 0.0;
+            if n <= CACHE {
+                for (j, info) in self.lights.iter().enumerate() {
+                    let w = Self::selection_weight(info, p);
+                    ws[j] = w;
+                    total += w;
+                }
+            } else {
+                total = self.selection_total(p);
+            }
+            if !(total > 0.0) {
+                // 全光源が裏側など（どの光源も寄与しない）。乱数の消費は他と揃える
+                let _ = rng.next_f64();
+                rng.align_pair();
+                return None;
+            }
+            let r = rng.next_f64() * total;
+            rng.align_pair();
+            let mut acc = 0.0;
+            let mut chosen = None;
+            let mut last_positive = 0usize;
+            let mut w_chosen = 0.0;
+            for (j, info) in self.lights.iter().enumerate() {
+                let w = if n <= CACHE { ws[j] } else { Self::selection_weight(info, p) };
+                acc += w;
+                if w > 0.0 {
+                    last_positive = j;
+                    w_chosen = w;
+                    if r < acc {
+                        chosen = Some(j);
+                        break;
+                    }
+                }
+            }
+            // r が丸めで total に達した場合は、重みが正の最後の光源（`w_chosen` はその重み）
+            (chosen.unwrap_or(last_positive), total, Self::prob_of_weight(w_chosen, total))
+        } else {
+            let r = rng.next_f64() * self.light_total;
+            // 光源の選択（1 次元）の後、面上の点（2 次元）は次の組の先頭から引く（Sobol の次元の表: `sampler`）
+            rng.align_pair();
+            let idx = cdf_search(&self.light_cdf, r).min(self.lights.len().saturating_sub(1));
+            (idx, self.light_total, self.selection_prob(idx, p, self.light_total))
+        };
         let info = self.lights[idx];
-        let pdf_select = info.weight / self.light_total;
+        let _ = total;
         // 層化なし（`uv_override` が None）のときは、元の実装と同じ順で rng から引く
         // （「選択 → 面上の点」）ので、`sample_light` はビット単位で従来どおりの挙動になる。
         let uv = uv_override.unwrap_or_else(|| (rng.next_f64(), rng.next_f64()));
@@ -1347,6 +1497,15 @@ pub struct LightInfo {
     pub weight: f64,
     /// この光源上の任意の点（シャッター区間全体）の成分ごとの誤差上界（`build_lights` で事前計算）
     pub p_error: Vec3,
+    /// 光源選択の重み（[`World::selection_weight`]）に使う量。距離は**光源のまとまり**（発光球 1 個、または発光インスタンス 1 個の
+    /// 三角形全部）の境界球 `(center, r2)` で測る。同じ矩形の 2 つの三角形は同じ距離の項を共有し、出力パワー `weight` の比が保たれる
+    pub center: Vec3,
+    /// 境界球の半径の二乗（距離の下限。`d²` がこれ未満なら `r2`）
+    pub r2: f64,
+    /// 三角形の重心と外向き法線（片面発光。参照点が裏側なら選択重み 0）。球は `one_sided = false`
+    pub plane_p: Vec3,
+    pub normal: Vec3,
+    pub one_sided: bool,
 }
 
 /// デルタ光源: 発光が面積ゼロに集中した光源（点・平行・スポット）。
@@ -1825,6 +1984,118 @@ mod tests {
         world.spheres.push(Sphere { c, r, mat_id: 0 });
         world.build_lights(&mats);
         world
+    }
+
+    /// 光源が多数・混在（球 5 個 + 向きの違う矩形 2 枚）のワールド。矩形の法線は +z（cross(v1−v0, v2−v0)）。
+    fn many_lights_world() -> World {
+        use crate::world::test_meshes::tilted_quad;
+        let mut world = World::new();
+        let mats = vec![Material::DiffuseLight { emit: Color::new(3.0, 4.0, 5.0) }];
+        for (c, r) in [
+            (Vec3::new(-6.0, 1.0, 2.0), 0.4),
+            (Vec3::new(4.0, 0.5, -3.0), 1.5),
+            (Vec3::new(0.0, 5.0, 0.0), 0.05),
+            (Vec3::new(20.0, 2.0, 20.0), 3.0),
+            (Vec3::new(0.0, 0.0, 0.0), 0.7),
+        ] {
+            world.add_sphere(Sphere { c, r, mat_id: 0 });
+        }
+        // +z を向く矩形と、y 軸まわりに 180° 回して −z を向く矩形
+        world.add_mesh_data_instance(tilted_quad(1.0, Vec3::new(0.0, 0.0, 1.0), 0), Transform::translate(Vec3::new(2.0, 1.0, 6.0)), None);
+        world.add_mesh_data_instance(
+            tilted_quad(2.0, Vec3::new(0.0, 0.0, 1.0), 0),
+            Transform::translate(Vec3::new(-3.0, 1.0, -6.0)).compose(Transform::rotate(Vec3::new(0.0, 1.0, 0.0), 180.0)),
+            None,
+        );
+        world.build_lights(&mats);
+        assert!(world.light_weighted, "テスト設定: 光源のまとまりが複数なので重み付けになるはず");
+        world
+    }
+
+    /// **MIS の前提**: `sample_light` が返した `pdf` は、同じ光源・同じ点に対する `light_pdf` とビット単位で一致する
+    /// （選択確率が参照点に依存しても）。光源 1 個 / 多数 / 裏側 / 距離 0 近傍 / 重み 0 の光源を含む。
+    #[test]
+    fn light_pdf_is_bit_identical_to_the_sampled_pdf_with_position_dependent_selection() {
+        let world = many_lights_world();
+        let mut rng = Rng::new(77);
+        let mut points = vec![
+            Vec3::new(0.0, 0.0, 0.0),           // 球 [4] の中心（距離 0）
+            Vec3::new(0.0, 5.0, 1e-9),          // 小さな球のすぐそば
+            Vec3::new(2.0, 1.0, 6.0 + 1e-9),    // +z 矩形の面上すれすれ（表側）
+            Vec3::new(2.0, 1.0, 6.0 - 1e-3),    // 同・裏側（この矩形の重みは 0）
+            Vec3::new(-3.0, 1.0, -6.0 - 0.5),   // −z を向く矩形の裏側（−z 側 = 表側なので実は表）
+            Vec3::new(-3.0, 1.0, -5.0),         // 同・裏側
+            Vec3::new(300.0, 100.0, -200.0),    // 遠方
+        ];
+        for _ in 0..40 {
+            points.push(Vec3::new(rng.next_f64() * 40.0 - 20.0, rng.next_f64() * 12.0 - 3.0, rng.next_f64() * 40.0 - 20.0));
+        }
+        let mut checked = 0;
+        for from in points {
+            for _ in 0..200 {
+                let Some(ls) = world.sample_light(&mut rng, 0.0, from) else { continue };
+                let hit = Hit {
+                    t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0,
+                    prim_id: ls.prim_id, inst_id: ls.inst_id, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0), uv: (0.0, 0.0),
+                };
+                let pdf = world.light_pdf(from, 0.0, &hit);
+                assert_eq!(pdf.to_bits(), ls.pdf.to_bits(), "from {:?}: light_pdf {} != sample pdf {}", from, pdf, ls.pdf);
+                checked += 1;
+            }
+        }
+        assert!(checked > 5000, "too few samples: {checked}");
+    }
+
+    /// 光源が 64 個を超える（重みを配列に持てず 2 回に分けて計算する経路）ワールドでも、`light_pdf` とビット一致する。
+    #[test]
+    fn light_pdf_is_bit_identical_when_there_are_more_lights_than_the_weight_cache() {
+        let mut world = World::new();
+        let mats = vec![Material::DiffuseLight { emit: Color::new(2.0, 2.0, 2.0) }];
+        let mut rng = Rng::new(3);
+        for _ in 0..150 {
+            let c = Vec3::new(rng.next_f64() * 30.0 - 15.0, rng.next_f64() * 5.0, rng.next_f64() * 30.0 - 15.0);
+            world.add_sphere(Sphere { c, r: 0.1 + rng.next_f64() * 0.4, mat_id: 0 });
+        }
+        world.build_lights(&mats);
+        // しきい値（`LIGHT_SELECT_MAX_GROUPS`）を超える構成なので、重み付けを強制して 64 個超の経路を通す
+        world.force_light_weighting(true);
+        assert!(world.lights.len() > 64);
+        let mut checked = 0;
+        for _ in 0..300 {
+            let from = Vec3::new(rng.next_f64() * 30.0 - 15.0, rng.next_f64() * 6.0 - 1.0, rng.next_f64() * 30.0 - 15.0);
+            let Some(ls) = world.sample_light(&mut rng, 0.0, from) else { continue };
+            let hit = Hit { t: 0.0, p: ls.position, ng: ls.normal, ns: ls.normal, mat_id: 0, prim_id: ls.prim_id, inst_id: ls.inst_id, p_error: Vec3::new(0.0, 0.0, 0.0), bary: (0.0, 0.0), uv: (0.0, 0.0) };
+            assert_eq!(world.light_pdf(from, 0.0, &hit).to_bits(), ls.pdf.to_bits());
+            checked += 1;
+        }
+        assert!(checked > 200);
+    }
+
+    /// 選択確率は参照点ごとに全光源で足して 1、裏側の片面発光は選ばれず（確率 0）、近い光源ほど選ばれやすい。
+    #[test]
+    fn selection_probabilities_sum_to_one_and_respect_orientation_and_distance() {
+        let world = many_lights_world();
+        let mut rng = Rng::new(5);
+        for _ in 0..200 {
+            let from = Vec3::new(rng.next_f64() * 40.0 - 20.0, rng.next_f64() * 12.0 - 3.0, rng.next_f64() * 40.0 - 20.0);
+            let total = world.selection_total(from);
+            if total > 0.0 {
+                let sum: f64 = (0..world.lights.len()).map(|i| world.selection_prob(i, from, total)).sum();
+                assert!((sum - 1.0).abs() < 1e-12, "sum {sum}");
+            }
+        }
+        // +z を向く矩形（インスタンス 0）の裏側からは、その 2 枚の三角形の選択確率が 0
+        let behind = Vec3::new(2.0, 1.0, 3.0);
+        let total = world.selection_total(behind);
+        for (i, info) in world.lights.iter().enumerate() {
+            if let Light::Triangle { inst_id: 0, .. } = info.light {
+                assert_eq!(world.selection_prob(i, behind, total), 0.0);
+            }
+        }
+        // 小さな球 [2]（0,5,0）は、すぐそばのほうが遠くからより選ばれやすい（出力パワーは同じ）
+        let i_small = world.sphere_light_id[2].unwrap();
+        let prob_at = |from: Vec3| world.selection_prob(i_small, from, world.selection_total(from));
+        assert!(prob_at(Vec3::new(0.0, 5.3, 0.0)) > 5.0 * prob_at(Vec3::new(0.0, 5.0, 12.0)));
     }
 
     /// 枝刈りなし（インスタンス BVH に tmax = 1e30）の参照実装。tmin の写像と再探索の規則は World::hit と同じ。

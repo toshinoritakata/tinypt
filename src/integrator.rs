@@ -772,6 +772,41 @@ mod tests {
         (world, mats, EnvMap::constant(Color::new(0.0, 0.0, 0.0)))
     }
 
+    /// 光源選択を参照点からの重みで行っても、直接照明の平均は変わらない（不偏）。光源が近い・遠い・向きが違う 3 個
+    /// （発光球 2 個と、床に向いた矩形 1 枚）の下の床で、重み付けあり / なしを独立なシードで比べる（差が標準誤差の 5 倍以内）。
+    #[test]
+    fn weighted_light_selection_is_unbiased_against_the_power_cdf() {
+        use crate::geometry::Sphere;
+        use crate::transform::Transform;
+        use crate::world::test_meshes::tilted_quad;
+        let mats = vec![
+            Material::Lambert { albedo: Color::new(0.5, 0.5, 0.5), albedo_tex: None },
+            Material::DiffuseLight { emit: Color::new(4.0, 4.0, 4.0) },
+        ];
+        let mut world = World::new();
+        world.add_sphere(Sphere { c: Vec3::new(0.0, -1000.0, 0.0), r: 1000.0, mat_id: 0 });
+        world.add_sphere(Sphere { c: Vec3::new(0.0, 3.0, 0.0), r: 1.0, mat_id: 1 });
+        world.add_sphere(Sphere { c: Vec3::new(6.0, 5.0, 2.0), r: 2.0, mat_id: 1 });
+        // 下（−y）を向く矩形: tilted_quad の法線は +z なので x 軸まわりに 90° 回して +z → −y にする
+        world.add_mesh_data_instance(
+            tilted_quad(1.0, Vec3::new(0.0, 0.0, 1.0), 1),
+            Transform::translate(Vec3::new(-3.0, 4.0, 0.0)).compose(Transform::rotate(Vec3::new(1.0, 0.0, 0.0), 90.0)),
+            None,
+        );
+        world.build_lights(&mats);
+        let env = EnvMap::constant(Color::new(0.0, 0.0, 0.0));
+        let limits = PathLimits { max_depth: 2, rr_depth: 1000 };
+        let ray = Ray { o: Vec3::new(1.0, 1.0, 5.0), d: Vec3::new(-1.0, -1.0, -3.0).norm(), time: 0.0 };
+        world.force_light_weighting(true);
+        let (mw, sw) = estimate(&world, &mats, &env, ray, limits, 400_000, 101);
+        world.force_light_weighting(false);
+        let (mu, su) = estimate(&world, &mats, &env, ray, limits, 400_000, 202);
+        let se = (sw * sw + su * su).sqrt();
+        assert!(mw > 0.0 && (mw - mu).abs() < 5.0 * se + 1e-4 * mu, "weighted {} ± {} vs power CDF {} ± {}", mw, sw, mu, su);
+        // 分散も下がっている（同じ光線・同じ回数で、重み付けのほうが標準誤差が小さい）
+        assert!(sw < su, "weighted se {} not below power-cdf se {}", sw, su);
+    }
+
     /// 平均と標準誤差。
     fn estimate(world: &World, mats: &[Material], env: &EnvMap, ray: Ray, limits: PathLimits, n: usize, seed: u64) -> (f64, f64) {
         // 本番と同じ Sobol モード（画素 1 つぶん。種は `seed`、サンプル番号は 0..n）。白炉・解析解の検定を
