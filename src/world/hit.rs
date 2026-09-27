@@ -12,14 +12,14 @@ use super::geometry::{moving_sphere_bounds, sphere_world_bounds};
 use super::World;
 
 /// インスタンスの交差判定で、ワールド空間の tmin 判定に却下された面の先を探し直す最大回数。
-pub(crate) const INSTANCE_RETRY_LIMIT: usize = 4;
+pub(super) const INSTANCE_RETRY_LIMIT: usize = 4;
 
 
 /// トップレベル BVH。葉の添字 `k < n_inst` はインスタンス `k`、`n_inst <= k < n_inst + n_sph` は球 `k - n_inst`、
 /// それ以降は SDF `k - n_inst - n_sph`
 /// （線形総当たりの走査順「インスタンス → 球 → SDF」と同じ通し番号で、同値の t のタイブレークにも使う。
 /// SDF の `Hit::prim_id` は `n_sph + SDF の添字` で、この通し番号から `n_inst` を引いたものに等しい）。
-pub(crate) struct Tlas {
+pub(super) struct Tlas {
     bvh: Bvh,
     n_inst: usize,
     n_sph: usize,
@@ -52,13 +52,13 @@ impl Tlas {
 
 /// この数以上のプリミティブ（インスタンス + 球）があるときだけ TLAS を使う。少数では総当たりのほうが速い
 /// （決め方は tlas_report.md 参照）。
-pub(crate) const TLAS_MIN_PRIMS: usize = 20;
+pub(super) const TLAS_MIN_PRIMS: usize = 20;
 
 
 impl World {
     /// トップレベル BVH（あれば）。最初の呼び出しで構築する。プリミティブが少ない、または構築後に
     /// ジオメトリが増えて古くなっているときは `None`（呼び出し側は線形に総当たりする）。
-    pub(crate) fn tlas(&self) -> Option<&Tlas> {
+    pub(super) fn tlas(&self) -> Option<&Tlas> {
         let n_prims = self.instances.len() + self.spheres.len() + self.sdfs.len();
         if n_prims < TLAS_MIN_PRIMS {
             return None;
@@ -145,7 +145,7 @@ impl World {
 
     /// 線形総当たり版の [`World::hit`]（インスタンス → 球の順）。プリミティブが少ないときの本体で、
     /// TLAS 経由の結果と一致するべき基準でもある（テストが比較する）。
-    pub(crate) fn hit_linear(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+    pub(super) fn hit_linear(&self, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
         let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
         let mut closest = tmax;
         let mut best: Option<Hit> = None;
@@ -299,7 +299,7 @@ impl World {
 
 
     /// 線形総当たり版の [`World::occluded`]。
-    pub(crate) fn occluded_linear(&self, r: Ray, tmin: f64, tmax: f64, skip: Option<(Option<usize>, usize)>) -> bool {
+    pub(super) fn occluded_linear(&self, r: Ray, tmin: f64, tmax: f64, skip: Option<(Option<usize>, usize)>) -> bool {
         let inv_d = Vec3::new(1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z);
         for inst_id in 0..self.instances.len() {
             if self.occluded_instance(inst_id, r, inv_d, tmin, tmax, skip) {

@@ -11,7 +11,7 @@ use super::World;
 /// 1 つ以下は出力パワーの CDF（選択確率が変わりようがない）。2〜32 は線形の重み付け（N = 10 で等価時間 0.90）。
 /// 33〜79 はどれも得にならない（spiral の 45 で線形 1.06 / BVH 1.07 の損、人工 50 個で ±0）ので CDF のまま。
 /// 80 以上は光源 BVH（N = 100 で 0.84、200 で 0.70、500 で 0.63、1000 で 0.65、2000 で 0.82。線形は N = 1000 から損）。
-pub(crate) fn default_light_select(n_groups: usize) -> LightSelect {
+pub(super) fn default_light_select(n_groups: usize) -> LightSelect {
     const LINEAR_MAX_GROUPS: usize = 32;
     const BVH_MIN_GROUPS: usize = 80;
     if n_groups < 2 {
@@ -57,7 +57,7 @@ struct LightNode {
 
 /// 光源 BVH（1 光源 = 1 葉）。木の形は SAH（パワー × 表面積）の 2 分割。
 #[derive(Clone, Debug, Default)]
-pub(crate) struct LightBvh {
+pub(super) struct LightBvh {
     nodes: Vec<LightNode>,
     /// 光源 → 葉のノード番号（`light_pdf` が葉から根へ経路を引くのに使う）
     leaf_of: Vec<u32>,
@@ -106,7 +106,7 @@ fn sub_angle_clamped(sa: f64, ca: f64, sb: f64, cb: f64) -> (f64, f64) {
 
 impl LightBvh {
     /// 光源のリストから作る。`world` は三角形の頂点（境界・向き）を引くのに使う。
-    pub(crate) fn build(lights: &[LightInfo], world: &World) -> Self {
+    pub(super) fn build(lights: &[LightInfo], world: &World) -> Self {
         let n = lights.len();
         if n == 0 {
             return Self::default();
@@ -264,7 +264,7 @@ impl World {
     /// 光源 BVH で光源を選ぶ。`u` ∈ [0,1) 1 個を各段で使い回す（子を選んだら `u` を選んだ区間に写して一様に戻す: 確率的な分割）。
     /// 返り値は `(光源の添字, 選択確率)`。選択確率は根から葉までの各段の確率の**根側から順の積**。
     #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(x > 0.0)` also catches NaN importance/probability; `x <= 0.0` would not
-    pub(crate) fn bvh_select(&self, mut u: f64, p: Vec3) -> Option<(usize, f64)> {
+    pub(super) fn bvh_select(&self, mut u: f64, p: Vec3) -> Option<(usize, f64)> {
         let nodes = &self.light_bvh.nodes;
         if nodes.is_empty() {
             return None;
@@ -298,7 +298,7 @@ impl World {
 
     /// 光源 `id` を光源 BVH で選ぶ確率。**`bvh_select` が降りるのと同じ経路**（葉から親をたどって根側から並べる）で、
     /// 同じ `bvh_child_probs` の値を同じ順序で掛ける（ビット一致）。
-    pub(crate) fn bvh_prob(&self, id: usize, p: Vec3) -> f64 {
+    pub(super) fn bvh_prob(&self, id: usize, p: Vec3) -> f64 {
         let nodes = &self.light_bvh.nodes;
         if nodes.is_empty() {
             return 0.0;

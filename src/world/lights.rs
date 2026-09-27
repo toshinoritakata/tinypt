@@ -182,7 +182,7 @@ impl World {
     /// **`sample_light` と `light_pdf` の両方がこの関数だけを使う**（式を 2 か所に書かない）。MIS は `light_pdf` が
     /// `sample_light` の使った選択確率とビット単位で一致することに依存する。
     #[inline]
-    pub(crate) fn selection_weight(info: &LightInfo, from: Vec3) -> f64 {
+    pub(super) fn selection_weight(info: &LightInfo, from: Vec3) -> f64 {
         if info.one_sided && info.normal.dot(from - info.plane_p) <= 0.0 {
             return 0.0;
         }
@@ -194,7 +194,7 @@ impl World {
     /// 選択確率の分母（全光源の重みの和）。重み付けなしなら従来の `light_total`。**加算は光源の番号順**
     /// （`sample_light` の累積和と同じ順序・同じ丸め）。
     #[inline]
-    pub(crate) fn selection_total(&self, from: Vec3) -> f64 {
+    pub(super) fn selection_total(&self, from: Vec3) -> f64 {
         if self.light_select != LightSelect::Linear {
             return self.light_total;
         }
@@ -208,7 +208,7 @@ impl World {
 
     /// 光源 `id` を選ぶ確率（`total` は [`Self::selection_total`]）。
     #[inline]
-    pub(crate) fn selection_prob(&self, id: usize, from: Vec3, total: f64) -> f64 {
+    pub(super) fn selection_prob(&self, id: usize, from: Vec3, total: f64) -> f64 {
         let info = &self.lights[id];
         if self.light_select != LightSelect::Linear {
             return info.weight / total;
@@ -488,19 +488,19 @@ impl Light {
 const NEAR_SURFACE_SIN2: f64 = 1.0 - 1e-12;
 
 /// 球の外部の点から見た円錐。
-pub(crate) struct SphereCone {
+pub(super) struct SphereCone {
     /// 参照点から球中心への単位ベクトル
     axis: Vec3,
-    pub(crate) sin2_max: f64,
+    pub(super) sin2_max: f64,
     /// 1 − cosθmax = sin²θmax / (1 + √(1 − sin²θmax))（桁落ちのない厳密な形）
-    pub(crate) one_minus_cos_max: f64,
+    pub(super) one_minus_cos_max: f64,
 }
 
 /// `from` が球の十分に外部なら、`from` から球を見込む円錐を返す。
 /// 内部（境界を含む）または表面すれすれ（sin²θmax > [`NEAR_SURFACE_SIN2`]）なら `None`
 /// （呼び出し側は表面積サンプリングにフォールバックする）。
 #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(sin2_max <= NEAR_SURFACE_SIN2)` also catches a NaN ratio (falls back to the near-surface path)
-pub(crate) fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
+pub(super) fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
     let to_c = s.c - from;
     let dc2 = to_c.dot(to_c);
     let r2 = s.r * s.r;
@@ -519,7 +519,7 @@ pub(crate) fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
 }
 
 /// 単位ベクトル `w` に直交する正規直交基底 (t, b)。
-pub(crate) fn orthonormal_basis(w: Vec3) -> (Vec3, Vec3) {
+pub(super) fn orthonormal_basis(w: Vec3) -> (Vec3, Vec3) {
     let a = if w.x.abs() > 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
     let t = w.cross(a).norm();
     let b = t.cross(w);
@@ -542,7 +542,7 @@ fn tri_point_error(world: &World, mesh_id: usize, tri_id: usize, inst_id: usize,
     vmax(e0, e1, e2) + vmax(w0.abs(), w1.abs(), w2.abs()) * gamma(9)
 }
 
-pub(crate) fn tri_world_verts(
+pub(super) fn tri_world_verts(
     world: &World,
     mesh_id: usize,
     tri_id: usize,

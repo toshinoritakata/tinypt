@@ -35,7 +35,7 @@ pub struct Mesh {
     /// `masks` が空なら空
     tri_alpha: Vec<(u16, f32)>,
     /// メッシュ内の BVH（高速交差判定用）
-    pub(crate) bvh: Bvh,
+    pub(super) bvh: Bvh,
 }
 
 impl Mesh {
@@ -206,7 +206,7 @@ impl Mesh {
     /// UV が無い三角形、および UV 三角形が縮退している（行列式が丸めの範囲でゼロ）三角形は `None`。
     /// 任意基底へのフォールバックはしない（隣接三角形で接空間が飛んで縞になるより、摂動しない方が安全）。
     /// 縮退の判定は相対: `|det| <= (|a| + |b|)·γ(2)`（`det = a − b`、桁落ちの上界）。
-    pub(crate) fn uv_derivatives(&self, tri_id: usize, time: f64) -> Option<(Vec3, Vec3)> {
+    pub(super) fn uv_derivatives(&self, tri_id: usize, time: f64) -> Option<(Vec3, Vec3)> {
         let idx = *self.tri_uv.get(tri_id)?;
         if idx[0] == NO_UV {
             return None;
@@ -306,7 +306,7 @@ pub struct Instance {
 }
 
 /// 球のワールド空間の境界ボックス（中心 ± 半径）。球の交差判定の丸め誤差ぶんを見込んで少し広げる。
-pub(crate) fn sphere_world_bounds(s: &Sphere) -> Aabb {
+pub(super) fn sphere_world_bounds(s: &Sphere) -> Aabb {
     let pad = s.r * 1e-9 + gamma(8) * (s.c.x.abs().max(s.c.y.abs()).max(s.c.z.abs()) + s.r);
     let e = Vec3::new(s.r + pad, s.r + pad, s.r + pad);
     Aabb::empty().grow(s.c - e).grow(s.c + e)
@@ -321,7 +321,7 @@ fn lerp_center(c0: Vec3, c1: Vec3, t: f64) -> (Vec3, f64) {
 /// 動く球の掃過ボリューム: シャッター区間の両端の中心に置いた球の箱の和。中心は時刻の**線形**関数なので、
 /// 区間の途中の球は両端の球の凸包に入り、箱は凸なのでこの和は**厳密に保守的**（回転のあるインスタンスと違って
 /// 途中で膨らまない）。補間の丸めぶん（`lerp_center` の誤差）を足す。
-pub(crate) fn moving_sphere_bounds(s: &Sphere, end: Vec3, shutter: (f64, f64)) -> Aabb {
+pub(super) fn moving_sphere_bounds(s: &Sphere, end: Vec3, shutter: (f64, f64)) -> Aabb {
     let at = |t: f64| {
         let (c, err) = lerp_center(s.c, end, t);
         let b = sphere_world_bounds(&Sphere { c, ..*s });
@@ -396,7 +396,7 @@ impl World {
 
     /// 球 `idx` の交差判定。動く球はレイの時刻で中心を補間してから解く（静止は従来と同じ `Sphere::hit`）。
     #[inline(always)]
-    pub(crate) fn sphere_hit(&self, idx: usize, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
+    pub(super) fn sphere_hit(&self, idx: usize, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
         let s = &self.spheres[idx];
         if let Some(Some(end)) = self.sphere_end.get(idx) {
             let (c, err) = lerp_center(s.c, *end, r.time);
