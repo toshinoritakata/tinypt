@@ -24,17 +24,25 @@
 //! Sobol 次元 0, 1 なので層化は保たれる。
 
 /// 画素フィルタの種類と（あれば）パラメータ。
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PixelFilter {
-    /// 半径 0.5 の一様（従来の挙動。既定）
-    #[default]
+    /// 半径 0.5 の一様（旧来の挙動。`--filter box` で明示的に選べる。ビット単位の比較にはこれを使う）
     Box,
     /// 半径 1 の三角形
     Tent,
-    /// Mitsuba のガウス（半径 `4·stddev`、裾を引く）
+    /// Mitsuba のガウス（半径 `4·stddev`、裾を引く）。**既定**（Mitsuba 自身の既定と同じ）
     Gaussian { stddev: f64 },
     /// Mitchell–Netravali（半径 2）
     Mitchell { b: f64, c: f64 },
+}
+
+impl Default for PixelFilter {
+    /// 既定はガウス（`stddev` 既定 0.5）。Mitsuba 自身の既定と同じにした（tinypt が独自の既定 box を選んでいた
+    /// 期間があったのは、box が旧来の一様ジッターとビット単位で同じ経路を通れる唯一のフィルタで、既存のシーン・
+    /// ゴールデンテストを壊さずに機能を足すためだった）。旧来の挙動が要る比較は `--filter box` を明示する。
+    fn default() -> Self {
+        PixelFilter::Gaussian { stddev: 0.5 }
+    }
 }
 
 /// 表の区間数。

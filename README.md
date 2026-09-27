@@ -268,7 +268,7 @@ Loaded in 2.81s (obj parse 0.91s, mesh + BVH build 1.87s, textures 0.00s)
 | `--no-env` | — | それ以前に指定した `--env` を取り消す (デフォルトも未指定＝手続き的な空) |
 | `--denoise` / `--no-denoise` | 有効 | Intel OIDN デノイズ |
 | `--adaptive` / `--no-adaptive` | 無効 | アダプティブサンプリング (バイアスあり、[下記](#アダプティブサンプリングのバイアス)) |
-| `--filter box\|tent\|gaussian\|mitchell` | `box` | 画素の再構成フィルタ ([下記](#画素フィルタ))。シーンファイルの `<rfilter>` より優先 |
+| `--filter box\|tent\|gaussian\|mitchell` | `gaussian` | 画素の再構成フィルタ ([下記](#画素フィルタ))。シーンファイルの `<rfilter>` より優先 |
 | `--adaptive-min-spp N` | 8 | アダプティブサンプリングの最小サンプル数 (0 は警告して 1 にする) |
 | `--adaptive-threshold N` | 0.02 | 収束閾値 (相対標準偏差、負値は 0 に丸め) |
 | `--seed N` | 0 | 乱数シード。同じ設定なら出力はスレッド数に依らず決定論的 |
@@ -292,7 +292,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 **再現性はファイル単位ではなく画素単位**: 同じ設定なら画素値はスレッド数に依らず再現するが (`--seed`)、
 `.exr` だけは**同じ画素値でもファイルがバイト単位で一致しない** (圧縮ブロックの都合。同一シーン・同一 seed で
 2 回描くと、サイズは同じまま数十万バイト分が異なる)。`.ppm` `.png` `.hdr` は 2 回描いてもバイト単位で一致する。
-回帰比較にハッシュを使うなら `.ppm` か `.hdr` を使うか、`.exr` はデコードして画素値で比べること。
+回帰比較にハッシュを使うなら `.ppm` か `.hdr` を使うか、`.exr` はデコードして画素値で比べること。画素フィルタの既定は `gaussian` なので、過去のレンダーと比較するときは両方に `--filter box` を付けること。
 
 ### アダプティブサンプリングのバイアス
 
@@ -375,7 +375,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<emitter type="point"\|"directional"\|"spot">` | シーン直下のデルタ光源 (複数可)。`position` / `direction` 直書きは独自拡張 ([詳細](#デルタ光源)) |
 | `<medium type="homogeneous">` | シーン直下に 1 つ。`sigma_t` / `albedo` / `<phase>` / `bounds_min`・`bounds_max` (独自拡張) ([詳細](#参加媒質)) |
 | `<film>` / `<sampler>` / `<integrator>` | 解像度 / `sample_count` / `max_depth`・`rr_depth` (Mitsuba と同じパス長の意味: `max_depth` 1 = 直接見える発光体のみ、2 = 直接照明まで、-1 = 無制限。組み込みシーンの既定は `max_depth` 9・`rr_depth` 4) |
-| `<film>` の `<rfilter>` | 画素フィルタ (`box`(既定) / `tent` / `gaussian`(`stddev`) / `mitchell`(`B`, `C`)、[詳細](#画素フィルタ)) |
+| `<film>` の `<rfilter>` | 画素フィルタ (`box` / `tent` / `gaussian`(`stddev`、既定) / `mitchell`(`B`, `C`)、[詳細](#画素フィルタ)) |
 
 - **色**: `<rgb>` はリニア、`<srgb>` は sRGB (ガンマ展開)。
 - **CLI 優先**: `--spp` はシーンファイルの `sample_count` を上書きする。解像度は `--width` / `--height` / `--res` で上書きできる (`<film>` より優先)。`max_depth`・`rr_depth` は CLI から変更不可。
@@ -384,7 +384,7 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 - 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。ただし `<default>` は**警告なし**で無視される。
 ### 画素フィルタ
 
-画素の再構成フィルタは既定で `box`（半径 0.5 の一様。指定が無いシーンは常にビット単位で従来と同じ）。`tent`（半径 1）・`gaussian`（Mitsuba と同じ定義: `stddev` 既定 0.5、半径 `4·stddev` で裾を引いて 0 になる）・`mitchell`（`B`・`C` 既定 1/3 ずつ、半径 2）を選べる。**Mitsuba 自体の既定は gaussian だが、tinypt は box を既定にしている**（`--filter`/`<rfilter>` を指定しないシーン・ゴールデンテストがビット単位で変わらないようにするため）。
+画素の再構成フィルタは既定で `gaussian`（`stddev` 既定 0.5、半径 `4·stddev` で裾を引いて 0 になる。Mitsuba 自身の既定と同じ）。`box`（半径 0.5 の一様。旧来の一様ジッターと**ビット単位で同じ経路**を通る唯一のフィルタ）・`tent`（半径 1）・`mitchell`（`B`・`C` 既定 1/3 ずつ、半径 2）も選べる。**過去のレンダーとビット単位で比較するときは `--filter box` を明示すること**（既定が gaussian になった後も、box だけは常に旧来と同じ画素値になる）。
 
 ```xml
 <film type="hdrfilm">

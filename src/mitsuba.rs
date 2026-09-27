@@ -13,7 +13,7 @@
 //! - `emitter type="area"`: `radiance`（shape に付随）
 //! - `emitter type="envmap"`(filename) / `constant`(radiance): 環境マップ。`scale` 対応
 //! - `film`(width/height) / `sampler`(sample_count) / `integrator`(max_depth/rr_depth、Mitsuba と同じ意味、max_depth=-1 は無制限): RenderConfig へ反映
-//! - `film` の `<rfilter type="box|tent|gaussian|mitchell">`: 画素の再構成フィルタ（既定 box。フィルタ重点サンプリングで実装、`filter.rs` 参照）
+//! - `film` の `<rfilter type="box|tent|gaussian|mitchell">`: 画素の再構成フィルタ（既定 gaussian、Mitsuba と同じ。フィルタ重点サンプリングで実装、`filter.rs` 参照）
 //!
 //! ## 方針
 //! - 色: `<rgb>` はリニア、`<srgb>` は sRGB（ガンマ展開）。

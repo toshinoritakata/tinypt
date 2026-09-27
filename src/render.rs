@@ -855,6 +855,9 @@ mod tests {
         config.morton_enabled = true;
         config.adaptive_enabled = false;
         config.checkpoint_enabled = false;
+        // ゴールデン値は統合器（NEE/MIS/BSDF サンプリング等）の回帰を見張るためのもので、画素フィルタの
+        // 既定値の選択とは無関係。box を明示することで、既定フィルタが変わってもここは影響を受けない
+        config.filter = crate::filter::PixelFilter::Box;
     }
 
     /// sample/cornell.xml 全体（形状の変換とカメラ）を `k` 倍に拡大縮小したシーンを読み込む。

@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(o.filter, Some(c.filter));
         let (c, _, w) = parse(&["--filter", "lanczos"]);
         assert!(w.iter().any(|m| m.contains("--filter")), "{w:?}");
-        assert_eq!(c.filter, PixelFilter::Box);
+        assert_eq!(c.filter, RenderConfig::default().filter, "an unrecognized name leaves the default filter untouched");
     }
 
     /// 正しい引数では警告が出ず、値が反映される。
