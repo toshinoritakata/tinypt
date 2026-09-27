@@ -278,22 +278,18 @@ fn parse_rfilter(el: &Element) -> Option<PixelFilter> {
         "tent" => Some(PixelFilter::Tent),
         "gaussian" => {
             let stddev = el.float("stddev").unwrap_or(0.5);
-            if stddev.is_finite() && stddev > 0.0 {
-                Some(PixelFilter::Gaussian { stddev })
-            } else {
+            PixelFilter::gaussian(stddev).or_else(|| {
                 warn(&format!("rfilter gaussian stddev must be positive and finite (got {stddev}); ignored"));
                 None
-            }
+            })
         }
         "mitchell" => {
             let b = el.float("B").unwrap_or(1.0 / 3.0);
             let c = el.float("C").unwrap_or(1.0 / 3.0);
-            if b.is_finite() && c.is_finite() {
-                Some(PixelFilter::Mitchell { b, c })
-            } else {
+            PixelFilter::mitchell(b, c).or_else(|| {
                 warn(&format!("rfilter mitchell B/C must be finite (got B={b}, C={c}); ignored"));
                 None
-            }
+            })
         }
         other => {
             warn(&format!("unsupported rfilter type '{other}' (expected box | tent | gaussian | mitchell); ignored"));

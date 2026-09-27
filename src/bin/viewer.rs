@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tinypt::cli::{load_with_overrides, parse_args, CliOverrides, USAGE};
+use tinypt::filter::PixelFilter;
 use tinypt::math::Color;
 use tinypt::{
     denoise, ppm_bytes, render_observed, resolve_pixels, OutputFormat, OutputSettings, RenderConfig, RenderProbe, Tonemap,
@@ -121,6 +122,16 @@ fn scan(dir: &std::path::Path) -> Listing {
 
 /// `dir` の中身を (サブフォルダ, `.xml` ファイル)（名前のみ）で返す。隠しエントリ（`.` で始まる名前）は出さず、
 /// 拡張子は大文字小文字を区別せず、どちらも名前の小文字順に並べる。読めないディレクトリはエラー。
+/// 状態行に出す短い表示（例: "gaussian σ0.5"、"mitchell B0.33 C0.33"、"box"）。
+fn filter_label(f: &PixelFilter) -> String {
+    match *f {
+        PixelFilter::Box => "box".to_string(),
+        PixelFilter::Tent => "tent".to_string(),
+        PixelFilter::Gaussian { stddev } => format!("gaussian σ{stddev:.2}"),
+        PixelFilter::Mitchell { b, c } => format!("mitchell B{b:.2} C{c:.2}"),
+    }
+}
+
 fn list_dir(dir: &std::path::Path) -> std::io::Result<(Vec<String>, Vec<String>)> {
     let (mut dirs, mut xmls) = (Vec::new(), Vec::new());
     for e in std::fs::read_dir(dir)?.flatten() {
@@ -190,6 +201,7 @@ struct Opts {
     adaptive: bool,
     adaptive_min: usize,
     threshold: f64,
+    filter: PixelFilter,
 }
 
 impl Opts {
@@ -202,6 +214,7 @@ impl Opts {
             adaptive: c.adaptive_enabled,
             adaptive_min: c.adaptive_min_spp,
             threshold: c.adaptive_threshold,
+            filter: c.filter,
         }
     }
 
@@ -226,6 +239,19 @@ impl Opts {
         if !self.threshold.is_finite() || self.threshold < 0.0 {
             self.threshold = 0.02;
             w.push("adaptive threshold → 0.02".to_string());
+        }
+        // フィルタのパラメータは XML/CLI と同じ検証（PixelFilter::gaussian / mitchell）を通す。egui の
+        // DragValue は普段は不正値を作らないが、直接値を打ち込める欄なので、既定値へ丸めて警告する
+        match self.filter {
+            PixelFilter::Gaussian { stddev } if PixelFilter::gaussian(stddev).is_none() => {
+                w.push(format!("filter gaussian stddev {stddev} → 0.5"));
+                self.filter = PixelFilter::Gaussian { stddev: 0.5 };
+            }
+            PixelFilter::Mitchell { b, c } if PixelFilter::mitchell(b, c).is_none() => {
+                w.push(format!("filter mitchell B/C ({b}, {c}) → 1/3, 1/3"));
+                self.filter = PixelFilter::Mitchell { b: 1.0 / 3.0, c: 1.0 / 3.0 };
+            }
+            _ => {}
         }
         (self, w)
     }
@@ -397,6 +423,10 @@ impl App {
             self.base.width = e.width;
             self.base.height = e.height;
         }
+        if e.filter != self.active.filter {
+            ov.filter = Some(e.filter);
+            self.base.filter = e.filter;
+        }
         self.base.seed = e.seed;
         self.base.adaptive_enabled = e.adaptive;
         self.base.adaptive_min_spp = e.adaptive_min;
@@ -425,6 +455,32 @@ impl App {
                     if let Some((w, h)) = v.split_once('x') {
                         self.edit.width = w.parse().unwrap_or(self.edit.width);
                         self.edit.height = h.parse().unwrap_or(self.edit.height);
+                    }
+                }
+                // フィルタ検証フック: `filter=mitchell;filter_b=0.4;filter_c=0.2` / `filter=gaussian;filter_stddev=0.8`
+                // のように、他の欄と同じキー方式で B の値を触る。既存のパラメータは維持し、名前だけ変えても壊さない
+                "filter" => {
+                    if let Some(f) = PixelFilter::from_name(v) {
+                        self.edit.filter = match (f, self.edit.filter) {
+                            (PixelFilter::Gaussian { .. }, PixelFilter::Gaussian { stddev }) => PixelFilter::Gaussian { stddev },
+                            (PixelFilter::Mitchell { .. }, PixelFilter::Mitchell { b, c }) => PixelFilter::Mitchell { b, c },
+                            (f, _) => f,
+                        };
+                    }
+                }
+                "filter_stddev" => {
+                    if let (Ok(stddev), PixelFilter::Gaussian { .. }) = (v.parse(), self.edit.filter) {
+                        self.edit.filter = PixelFilter::Gaussian { stddev };
+                    }
+                }
+                "filter_b" => {
+                    if let (Ok(b), PixelFilter::Mitchell { c, .. }) = (v.parse(), self.edit.filter) {
+                        self.edit.filter = PixelFilter::Mitchell { b, c };
+                    }
+                }
+                "filter_c" => {
+                    if let (Ok(c), PixelFilter::Mitchell { b, .. }) = (v.parse(), self.edit.filter) {
+                        self.edit.filter = PixelFilter::Mitchell { b, c };
                     }
                 }
                 _ => {}
@@ -752,9 +808,10 @@ impl eframe::App for App {
                     };
                     let (t, tt) = probe.tiles();
                     ui.label(format!(
-                        "{state}: {:.1}/{} spp ({t}/{tt} tiles) · {:.1}s · {:.2} Msamples/s",
+                        "{state}: {:.1}/{} spp ({t}/{tt} tiles) · {} · {:.1}s · {:.2} Msamples/s",
                         done / px,
                         config.spp,
+                        filter_label(&config.filter),
                         secs,
                         done / secs / 1e6
                     ));
@@ -843,6 +900,30 @@ impl eframe::App for App {
                 ui.end_row();
                 ui.label("  threshold");
                 ui.add_enabled(e.adaptive, egui::DragValue::new(&mut e.threshold).speed(0.001).range(0.0..=10.0));
+                ui.end_row();
+                ui.label("filter");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("pixel_filter").selected_text(e.filter.name()).show_ui(ui, |ui| {
+                        for name in ["box", "tent", "gaussian", "mitchell"] {
+                            if ui.selectable_label(e.filter.name() == name, name).clicked() && e.filter.name() != name {
+                                e.filter = PixelFilter::from_name(name).unwrap();
+                            }
+                        }
+                    });
+                    match &mut e.filter {
+                        PixelFilter::Gaussian { stddev } => {
+                            ui.label("σ");
+                            ui.add(egui::DragValue::new(stddev).speed(0.01).range(1e-6..=100.0));
+                        }
+                        PixelFilter::Mitchell { b, c } => {
+                            ui.label("B");
+                            ui.add(egui::DragValue::new(b).speed(0.01));
+                            ui.label("C");
+                            ui.add(egui::DragValue::new(c).speed(0.01));
+                        }
+                        PixelFilter::Box | PixelFilter::Tent => {}
+                    }
+                });
                 ui.end_row();
             });
             let dirty = self.edit != self.active;

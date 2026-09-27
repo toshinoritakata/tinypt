@@ -52,6 +52,24 @@ const SUBSTEPS: usize = 8;
 
 impl PixelFilter {
     /// 名前（`--filter` と XML の `type`）から、既定のパラメータで作る。
+    /// `stddev` を検証してガウスを作る（有限かつ正でなければ `None`）。XML パーサ・CLI・viewer が共有する。
+    pub fn gaussian(stddev: f64) -> Option<Self> {
+        if stddev.is_finite() && stddev > 0.0 {
+            Some(PixelFilter::Gaussian { stddev })
+        } else {
+            None
+        }
+    }
+
+    /// `B`, `C` を検証して Mitchell を作る（両方有限でなければ `None`）。
+    pub fn mitchell(b: f64, c: f64) -> Option<Self> {
+        if b.is_finite() && c.is_finite() {
+            Some(PixelFilter::Mitchell { b, c })
+        } else {
+            None
+        }
+    }
+
     pub fn from_name(s: &str) -> Option<Self> {
         Some(match s.to_ascii_lowercase().as_str() {
             "box" => PixelFilter::Box,
