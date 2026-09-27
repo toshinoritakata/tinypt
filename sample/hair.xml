@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 髪の毛のストレステスト（極細の多角形チューブを大量に並べる）。
+
+     OBJ はリポジトリに入っていない。先に生成すること:
+         python3 tools/gen_hair.py                       # 既定 20000 本 ≈ 1.9M 三角形
+         python3 tools/gen_hair.py --preset small        # 5000 本
+         python3 tools/gen_hair.py --strands 80000       # 80000 本 ≈ 7.7M 三角形
+     生成物はこの XML から見て ../assets/hair/hair.obj に置かれる（.gitignore の *.obj で無視される）。
+     OBJ が無いと "failed to load obj ...; skipped" と警告され、頭と床だけが描かれる。
+
+     何を試すか:
+       - BVH の構築時間・メモリ（細長い三角形は SAH の BVH にとって最悪に近い）
+       - 走査コスト（斜めの毛の巨大で重なった AABB）
+       - ミリ以下の形状での自己交差回避（p_error）の頑健性: 黒い斑点・光漏れ・毛の破線化が出ないか
+       - ピクセルより細い毛のエイリアシング / ノイズ
+
+     構成: 頭（球、半径 1、中心 (0,1,0)。gen_hair.py の SCALP_* と一致させること）+ 髪（頭の上半球から
+     伸びて垂れる細いチューブ、半径 0.002 の 3 角形）+ 床 + 斜め前上のキーライト（面光源）+ 弱い constant 環境光。
+     960x540 で毛が 1 ピクセル幅以下になる距離にカメラを置いている。
+
+     使い方: tinypt --scene sample/hair.xml --spp 16 -o renders/hair.png -->
+<scene version="3.0.0">
+  <integrator type="path">
+    <integer name="max_depth" value="8"/>
+    <integer name="rr_depth" value="4"/>
+  </integrator>
+  <sampler type="independent"><integer name="sample_count" value="16"/></sampler>
+  <film type="hdrfilm">
+    <integer name="width" value="960"/>
+    <integer name="height" value="540"/>
+  </film>
+
+  <sensor type="perspective">
+    <float name="fov" value="35"/>
+    <string name="fov_axis" value="y"/>
+    <transform name="to_world">
+      <lookat origin="0, 1.6, 6.5" target="0, 0.75, 0" up="0, 1, 0"/>
+    </transform>
+  </sensor>
+
+  <!-- 頭（頭皮） -->
+  <shape type="sphere">
+    <point name="center" x="0" y="1" z="0"/>
+    <float name="radius" value="1"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.72, 0.55, 0.45"/></bsdf>
+  </shape>
+
+  <!-- 髪 -->
+  <shape type="obj">
+    <string name="filename" value="../assets/hair/hair.obj"/>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.55, 0.36, 0.18"/></bsdf>
+  </shape>
+
+  <!-- 床 -->
+  <shape type="rectangle">
+    <transform name="to_world"><translate x="0" y="-0.02" z="0"/><rotate x="1" angle="-90"/><scale value="8"/></transform>
+    <bsdf type="diffuse"><srgb name="reflectance" value="0.35, 0.36, 0.38"/></bsdf>
+  </shape>
+
+  <!-- キーライト（斜め前上から頭へ向ける） -->
+  <shape type="rectangle">
+    <transform name="to_world">
+      <translate x="2.6" y="4.2" z="3.0"/><rotate y="1" angle="-139.1"/><rotate x="1" angle="37.1"/><scale value="1.1"/>
+    </transform>
+    <emitter type="area"><rgb name="radiance" value="40, 37, 32"/></emitter>
+  </shape>
+
+  <!-- 弱い環境光 -->
+  <emitter type="constant"><rgb name="radiance" value="0.15, 0.19, 0.28"/></emitter>
+</scene>
