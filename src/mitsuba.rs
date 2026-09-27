@@ -1076,25 +1076,14 @@ fn parse_sdf_node(el: &Element, tree: &mut SdfTree) -> Result<SdfId, String> {
             if !finite(offset) {
                 return Err("<sdf type=\"displace\"> offset must be finite".to_string());
             }
-            // 範囲の丸めは `NoiseTexture::sanitized` と同じ規則（scale は (0, 1e6]、octaves 1..10、lacunarity 1..8、gain 0..1）
-            let raw = NoiseTexture {
-                pattern: Pattern::Fbm,
-                scale: float("scale", 1.0),
-                octaves: el.int("octaves").map_or(4, |o| o.clamp(0, 1000) as u32),
-                lacunarity: float("lacunarity", 2.0),
-                gain: float("gain", 0.5),
-                strength: 1.0,
-                color0: Color::new(0.0, 0.0, 0.0),
-                color1: Color::new(1.0, 1.0, 1.0),
-                local: true,
-                offset: Vec3::new(0.0, 0.0, 0.0),
-            };
-            let fixed = raw.sanitized();
-            if (fixed.scale, fixed.octaves, fixed.lacunarity, fixed.gain) != (raw.scale, raw.octaves, raw.lacunarity, raw.gain) {
+            let raw = (float("scale", 1.0), el.int("octaves").map_or(4, |o| o.clamp(0, 1000) as u32), float("lacunarity", 2.0), float("gain", 0.5));
+            let fixed = crate::noise::sanitize_octave_params(raw.0, raw.1, raw.2, raw.3);
+            if fixed != raw {
                 warn("displace parameter out of range (scale must be in (0, 1e6], octaves 1..10, lacunarity 1..8, gain 0..1); clamped");
             }
+            let (scale, octaves, lacunarity, gain) = fixed;
             let child = parse_sdf_node(kids[0], tree)?;
-            let noise = SdfNoise { pattern, amplitude, scale: fixed.scale, octaves: fixed.octaves, lacunarity: fixed.lacunarity, gain: fixed.gain, offset };
+            let noise = SdfNoise { pattern, amplitude, scale, octaves, lacunarity, gain, offset };
             return Ok(tree.push(SdfNode::Op(SdfOp::Displace(child, noise))));
         }
         other => return Err(format!("unsupported <sdf type=\"{}\">", other)),

@@ -129,6 +129,18 @@ impl Pattern {
     }
 }
 
+/// `scale`/`octaves`/`lacunarity`/`gain` を安全な範囲に丸める（呼び出し側が警告する）: `scale` は (0, 1e6] の
+/// 有限値（他は 1）、`octaves` は 1..=10、`lacunarity` は [1, 8]（他は 2）、`gain` は [0, 1]（他は 0.5）。
+/// [`NoiseTexture::sanitized`] とパースのある `<sdf type="displace">`（`mitsuba::parse_sdf_node`）が共有する
+/// （`NoiseTexture` の色・空間・オフセットまでは要らない側のための、この 4 つだけの版）。
+pub fn sanitize_octave_params(scale: f64, octaves: u32, lacunarity: f64, gain: f64) -> (f64, u32, f64, f64) {
+    let scale = if scale.is_finite() && scale > 0.0 { scale.min(1e6) } else { 1.0 };
+    let octaves = octaves.clamp(1, 10);
+    let lacunarity = if lacunarity.is_finite() { lacunarity.clamp(1.0, 8.0) } else { 2.0 };
+    let gain = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.5 };
+    (scale, octaves, lacunarity, gain)
+}
+
 /// 3D ソリッドノイズのテクスチャ（画像の [`crate::texture::Texture`] とは別物。`Scene::noises` に置く）。
 #[derive(Clone, Copy, Debug)]
 pub struct NoiseTexture {
@@ -153,13 +165,7 @@ impl NoiseTexture {
     /// 不正な値は安全な範囲に丸める（呼び出し側が警告する）: `scale` は (0, 1e6] の有限値（他は 1）、`octaves` は 1..=10、
     /// `lacunarity` は [1, 8]（他は 2）、`gain` は [0, 1]（他は 0.5）、`strength` は有限値（他は 1）。
     pub fn sanitized(mut self) -> Self {
-        if !(self.scale.is_finite() && self.scale > 0.0) {
-            self.scale = 1.0;
-        }
-        self.scale = self.scale.min(1e6);
-        self.octaves = self.octaves.clamp(1, 10);
-        self.lacunarity = if self.lacunarity.is_finite() { self.lacunarity.clamp(1.0, 8.0) } else { 2.0 };
-        self.gain = if self.gain.is_finite() { self.gain.clamp(0.0, 1.0) } else { 0.5 };
+        (self.scale, self.octaves, self.lacunarity, self.gain) = sanitize_octave_params(self.scale, self.octaves, self.lacunarity, self.gain);
         if !self.strength.is_finite() {
             self.strength = 1.0;
         }
