@@ -592,20 +592,11 @@ impl App {
         };
         eprintln!("{}", self.message);
     }
-}
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let snap = self.snapshot();
-        let running = matches!(snap, Snap::Loading | Snap::Live { finished: false, .. });
-        if let Snap::Live { probe, config, .. } = &snap {
-            self.last = Some((probe.clone(), config.clone()));
-        }
-        if let Some(p) = self.job.path.clone() {
-            self.refresh_scene_list(&p);
-        }
-        // 走り始めたレンダーの config を B の欄へ反映（適用後は同じ値、シーンを開いたときはシーンの値）
-        if let (Snap::Live { config, .. }, false) = (&snap, self.opts_synced) {
+    /// 走り始めたレンダーの config を B の欄へ反映し（適用後は同じ値、シーンを開いたときはシーンの値）、
+    /// 一度だけ走る編集・適用フックを消化する。
+    fn sync_opts_from_snapshot(&mut self, snap: &Snap) {
+        if let (Snap::Live { config, .. }, false) = (snap, self.opts_synced) {
             self.active = Opts::of(config);
             self.edit = self.active;
             self.opts_synced = true;
@@ -617,7 +608,10 @@ impl eframe::App for App {
                 self.apply_opts();
             }
         }
-        // デノイズ済みプレビュー: 結果の受け取り → 間引いて別スレッドで起動
+    }
+
+    /// デノイズ済みプレビュー: 前回の結果の受け取り → 間引いて別スレッドで起動。
+    fn maybe_spawn_denoise(&mut self, snap: &Snap) {
         if let Some(d) = self.dn_slot.lock().unwrap().take() {
             self.dn_last_end = Some(Instant::now());
             self.dn_last_took = d.took;
@@ -625,7 +619,7 @@ impl eframe::App for App {
                 self.dn = Some(d);
             }
         }
-        if let (Snap::Live { probe, config, finished, .. }, true) = (&snap, self.show_dn && cfg!(feature = "oidn")) {
+        if let (Snap::Live { probe, config, finished, .. }, true) = (snap, self.show_dn && cfg!(feature = "oidn")) {
             let cur = probe.tiles().0;
             let have = self.dn.as_ref().map(|d| d.tiles);
             if cur > 0 && have != Some(cur) && !self.dn_busy.load(Ordering::Relaxed) {
@@ -649,7 +643,11 @@ impl eframe::App for App {
                 }
             }
         }
+    }
 
+    /// 検証用フック群（環境変数駆動）: スクリーンショット、A の値変更、シーンの順送り、中断、自動保存。
+    /// レンダー本体・表示ロジックには影響しない（テスト専用の副作用のみ）。
+    fn handle_test_hooks(&mut self, ctx: &egui::Context, snap: &Snap) {
         let finished_now = matches!(snap, Snap::Live { finished: true, .. });
         // 検証フック: スクリーンショット（要求 → 次のフレームで Event::Screenshot が届く）
         if let Some(path) = self.shot_path.clone() {
@@ -665,7 +663,7 @@ impl eframe::App for App {
                 eprintln!("[hook] screenshot {path}: {:?}", r.map_err(|e| e.to_string()));
                 self.shot_path = None;
             }
-        } else if let (Snap::Live { probe, .. }, Some((n, _))) = (&snap, self.shots.first()) {
+        } else if let (Snap::Live { probe, .. }, Some((n, _))) = (snap, self.shots.first()) {
             let cur = probe.tiles().0;
             let dn_ready = !(self.show_dn && finished_now) || self.dn_on_screen(cur);
             if cur >= *n && dn_ready {
@@ -675,7 +673,7 @@ impl eframe::App for App {
             }
         }
         // 検証フック（A）: 指定タイル数で view を変える。レンダーは触らない
-        if let (Snap::Live { probe, elapsed, .. }, true) = (&snap, self.view_hook.is_some()) {
+        if let (Snap::Live { probe, elapsed, .. }, true) = (snap, self.view_hook.is_some()) {
             let t = probe.tiles().0;
             if t >= self.view_hook_at {
                 let spec = self.view_hook.take().unwrap();
@@ -688,7 +686,7 @@ impl eframe::App for App {
         if !self.seq.is_empty() || self.seq_dir.is_some() {
             let idx = self.seq_next;
             let mut advance = false;
-            match &snap {
+            match snap {
                 Snap::Live { probe, config, finished, cancelled, .. } => {
                     if *finished && !*cancelled && !self.seq_saved {
                         if let Some(dir) = self.seq_dir.clone() {
@@ -728,7 +726,7 @@ impl eframe::App for App {
         }
 
         // 検証用フック
-        if let Snap::Live { probe, config, finished, .. } = &snap {
+        if let Snap::Live { probe, config, finished, .. } = snap {
             if let Some(n) = self.cancel_at_tiles {
                 if !finished && probe.tiles().0 >= n {
                     self.job.cancel();
@@ -749,9 +747,11 @@ impl eframe::App for App {
                 }
             }
         }
+    }
 
-        // 画像の更新: 元（生の蓄積 / デノイズ済み）か (トーンマップ, 露出) が変わったときだけテクスチャを作り直す
-        if let Snap::Live { probe, config, .. } = &snap {
+    /// 画像の更新: 元（生の蓄積 / デノイズ済み）か (トーンマップ, 露出) が変わったときだけテクスチャを作り直す。
+    fn refresh_texture(&mut self, ctx: &egui::Context, snap: &Snap) {
+        if let Snap::Live { probe, config, .. } = snap {
             let dn_now = if self.show_dn { self.dn.as_ref() } else { None };
             let src = match dn_now {
                 Some(d) => (1u8, d.id),
@@ -775,7 +775,10 @@ impl eframe::App for App {
                 self.shown_view = Some(view_key);
             }
         }
+    }
 
+    /// 上段パネル: シーンの選択・状態表示・保存欄。
+    fn draw_top_panel(&mut self, ctx: &egui::Context, snap: &Snap, running: bool) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("scene:");
@@ -890,7 +893,10 @@ impl eframe::App for App {
             };
             ui.weak(note);
         });
+    }
 
+    /// 左サイドパネル: A（表示・保存の後処理、即時反映）と B（やり直しが要る設定、Apply で反映）。
+    fn draw_options_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("opts").resizable(false).default_width(230.0).show(ctx, |ui| {
             ui.colored_label(egui::Color32::from_rgb(120, 200, 120), egui::RichText::new("View — applies instantly").strong());
             ui.weak("Re-displays the current accumulation. The render keeps running.");
@@ -991,7 +997,10 @@ impl eframe::App for App {
                 ui.colored_label(egui::Color32::LIGHT_RED, &self.opts_note);
             }
         });
+    }
 
+    /// アプリ内のシーンブラウザ（`self.browser` が `Some` の間だけ出す小ウィンドウ）。
+    fn draw_browser_window(&mut self, ctx: &egui::Context) {
         if let Some((dir, listing)) = &self.browser {
             let (mut close, mut goto, mut open, mut refresh) = (ctx.input(|i| i.key_pressed(egui::Key::Escape)), None, None, false);
             egui::Window::new("Open scene").collapsible(false).default_size([440.0, 420.0]).show(ctx, |ui| {
@@ -1043,7 +1052,10 @@ impl eframe::App for App {
                 self.browser = Some((dir, l));
             }
         }
+    }
 
+    /// 中央パネル: プレビュー画像（生 / デノイズ済み）とそのタイル進捗表示。
+    fn draw_central_panel(&mut self, ctx: &egui::Context, snap: &Snap) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(tex) = &self.texture else {
                 if matches!(snap, Snap::Idle) {
@@ -1091,6 +1103,29 @@ impl eframe::App for App {
                 });
             }
         });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let snap = self.snapshot();
+        let running = matches!(snap, Snap::Loading | Snap::Live { finished: false, .. });
+        if let Snap::Live { probe, config, .. } = &snap {
+            self.last = Some((probe.clone(), config.clone()));
+        }
+        if let Some(p) = self.job.path.clone() {
+            self.refresh_scene_list(&p);
+        }
+
+        self.sync_opts_from_snapshot(&snap);
+        self.maybe_spawn_denoise(&snap);
+        self.handle_test_hooks(ctx, &snap);
+        self.refresh_texture(ctx, &snap);
+
+        self.draw_top_panel(ctx, &snap, running);
+        self.draw_options_panel(ctx);
+        self.draw_browser_window(ctx);
+        self.draw_central_panel(ctx, &snap);
 
         // 実行中は約 10 Hz で覗く。終了後は入力があるときだけ再描画（自動保存フックの待ちを除く）
         if running || self.autosave.is_some() || !self.seq.is_empty() || !self.shots.is_empty() || self.shot_path.is_some() {
