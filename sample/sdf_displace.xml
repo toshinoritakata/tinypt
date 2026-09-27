@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SDF の表面をノイズで変位させるデモ（<sdf type="displace">。tinypt の独自拡張）。
+       左  : fbm で変位させた球（岩・小惑星風）
+       中央: 角丸の箱 − 球に turbulence
+       右  : perlin で波打たせたガラスのトーラス
+     変位はリプシッツ上界でマーチの歩幅を縮めるので、変位の無い SDF より数倍遅い。
+     使い方: tinypt --scene sample/sdf_displace.xml -o sdf_displace.png -->
+<scene version="3.0.0">
+  <integrator type="path"><integer name="max_depth" value="10"/><integer name="rr_depth" value="4"/></integrator>
+  <sampler type="independent"><integer name="sample_count" value="128"/></sampler>
+  <film type="hdrfilm"><integer name="width" value="960"/><integer name="height" value="540"/></film>
+  <sensor type="perspective">
+    <float name="fov" value="36"/><string name="fov_axis" value="y"/>
+    <transform name="to_world"><lookat origin="0, 3.2, 8.5" target="0, 0.9, 0" up="0, 1, 0"/></transform>
+  </sensor>
+
+  <emitter type="envmap"><string name="filename" value="env.exr"/><float name="scale" value="0.6"/></emitter>
+
+  <shape type="rectangle">
+    <transform name="to_world"><rotate x="1" angle="-90"/><scale x="8" y="5" z="1"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.55, 0.55, 0.5"/></bsdf>
+  </shape>
+
+  <!-- 左: fbm で変位した球（小惑星のような岩肌） -->
+  <shape type="sdf">
+    <sdf type="displace">
+      <string name="pattern" value="fbm"/><float name="amplitude" value="0.18"/><float name="scale" value="2.2"/><integer name="octaves" value="5"/>
+      <sdf type="sphere"><float name="radius" value="1.0"/></sdf>
+    </sdf>
+    <transform name="to_world"><translate x="-3.0" y="1.1" z="0"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.55, 0.5, 0.45"/></bsdf>
+  </shape>
+
+  <!-- 中央: 角丸の箱 − 球 -->
+  <shape type="sdf">
+    <sdf type="displace">
+      <string name="pattern" value="turbulence"/><float name="amplitude" value="0.07"/><float name="scale" value="3"/><integer name="octaves" value="4"/>
+    <sdf type="difference">
+      <sdf type="box"><vector name="half" x="0.8" y="0.8" z="0.8"/><float name="round" value="0.15"/></sdf>
+      <sdf type="sphere"><float name="radius" value="1.05"/><point name="center" x="0.2" y="0.3" z="0.6"/></sdf>
+    </sdf>
+    </sdf>
+    <transform name="to_world"><rotate y="1" angle="30"/><translate x="0" y="1.0" z="0"/></transform>
+    <bsdf type="diffuse"><rgb name="reflectance" value="0.7, 0.25, 0.2"/></bsdf>
+  </shape>
+
+  <!-- 右: ガラスのトーラス -->
+  <shape type="sdf">
+    <sdf type="displace">
+      <string name="pattern" value="perlin"/><float name="amplitude" value="0.03"/><float name="scale" value="7"/>
+      <sdf type="torus"><float name="major" value="0.9"/><float name="minor" value="0.35"/></sdf>
+    </sdf>
+    <transform name="to_world"><rotate x="1" angle="70"/><translate x="3.0" y="1.7" z="0.3"/></transform>
+    <bsdf type="dielectric"><float name="int_ior" value="1.5"/></bsdf>
+  </shape>
+</scene>

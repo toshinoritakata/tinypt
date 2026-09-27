@@ -508,6 +508,11 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `sample/spotlight.xml` | スポットライト 2 灯 + 薄い霧。光の円錐と球・箱の影。光源は写らない ([詳細](#デルタ光源)) |
 | `sample/shader.xml` | シェーダーの式: 粗さをノイズで変調した金属・`mix` で塗った球・バンプ + ノーマルの重ね掛け・画像 × ノイズの床 ([詳細](#シェーダーの式-テクスチャの合成とパラメータごとのテクスチャ)) |
 | `sample/motion.xml` | モーションブラー: 静止した箱・回転する箱・横切りながら回る箱・変形するボール ([詳細](#モーションブラー)) |
+| `sample/sdf.xml` | SDF (陰関数曲面): スムーズ結合のブロブ・角丸の箱 − 球・ガラスのトーラス |
+| `sample/sdf_noise.xml` | SDF にノイズテクスチャ: 粗さをノイズで変えた金属のブロブ・2 色をノイズで混ぜた箱 |
+| `sample/sdf_displace.xml` | SDF の表面をノイズで変位 (`<sdf type="displace">`): 岩のような球・turbulence の箱・波打つガラスのトーラス。変位の無い SDF より数倍遅い |
+| `sample/sdf_motion.xml` | SDF のモーションブラー: ブロブの一部だけが動く (`center_end`)・箱全体が動く (`to_world_end`) |
+| `sample/hair.xml` | 細いチューブ 2 万本の毛 (約 190 万三角形) のストレステスト。**OBJ の生成が必要** (`python3 tools/gen_hair.py`) |
 | `sample/fog.xml` | 天井のスリットから差し込む光がつくるゴッドレイ (光の筋)。部屋の中を霧 (`<medium>`) で満たす ([詳細](#参加媒質)) |
 | `sample/highpoly.xml` | 高ポリゴン検証シーン (約 100 万三角形)。**OBJ の生成が必要** ([下記](#高ポリゴン検証シーン)) |
 | `sample/sponza.xml` | Crytek Sponza (262,267 三角形)。**モデルの取得が必要** ([下記](#外部ベンチマークモデル-sponza--rungholt)) |
