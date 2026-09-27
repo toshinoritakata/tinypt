@@ -7,7 +7,7 @@
 //! ## 対応要素
 //! - `sensor type="perspective"`: `fov` / `fov_axis` / `to_world`(`lookat`) / `aperture_radius` / `focus_distance` / `shutter_open` / `shutter_close` / `shutter_angle`（独自拡張、度。`close = open + angle/360`）
 //! - `shape type="sphere"`: `center` / `radius`
-//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。`to_world_end`（モーションブラー）対応。各プリミティブは `center_end`（カプセルは `a_end` / `b_end`）で個別に動かせる（時刻で線形補間）。スフィアトレーシング、光源にはならない
+//! - `shape type="sdf"`: 直下の `<sdf>` 木（`sphere` / `box` / `torus` / `cylinder` / `capsule` と `union` / `intersection` / `difference` / `smooth_*`）+ `to_world`。`to_world_end`（モーションブラー）対応。`displace`（子の面を `perlin` / `fbm` / `turbulence` のノイズでずらす。リプシッツ定数でマーチの歩幅を割る）。各プリミティブは `center_end`（カプセルは `a_end` / `b_end`）で個別に動かせる（時刻で線形補間）。スフィアトレーシング、光源にはならない
 //! - `shape type="obj"`: `filename`（XML 相対）+ `to_world`（translate/rotate/scale/matrix）
 //! - `bsdf`: `diffuse` / `conductor` / `roughconductor`(ggx) / `dielectric` / `thindielectric`・`roughdielectric`(dielectric 扱い) / `twosided`(unwrap)。未知の型は警告して diffuse
 //! - `emitter type="area"`: `radiance`（shape に付随）
@@ -48,7 +48,7 @@ use std::sync::Arc;
 use crate::ray::Camera;
 use crate::scene::Scene;
 use crate::transform::Transform;
-use crate::sdf::{SdfId, SdfNode, SdfOp, SdfPrim, SdfPrimEnd, SdfShape, SdfTree};
+use crate::sdf::{SdfId, SdfNode, SdfNoise, SdfNoisePattern, SdfOp, SdfPrim, SdfPrimEnd, SdfShape, SdfTree};
 use crate::world::World;
 
 /// パース済み XML 要素（タグ名・属性・子要素）。
@@ -1013,6 +1013,51 @@ fn parse_sdf_node(el: &Element, tree: &mut SdfTree) -> Result<SdfId, String> {
                 acc = tree.push(SdfNode::Op(op));
             }
             return Ok(acc);
+        }
+        "displace" => {
+            // 子の面をノイズ場でずらす（独自拡張）。`f = f_child + amplitude · n(p · scale + offset)`。名前と既定値は
+            // `<texture type="noise">` に揃える（pattern / scale / octaves / lacunarity / gain）
+            let kids: Vec<&Element> = el.children.iter().filter(|c| c.tag == "sdf").collect();
+            if kids.len() != 1 {
+                return Err(format!("<sdf type=\"displace\"> needs exactly 1 child <sdf> (found {})", kids.len()));
+            }
+            let pattern = match el.string("pattern") {
+                None | Some("fbm") => SdfNoisePattern::Fbm,
+                Some("perlin") => SdfNoisePattern::Perlin,
+                Some("turbulence") => SdfNoisePattern::Turbulence,
+                Some(s) => {
+                    warn(&format!("unknown displace pattern '{s}' (perlin | fbm | turbulence); using fbm"));
+                    SdfNoisePattern::Fbm
+                }
+            };
+            let amplitude = float("amplitude", 0.05);
+            if !amplitude.is_finite() {
+                return Err("<sdf type=\"displace\"> amplitude must be finite".to_string());
+            }
+            let offset = el.vector("offset").or_else(|| el.point("offset")).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+            if !finite(offset) {
+                return Err("<sdf type=\"displace\"> offset must be finite".to_string());
+            }
+            // 範囲の丸めは `NoiseTexture::sanitized` と同じ規則（scale は (0, 1e6]、octaves 1..10、lacunarity 1..8、gain 0..1）
+            let raw = NoiseTexture {
+                pattern: Pattern::Fbm,
+                scale: float("scale", 1.0),
+                octaves: el.int("octaves").map_or(4, |o| o.clamp(0, 1000) as u32),
+                lacunarity: float("lacunarity", 2.0),
+                gain: float("gain", 0.5),
+                strength: 1.0,
+                color0: Color::new(0.0, 0.0, 0.0),
+                color1: Color::new(1.0, 1.0, 1.0),
+                local: true,
+                offset: Vec3::new(0.0, 0.0, 0.0),
+            };
+            let fixed = raw.sanitized();
+            if (fixed.scale, fixed.octaves, fixed.lacunarity, fixed.gain) != (raw.scale, raw.octaves, raw.lacunarity, raw.gain) {
+                warn("displace parameter out of range (scale must be in (0, 1e6], octaves 1..10, lacunarity 1..8, gain 0..1); clamped");
+            }
+            let child = parse_sdf_node(kids[0], tree)?;
+            let noise = SdfNoise { pattern, amplitude, scale: fixed.scale, octaves: fixed.octaves, lacunarity: fixed.lacunarity, gain: fixed.gain, offset };
+            return Ok(tree.push(SdfNode::Op(SdfOp::Displace(child, noise))));
         }
         other => return Err(format!("unsupported <sdf type=\"{}\">", other)),
     };
@@ -3635,6 +3680,45 @@ mod tests {
             let t = s.world.sdfs()[0].tree();
             let p = Vec3::new(0.3, 0.2, 0.1);
             assert_eq!(t.eval_at(p, 1.0).to_bits(), t.eval_at(p, 0.0).to_bits(), "{bad} stays static");
+        }
+    }
+
+    #[test]
+    fn sdf_displace_parses_with_defaults_and_bad_input_warns() {
+        let shape = |inner: &str| format!(r#"<shape type="sdf">{inner}<bsdf type="diffuse"/></shape>"#);
+        // 既定値: fbm、amplitude 0.05、scale 1、octaves 4、lacunarity 2、gain 0.5
+        let (s, w) = sdf_scene(&shape(r#"<sdf type="displace"><sdf type="sphere"/></sdf>"#));
+        assert!(w.is_empty(), "{w:?}");
+        let t = s.world.sdfs()[0].tree();
+        assert_eq!(t.len(), 2);
+        assert!(t.lipschitz() > 1.0);
+        let p = Vec3::new(0.4, 0.9, 0.3);
+        let expect = p.len() - 1.0 + 0.05 * crate::noise::fbm(p, 4, 2.0, 0.5);
+        assert!((t.eval(p) - expect).abs() < 1e-12, "{} vs {}", t.eval(p), expect);
+        // 明示した値
+        let (s, w) = sdf_scene(&shape(
+            r#"<sdf type="displace"><string name="pattern" value="perlin"/><float name="amplitude" value="0.2"/><float name="scale" value="4"/>
+                 <vector name="offset" x="1" y="2" z="3"/><sdf type="sphere"/></sdf>"#,
+        ));
+        assert!(w.is_empty(), "{w:?}");
+        let t = s.world.sdfs()[0].tree();
+        let expect = p.len() - 1.0 + 0.2 * crate::noise::perlin(p * 4.0 + Vec3::new(1.0, 2.0, 3.0));
+        assert!((t.eval(p) - expect).abs() < 1e-12);
+        // 未知のパターンは警告して fbm、範囲外のパラメータは警告して丸める
+        let (s, w) = sdf_scene(&shape(r#"<sdf type="displace"><string name="pattern" value="marble"/><sdf type="sphere"/></sdf>"#));
+        assert!(w.iter().any(|m| m.contains("unknown displace pattern")), "{w:?}");
+        assert_eq!(s.world.sdfs().len(), 1);
+        let (_, w) = sdf_scene(&shape(r#"<sdf type="displace"><float name="scale" value="-3"/><integer name="octaves" value="99"/><sdf type="sphere"/></sdf>"#));
+        assert!(w.iter().any(|m| m.contains("clamped")), "{w:?}");
+        // 子が 0 個・2 個以上は警告してシェープごと飛ばす
+        for bad in [
+            r#"<sdf type="displace"></sdf>"#,
+            r#"<sdf type="displace"><sdf type="sphere"/><sdf type="sphere"/></sdf>"#,
+            r#"<sdf type="displace"><float name="amplitude" value="inf"/><sdf type="sphere"/></sdf>"#,
+        ] {
+            let (s, w) = sdf_scene(&shape(bad));
+            assert!(!w.is_empty(), "{bad}");
+            assert_eq!(s.world.sdfs().len(), 0, "{bad}: {w:?}");
         }
     }
 }

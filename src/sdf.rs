@@ -9,6 +9,7 @@
 
 use crate::geometry::{Aabb, Hit};
 use crate::math::Vec3;
+use crate::noise::{fbm, perlin, turbulence};
 use crate::ray::Ray;
 use crate::transform::{AnimatedTransform, Transform};
 
@@ -31,6 +32,71 @@ pub enum SdfPrim {
     Capsule { a: Vec3, b: Vec3, radius: f64 },
 }
 
+/// `displace` に使うノイズの種類（`noise.rs` の関数をそのまま使う）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdfNoisePattern {
+    /// Perlin ノイズ（[-1, 1]）
+    Perlin,
+    /// fBm（[-1, 1]）
+    Fbm,
+    /// 乱流（元は [0, 1]）。変位には **`2t − 1` に写して [-1, 1]** にして使う（`amplitude` が変位の最大値になり、
+    /// 平均がほぼ 0 = 形が全体として膨らみも縮みもしない。[0, 1] のままだと面が一様に押し出される）
+    Turbulence,
+}
+
+/// `Displace` のノイズ場のパラメータ。`f(p) = f_child(p) + amplitude · n(p · scale + offset)`。ノイズ場は
+/// **物体空間に固定**（時刻で動かない）。
+#[derive(Clone, Copy, Debug)]
+pub struct SdfNoise {
+    pub pattern: SdfNoisePattern,
+    pub amplitude: f64,
+    /// 空間周波数（座標に掛ける倍率）
+    pub scale: f64,
+    pub octaves: u32,
+    pub lacunarity: f64,
+    pub gain: f64,
+    /// 倍率をかけた後に足す
+    pub offset: Vec3,
+}
+
+/// Perlin ノイズの勾配の大きさ `|∇perlin|` の上界。**実測**（f64・乱択 3000 万点で最大 3.13、そこから山登りで
+/// 最大 3.27）に約 22% の余裕を付けた値。解析的な上界ではない（改良 Perlin の補間の勾配は導けるが、`clamp` と
+/// 格子ごとのハッシュ選択を含めた厳密な上界は得ていない）ので、余裕はこの実測の不確かさのためのもの。
+const PERLIN_LIPSCHITZ: f64 = 4.0;
+
+impl SdfNoise {
+    /// ノイズ値 `n(p · scale + offset)`（[-1, 1]）。
+    fn value(&self, p: Vec3) -> f64 {
+        let q = p * self.scale + self.offset;
+        match self.pattern {
+            SdfNoisePattern::Perlin => perlin(q),
+            SdfNoisePattern::Fbm => fbm(q, self.octaves, self.lacunarity, self.gain),
+            SdfNoisePattern::Turbulence => 2.0 * turbulence(q, self.octaves, self.lacunarity, self.gain) - 1.0,
+        }
+    }
+
+    /// 変位項 `amplitude · n(p · scale + offset)` の勾配の大きさの上界（物体空間）。
+    /// fBm は `Σ g^i·λ^i·L_perlin / Σ g^i`（オクターブ `i`、正規化の分母つき）。乱流は `|perlin|` の和で
+    /// リプシッツ定数は同じ、`2t − 1` で 2 倍。
+    fn lipschitz(&self) -> f64 {
+        let octave_sum = |ratio: f64| -> f64 {
+            let (mut sum, mut r) = (0.0, 1.0);
+            for _ in 0..self.octaves.max(1) {
+                sum += r;
+                r *= ratio;
+            }
+            sum
+        };
+        let multi = octave_sum(self.gain * self.lacunarity) / octave_sum(self.gain);
+        let noise = match self.pattern {
+            SdfNoisePattern::Perlin => PERLIN_LIPSCHITZ,
+            SdfNoisePattern::Fbm => PERLIN_LIPSCHITZ * multi,
+            SdfNoisePattern::Turbulence => 2.0 * PERLIN_LIPSCHITZ * multi,
+        };
+        self.amplitude.abs() * self.scale * noise
+    }
+}
+
 /// CSG 演算。`SmoothUnion` / `SmoothIntersect` / `SmoothSubtract` は Inigo Quilez の多項式 smin を使う
 /// （`k` は滑らかさの半径。`k = 0` は対応する非平滑演算と同じ）。
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +108,9 @@ pub enum SdfOp {
     SmoothUnion(SdfId, SdfId, f64),
     SmoothIntersect(SdfId, SdfId, f64),
     SmoothSubtract(SdfId, SdfId, f64),
+    /// 子の面をノイズ場でずらす（`f_child + amplitude · n`）。`|∇f|` が 1 を超えるので、木のリプシッツ定数
+    /// （[`SdfTree::lipschitz`]）でレイマーチの歩幅を割る必要がある
+    Displace(SdfId, SdfNoise),
 }
 
 /// 木のノード: プリミティブか演算のどちらか。
@@ -79,6 +148,7 @@ fn children_of(node: &SdfNode) -> [Option<SdfId>; 2] {
         SdfNode::Op(op) => match *op {
             SdfOp::Union(a, b) | SdfOp::Intersect(a, b) | SdfOp::Subtract(a, b) => [Some(a), Some(b)],
             SdfOp::SmoothUnion(a, b, _) | SdfOp::SmoothIntersect(a, b, _) | SdfOp::SmoothSubtract(a, b, _) => [Some(a), Some(b)],
+            SdfOp::Displace(a, _) => [Some(a), None],
         },
     }
 }
@@ -172,6 +242,7 @@ impl SdfTree {
                 SdfOp::SmoothUnion(a, b, k) => smin(buf[a as usize], buf[b as usize], k),
                 SdfOp::SmoothIntersect(a, b, k) => -smin(-buf[a as usize], -buf[b as usize], k),
                 SdfOp::SmoothSubtract(a, b, k) => -smin(-buf[a as usize], buf[b as usize], k),
+                SdfOp::Displace(a, noise) => buf[a as usize] + noise.amplitude * noise.value(p),
             },
         }
     }
@@ -203,11 +274,35 @@ impl SdfTree {
                     SdfOp::SmoothUnion(a, b, k) => grow(memo[a as usize].union(memo[b as usize]), k),
                     SdfOp::SmoothIntersect(a, b, k) => grow(intersect_aabb(memo[a as usize], memo[b as usize]), k),
                     SdfOp::SmoothSubtract(a, _, k) => grow(memo[a as usize], k),
+                    // ノイズ値は [-1, 1] なので、面は子の面から高々 |amplitude| ずれる
+                    SdfOp::Displace(a, noise) => grow(memo[a as usize], noise.amplitude.abs()),
                 },
             };
             memo.push(bb);
         }
         memo[root as usize]
+    }
+
+    /// 木全体のリプシッツ定数 `L`（`|f(p) − f(q)| ≤ L·|p − q|`）の上界。下から順に求める:
+    /// プリミティブは 1、和・積・差は子の最大、平滑演算も子の最大（IQ の多項式 smin は 1 を保つと仮定）、
+    /// `Displace` は `L_child + |amplitude|·scale·L_noise`。**`Displace` が無い木はちょうど 1.0** を返す
+    /// （呼び出し側はそのとき従来と同じ演算を通る）。
+    pub fn lipschitz(&self) -> f64 {
+        let mut lip: Vec<f64> = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let l = match node {
+                SdfNode::Prim(_) => 1.0,
+                SdfNode::Op(op) => match *op {
+                    SdfOp::Union(a, b) | SdfOp::Intersect(a, b) | SdfOp::Subtract(a, b) => lip[a as usize].max(lip[b as usize]),
+                    SdfOp::SmoothUnion(a, b, _) | SdfOp::SmoothIntersect(a, b, _) | SdfOp::SmoothSubtract(a, b, _) => {
+                        lip[a as usize].max(lip[b as usize])
+                    }
+                    SdfOp::Displace(a, noise) => lip[a as usize] + noise.lipschitz(),
+                },
+            };
+            lip.push(l);
+        }
+        lip.last().copied().unwrap_or(1.0)
     }
 
     /// 勾配（外向き法線、正規化前）を四面体中心差分で求める（4 回評価。Inigo Quilez の手法）。
@@ -342,6 +437,8 @@ fn prim_bounds(prim: &SdfPrim) -> Aabb {
 
 /// スフィアトレーシングの最大歩数（超えたらミス扱い）。
 const MAX_STEPS: usize = 512;
+/// `Displace` を含む形状（L > 1）で歩数を `MAX_STEPS · L` に増やすときの上限。
+const MAX_STEPS_CAP: usize = 8192;
 /// 収束判定 `|f| < eps_obj` の、バウンディングボックス対角に対する比。
 const EPS_REL: f64 = 1e-6;
 /// 勾配（法線）の差分幅の、バウンディングボックス対角に対する比。
@@ -367,6 +464,8 @@ pub struct SdfShape {
     world_bounds: Aabb,
     /// シャッター閉の変換への補間（`None` なら静止で、従来と同じ経路・同じ演算を通る）
     anim: Option<AnimatedTransform>,
+    /// 木のリプシッツ定数（`Displace` が無ければちょうど 1.0）。レイマーチの歩幅を割る
+    lipschitz: f64,
     /// 収束幅（物体空間）
     eps_obj: f64,
     /// 法線の差分幅（物体空間）
@@ -383,9 +482,10 @@ impl SdfShape {
         }
         let diag = (b.max - b.min).len().max(1e-9);
         let eps_obj = EPS_REL * diag;
-        let obj_bounds = grow(b, ERR_BOX_EPS * eps_obj * 2.0);
+        let lipschitz = tree.lipschitz();
+        let obj_bounds = grow(b, ERR_BOX_EPS * eps_obj * 2.0 * lipschitz);
         let world_bounds = crate::world::box_world_bounds(obj_bounds, &xform);
-        Some(Self { tree, xform, mat_id, obj_bounds, world_bounds, anim: None, eps_obj, normal_h: (NORMAL_H_REL * diag).max(1e-9) })
+        Some(Self { tree, xform, mat_id, obj_bounds, world_bounds, anim: None, lipschitz, eps_obj, normal_h: (NORMAL_H_REL * diag).max(1e-9) })
     }
 
     pub fn tree(&self) -> &SdfTree {
@@ -467,9 +567,13 @@ impl SdfShape {
         let mut t = t_in.max(tmin);
         let t_end = t_out.min(tmax);
         let eps = self.eps_obj;
+        // 歩幅は |f| / (L·|d_obj|)。`Displace` が無い（L == 1）ときは割らず、従来と同じ `d_len` のまま
+        let step_len = if self.lipschitz == 1.0 { d_len } else { d_len * self.lipschitz };
+        // 歩幅が 1/L に縮むぶん、面に浅く近づくレイの収束にも L 倍の歩数が要る（L == 1 は従来どおり MAX_STEPS）
+        let max_steps = if self.lipschitz == 1.0 { MAX_STEPS } else { ((MAX_STEPS as f64 * self.lipschitz) as usize).min(MAX_STEPS_CAP) };
         // 直前のマーチ位置（t, f）。収束点の手前で、f は収束点と同じ符号（外側から始まれば正、内側から始まれば負）
         let mut prev: Option<(f64, f64)> = None;
-        for _ in 0..MAX_STEPS {
+        for _ in 0..max_steps {
             if t >= t_end {
                 return None;
             }
@@ -490,7 +594,7 @@ impl SdfShape {
                 continue;
             }
             prev = Some((t, f));
-            t += af / d_len;
+            t += af / step_len;
         }
         None
     }
@@ -536,7 +640,7 @@ impl SdfShape {
         // `offset_ray_origin` は `|n|·p_error` だけ法線方向へ押し出す。これは物体空間で少なくとも
         // ERR_BOX_EPS·eps_obj（= 4·eps_obj > eps_obj）の深さに相当し、反射・透過の再ヒットで
         // `|f| < eps_obj` に再び当たらない。
-        let b = ERR_BOX_EPS * self.eps_obj;
+        let b = ERR_BOX_EPS * self.eps_obj * self.lipschitz;
         let (p, p_error) = xf.apply_point_with_error(p_obj, Vec3::new(b, b, b));
         let n = xf.apply_normal(self.tree.normal_at(p_obj, self.normal_h, time));
         Hit {
@@ -1030,5 +1134,187 @@ mod tests {
             let h = shape.hit(Ray { o, d: Vec3::new(0.0, -1.0, 0.0), time }, 0.0, 1e9).expect("hit");
             assert!((h.p.y - (y + 0.8)).abs() < 1e-5 && (h.p.z - xf.apply_point(Vec3::new(2.0, 0.0, 0.0)).z).abs() < 1e-5, "{:?} at {time}", h.p);
         }
+    }
+
+    // ---- Displace（ノイズ変位） ----
+
+    fn noise(pattern: SdfNoisePattern, amplitude: f64, scale: f64) -> SdfNoise {
+        SdfNoise { pattern, amplitude, scale, octaves: 5, lacunarity: 2.0, gain: 0.5, offset: Vec3::new(0.3, -0.7, 1.1) }
+    }
+
+    fn displaced_sphere(n: SdfNoise) -> SdfTree {
+        let mut t = SdfTree::new();
+        let a = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(0.0, 0.0, 0.0), radius: 1.0 }));
+        t.push(SdfNode::Op(SdfOp::Displace(a, n)));
+        t
+    }
+
+    /// 木のリプシッツ定数: `Displace` が無ければちょうど 1.0、あれば `L_child + |A|·scale·L_noise`。
+    /// 乱択した点対で `|f(p) − f(q)| / |p − q|` が `L` を超えない（実測の余裕の確認）。
+    #[test]
+    fn lipschitz_is_exactly_one_without_displace_and_bounds_the_measured_slope_with_it() {
+        assert_eq!(blob_tree().lipschitz(), 1.0);
+        assert_eq!(SdfTree::new().lipschitz(), 1.0);
+        let mut rng = 987654321u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for pat in [SdfNoisePattern::Perlin, SdfNoisePattern::Fbm, SdfNoisePattern::Turbulence] {
+            let n = noise(pat, 0.1, 4.0);
+            let t = displaced_sphere(n);
+            let l = t.lipschitz();
+            assert!(l > 1.0 && (l - 1.0 - n.lipschitz()).abs() < 1e-12);
+            let mut worst: f64 = 0.0;
+            for _ in 0..200_000 {
+                let p = Vec3::new(next() * 4.0 - 2.0, next() * 4.0 - 2.0, next() * 4.0 - 2.0);
+                let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5).norm() * 1e-4;
+                worst = worst.max((t.eval(p + d) - t.eval(p)).abs() / d.len());
+            }
+            assert!(worst <= l, "{pat:?}: measured slope {worst} exceeds L = {l}");
+            assert!(worst > 1.0, "{pat:?}: displacement should steepen the field (slope {worst})");
+        }
+        // 演算子は子の最大、ネストした Displace は足し合わせ
+        let mut t = displaced_sphere(noise(SdfNoisePattern::Perlin, 0.1, 2.0));
+        let l1 = t.lipschitz();
+        let s2 = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(3.0, 0.0, 0.0), radius: 1.0 }));
+        let u = t.push(SdfNode::Op(SdfOp::SmoothUnion(1, s2, 0.2)));
+        assert_eq!(t.lipschitz(), l1);
+        t.push(SdfNode::Op(SdfOp::Displace(u, noise(SdfNoisePattern::Perlin, 0.05, 8.0))));
+        assert!((t.lipschitz() - (l1 + 0.05 * 8.0 * PERLIN_LIPSCHITZ)).abs() < 1e-12);
+    }
+
+    /// 密なレイマーチ（小さな固定歩幅 + 二分法）との照合: 最初の根が一致し、取りこぼしが無い。
+    #[test]
+    fn displaced_sphere_hit_agrees_with_a_dense_march() {
+        for (pat, amp, scale) in [(SdfNoisePattern::Fbm, 0.15, 3.0), (SdfNoisePattern::Perlin, 0.1, 5.0), (SdfNoisePattern::Turbulence, 0.12, 4.0)] {
+            let tree = displaced_sphere(noise(pat, amp, scale));
+            let shape = SdfShape::new(tree.clone(), Transform::identity(), 0).unwrap();
+            let (mut both, mut hits) = (0, 0);
+            for i in 0..300 {
+                let a = i as f64 * 0.731;
+                let o = Vec3::new(4.5 * a.cos(), 2.0 * (a * 1.7).sin(), 4.5 * a.sin());
+                let target = Vec3::new((a * 2.3).sin(), (a * 1.1).cos(), (a * 0.7).sin()) * 1.1;
+                let r = ray(o, target - o);
+                // 参照: 0..12 を 1e-3 刻みで走査し、符号が外→内に変わる最初の区間を二分法で詰める
+                let f = |t: f64| tree.eval(r.at(t));
+                let mut reference = None;
+                let mut t = 0.0;
+                while t < 12.0 {
+                    if f(t) > 0.0 && f(t + 1e-3) <= 0.0 {
+                        let (mut lo, mut hi) = (t, t + 1e-3);
+                        for _ in 0..50 {
+                            let mid = 0.5 * (lo + hi);
+                            if f(mid) > 0.0 { lo = mid } else { hi = mid }
+                        }
+                        reference = Some(0.5 * (lo + hi));
+                        break;
+                    }
+                    t += 1e-3;
+                }
+                let got = shape.hit(r, 0.0, 1e9).map(|h| h.t);
+                match (got, reference) {
+                    (Some(g), Some(e)) => {
+                        both += 1;
+                        assert!((g - e).abs() < 1e-4, "{pat:?} ray {i}: t {g} vs dense march {e}");
+                    }
+                    (None, Some(e)) => panic!("{pat:?} ray {i}: missed a hit the dense march found at t = {e}"),
+                    (Some(g), None) => panic!("{pat:?} ray {i}: hit at t = {g} that the dense march did not find"),
+                    (None, None) => {}
+                }
+                hits += got.is_some() as usize;
+            }
+            assert!(both > 100 && hits == both, "{pat:?}: {both} agreed hits out of {hits}");
+        }
+    }
+
+    #[test]
+    fn displaced_bounds_contain_the_surface_and_everything_outside_is_positive() {
+        for pat in [SdfNoisePattern::Perlin, SdfNoisePattern::Fbm, SdfNoisePattern::Turbulence] {
+            let t = displaced_sphere(noise(pat, 0.2, 3.0));
+            let bb = t.bounds();
+            let inside = |p: Vec3| p.x >= bb.min.x && p.x <= bb.max.x && p.y >= bb.min.y && p.y <= bb.max.y && p.z >= bb.min.z && p.z <= bb.max.z;
+            let l = t.lipschitz();
+            let mut n = 0;
+            for i in 0..3000 {
+                let a = i as f64;
+                let mut p = Vec3::new((a * 0.731).sin(), (a * 1.913).cos(), (a * 0.377).sin()) * 1.6;
+                // 表面へ寄せる（勾配は最大 L なので f/L ずつ進めば行き過ぎない）
+                for _ in 0..600 {
+                    p = p - t.normal(p, 1e-6) * (t.eval(p) / l);
+                }
+                if t.eval(p).abs() < 1e-6 {
+                    n += 1;
+                    assert!(inside(p), "{pat:?}: surface point {p:?} outside {bb:?}");
+                }
+            }
+            assert!(n > 100, "{pat:?}: too few surface samples ({n})");
+            // 箱の外は面の外側（f > 0）
+            for i in 0..2000 {
+                let a = i as f64;
+                let p = Vec3::new((a * 0.71).sin(), (a * 1.31).cos(), (a * 0.53).sin()) * 3.0;
+                if !inside(p) {
+                    assert!(t.eval(p) > 0.0, "{pat:?}: {p:?} outside the bounds but f <= 0");
+                }
+            }
+        }
+    }
+
+    /// 反射・透過の再ヒットが無い（変位した面、恒等・非一様スケールの両方）。
+    #[test]
+    fn displaced_surface_has_no_self_hit() {
+        let tree = displaced_sphere(noise(SdfNoisePattern::Fbm, 0.12, 4.0));
+        for xf in [Transform::identity(), Transform::scale(Vec3::new(2.0, 0.6, 1.0))] {
+            let shape = SdfShape::new(tree.clone(), xf, 0).unwrap();
+            let center = xf.apply_point(Vec3::new(0.0, 0.0, 0.0));
+            let (mut refl, mut trans) = (0, 0);
+            for i in 0..300 {
+                let a = i as f64 * 0.53;
+                let o = center + Vec3::new(a.cos() * 6.0, (a * 0.7).sin() * 3.0, a.sin() * 6.0);
+                let r = ray(o, center - o);
+                let Some(h) = shape.hit(r, 0.0, 1e9) else { continue };
+                let refl_d = h.ng * 2.0 * (-r.d).dot(h.ng) + r.d;
+                let ro = offset_ray_origin(h.p, h.p_error, h.ng, refl_d);
+                if shape.hit(Ray { o: ro, d: refl_d.norm(), time: 0.0 }, 0.0, 1e9).is_some_and(|h2| h2.t < 1e-3) {
+                    panic!("reflected ray re-hit its own surface immediately (i={i})");
+                }
+                refl += 1;
+                let ro = offset_ray_origin(h.p, h.p_error, h.ng, r.d);
+                let h2 = shape.hit(Ray { o: ro, d: r.d, time: 0.0 }, 0.0, 1e9).expect("transmitted ray must exit");
+                assert!((h2.p - h.p).dot(r.d) > 0.0 && h2.ng.dot(r.d) > -1e-6, "transmitted ray self-hit (i={i})");
+                trans += 1;
+            }
+            assert!(refl > 100 && trans == refl);
+        }
+    }
+
+    /// ノイズ場は物体空間に固定: 形状ごと動かしても、物体空間で見た面は時刻によらず同じ。子の動きも通る。
+    #[test]
+    fn displace_noise_is_fixed_in_object_space_and_composes_with_motion() {
+        let mut shape = SdfShape::new(displaced_sphere(noise(SdfNoisePattern::Fbm, 0.1, 3.0)), Transform::identity(), 0).unwrap();
+        assert!(shape.set_end_transform(Transform::translate(Vec3::new(5.0, 0.0, 0.0))));
+        for k in 0..20 {
+            let a = k as f64 * 0.9;
+            let dir_obj = Vec3::new(a.cos(), 0.3 * a.sin(), a.sin()).norm();
+            let mut hits = Vec::new();
+            for time in [0.0, 0.5, 1.0] {
+                let xf = shape.transform_at(time);
+                let o = xf.apply_point(dir_obj * 5.0);
+                let h = shape.hit(Ray { o, d: -dir_obj, time }, 0.0, 1e9).expect("hit");
+                hits.push(xf.apply_point_inv(h.p));
+            }
+            assert!((hits[0] - hits[1]).len() < 1e-6 && (hits[0] - hits[2]).len() < 1e-6, "{hits:?}");
+        }
+        // 動くプリミティブの子: 時刻で位置が変わる（面は依然として L 倍の歩幅で正しく見つかる）
+        let mut t = SdfTree::new();
+        let s = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(0.0, 0.0, 0.0), radius: 1.0 }));
+        assert!(t.set_prim_end(s, SdfPrimEnd::Center(Vec3::new(0.0, 3.0, 0.0))));
+        t.push(SdfNode::Op(SdfOp::Displace(s, noise(SdfNoisePattern::Perlin, 0.05, 4.0))));
+        let moving = SdfShape::new(t, Transform::identity(), 0).unwrap();
+        let down = Vec3::new(0.0, -1.0, 0.0);
+        let top = |time: f64| moving.hit(Ray { o: Vec3::new(0.0, 10.0, 0.0), d: down, time }, 0.0, 1e9).unwrap().p.y;
+        assert!((top(0.0) - 1.0).abs() < 0.06 && (top(1.0) - 4.0).abs() < 0.06, "{} {}", top(0.0), top(1.0));
     }
 }
