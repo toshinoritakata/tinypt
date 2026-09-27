@@ -169,8 +169,8 @@ pub fn radiance(
                 // ミス: 背景（環境マップまたは空）からの寄与を加算
                 let mut contrib = path_throughput.hadamard(background(ray.d, env));
                 // 非デルタ散乱後なら環境マップ PDF との MIS 重みを適用
-                if env.is_some() && last_non_delta {
-                    let pdf_env = env.unwrap().pdf(ray.d);
+                if last_non_delta && let Some(env) = env {
+                    let pdf_env = env.pdf(ray.d);
                     let w = mis_weight(last_bsdf_pdf, pdf_env);
                     contrib = contrib * w;
                 }
@@ -317,6 +317,7 @@ fn perturb_shading_normal(world: &World, shaders: &ShaderSet, map_id: MapId, hit
 /// Russian Roulette の生存確率: `max(throughput)·η²` を [0.05, 0.95] にクランプする。
 /// `eta_scale` はこの頂点までのパス上の透過の相対屈折率 η_t/η_i の積（Mitsuba 3 の path 積分器と同じ η² 補償。
 /// 下限 0.05 は tinypt 独自で、極端に小さい確率で生き残った経路の重みの爆発を抑える）。
+#[allow(clippy::manual_clamp)] // min/max maps a NaN throughput to 0.95 (path survives); clamp would propagate the NaN into the survival test
 fn rr_survival_probability(throughput_max: f64, eta_scale: f64) -> f64 {
     (throughput_max * eta_scale * eta_scale).min(0.95).max(0.05)
 }
@@ -394,6 +395,7 @@ fn is_black(c: Color) -> bool {
 /// `occluded(shadow, tmax)` はシャドウレイの遮蔽判定（any-hit。通常は `world.occluded`）。
 /// 光源自身（同じプリミティブ）への交差は、呼び出し側があらかじめ除外して渡す前提
 /// （`World::occluded` の `skip` 引数。理由は下のコメント参照）。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(dist > 0.0)` also catches a NaN distance (the shading point sits on the light); `dist <= 0.0` would not
 fn nee_area_light(
     occluded: impl Fn(Ray, f64) -> bool,
     mat: &Material,
@@ -493,6 +495,7 @@ fn nee_environment_phase(
 }
 
 /// 媒質散乱点 `p` からの面光源 NEE。[`nee_area_light`] との違いは [`nee_environment_phase`] と同じ。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(dist > 0.0)` also catches a NaN distance; `dist <= 0.0` would not
 fn nee_area_light_phase(
     occluded: impl Fn(Ray, f64) -> bool,
     med: &Medium,
@@ -539,6 +542,7 @@ fn nee_area_light_phase(
 /// 表面 NEE と同じく、`ng` の裏向き・cos ≤ 0 は寄与 0、シャドウレイの始点は面の誤差の箱の外へずらす。
 /// 光源には幾何が無いので、遮蔽判定に光源自身の除外（skip）は無い。
 /// 終点は、**ずらした始点から**光源位置までの距離を測り直して決める（始点がずれるので `distance` を流用しない）。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(len > 0.0)` also catches a NaN length (light at the shifted origin); `len <= 0.0` would not
 fn nee_delta_light(
     occluded: impl Fn(Ray, f64) -> bool,
     light: &DeltaLight,

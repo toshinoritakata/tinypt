@@ -20,7 +20,7 @@ use std::time::Instant;
 use crossbeam::scope;
 use crossbeam_channel as chan;
 
-use crate::checkpoint::{load_checkpoint, save_checkpoint};
+use crate::checkpoint::{load_checkpoint, save_checkpoint, CheckpointState};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
 use crate::env::EnvMap;
@@ -138,8 +138,8 @@ fn build_tasks(config: &RenderConfig) -> Vec<Task> {
         }
     }
     if config.morton_enabled {
-        let tiles_x = (w + config.tile - 1) / config.tile;
-        let tiles_y = (h + config.tile - 1) / config.tile;
+        let tiles_x = w.div_ceil(config.tile);
+        let tiles_y = h.div_ceil(config.tile);
         tasks.sort_by_key(|t| morton2(t.x0 / config.tile, t.y0 / config.tile, tiles_x, tiles_y));
     }
     for (i, t) in tasks.iter_mut().enumerate() {
@@ -246,10 +246,10 @@ fn sample_pixel(
 /// バッファ長が画素数と一致し、`next_id` がタスク数以内のときだけ `Some` を返す。
 /// `None` の場合、呼び出し側はレジューム位置を 0 のまま（最初から）レンダーする。
 fn validate_resume(
-    loaded: Option<(usize, Vec<Color>, Vec<f64>)>,
+    loaded: Option<CheckpointState>,
     n_pixels: usize,
     n_tasks: usize,
-) -> Option<(usize, Vec<Color>, Vec<f64>)> {
+) -> Option<CheckpointState> {
     let (next_id, acc, acc_w) = loaded?;
     if acc.len() != n_pixels || acc_w.len() != n_pixels || next_id > n_tasks {
         return None;
@@ -449,7 +449,7 @@ fn render_impl(
                     last_print = now;
                 }
 
-                if ckpt_enabled && (next_id % config.checkpoint_every_tasks == 0) {
+                if ckpt_enabled && next_id.is_multiple_of(config.checkpoint_every_tasks) {
                     if let Err(e) = save_checkpoint(ckpt_file, config.scene_hash, w, h, next_id, &out.acc, &out.acc_w)
                     {
                         eprintln!("Checkpoint save failed: {}", e);
@@ -465,10 +465,11 @@ fn render_impl(
     .unwrap();
 
     // Final checkpoint（中断されたレンダーは未完なので保存しない）
-    if ckpt_enabled && !probe.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
-        if let Err(e) = save_checkpoint(ckpt_file, config.scene_hash, w, h, tid, &out.acc, &out.acc_w) {
-            eprintln!("Final checkpoint save failed: {}", e);
-        }
+    if ckpt_enabled
+        && !probe.is_some_and(|p| p.cancel.load(Ordering::Relaxed))
+        && let Err(e) = save_checkpoint(ckpt_file, config.scene_hash, w, h, tid, &out.acc, &out.acc_w)
+    {
+        eprintln!("Final checkpoint save failed: {}", e);
     }
 
     Ok(out)

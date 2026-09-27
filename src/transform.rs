@@ -234,6 +234,7 @@ const POLAR_TOL: f64 = 1e-14;
 
 /// 線形部 `A = R·S` の極分解（`R` は回転行列、`S` は対称な伸縮）。`R ← (R + R⁻ᵀ)/2` を収束まで繰り返す。
 /// `A` が特異・非有限・鏡像（`det ≤ 0`）、または収束しなければ `None`（呼び出し側は静止扱いに落とす）。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(x > 0.0)` also catches a NaN determinant (falls back to "not decomposable"); `x <= 0.0` would not
 fn polar_decompose(a: &M3) -> Option<(M3, M3)> {
     if a.iter().flatten().any(|x| !x.is_finite()) {
         return None;
@@ -377,6 +378,7 @@ impl AnimatedTransform {
 
     /// 時刻 `time` の変換。`time ≤ 0` は開、`time ≥ 1` は閉の変換そのもの。それ以外は補間して再合成する。
     #[inline]
+    #[allow(clippy::needless_range_loop)] // 3x3 の成分ごとの補間は行・列の添字そのものが意味を持つので、添字形のほうが読みやすい
     pub fn at(&self, time: f64) -> Transform {
         if time <= 0.0 {
             return self.start;

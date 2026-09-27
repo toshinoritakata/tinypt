@@ -189,15 +189,15 @@ impl Mesh {
         } else {
             self.bvh.hit_filtered(self.source(), r, tmin, tmax, |ti, u, v| self.alpha_opaque(ti, u, v))?
         };
-        if !self.tri_vn.is_empty() {
-            if let Some(ns) = self.shading_normal(h.prim_id, h.bary, h.ng) {
-                h.ns = ns;
-            }
+        if !self.tri_vn.is_empty()
+            && let Some(ns) = self.shading_normal(h.prim_id, h.bary, h.ng)
+        {
+            h.ns = ns;
         }
-        if !self.tri_uv.is_empty() {
-            if let Some(uv) = self.texture_coords(h.prim_id, h.bary) {
-                h.uv = uv;
-            }
+        if !self.tri_uv.is_empty()
+            && let Some(uv) = self.texture_coords(h.prim_id, h.bary)
+        {
+            h.uv = uv;
         }
         Some(h)
     }
@@ -281,6 +281,7 @@ impl Mesh {
 
     /// 三角形 `tri_id` の重心座標 `(b1, b2)` での補間法線。頂点法線が無い三角形や、
     /// 補間結果が退化した（長さ 0 の）場合は `None`（= 面法線のまま）。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(len > 0.0)` also catches a NaN length (degenerate interpolation); `len <= 0.0` would not
     fn shading_normal(&self, tri_id: usize, bary: (f64, f64), ng: Vec3) -> Option<Vec3> {
         let idx = *self.tri_vn.get(tri_id)?;
         if idx[0] == NO_NORMAL {
@@ -702,6 +703,7 @@ impl World {
     /// 内部ノードの 2 つの子を選ぶ確率 `(左, 右)`（子の重要度の比）。両方 0 なら `(0, 0)`。
     /// **`sample_light`（`bvh_select`）と `light_pdf`（`bvh_prob`）の両方がこの関数だけで確率を作る**。
     #[inline]
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(sum > 0.0)` also catches a NaN importance sum; `sum <= 0.0` would not
     fn bvh_child_probs(&self, node: &LightNode, p: Vec3) -> (f64, f64) {
         let il = self.node_importance(&self.light_bvh.nodes[node.left as usize], p);
         let ir = self.node_importance(&self.light_bvh.nodes[node.right as usize], p);
@@ -714,6 +716,7 @@ impl World {
 
     /// 光源 BVH で光源を選ぶ。`u` ∈ [0,1) 1 個を各段で使い回す（子を選んだら `u` を選んだ区間に写して一様に戻す: 確率的な分割）。
     /// 返り値は `(光源の添字, 選択確率)`。選択確率は根から葉までの各段の確率の**根側から順の積**。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(x > 0.0)` also catches NaN importance/probability; `x <= 0.0` would not
     fn bvh_select(&self, mut u: f64, p: Vec3) -> Option<(usize, f64)> {
         let nodes = &self.light_bvh.nodes;
         if nodes.is_empty() {
@@ -775,6 +778,12 @@ impl World {
             prob *= if is_left { pl } else { pr };
         }
         prob
+    }
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1093,13 +1102,13 @@ impl World {
                     TlasLeaf::Sphere(idx) => {
                         // 同値タイで勝てる（添字が小さい）ときだけ、区間の上端をわずかに広げて t == closest の交差を拾う
                         let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
-                        if let Some(mut h) = self.sphere_hit(idx, r, tmin, hi) {
-                            if h.t < c || (h.t == c && k < best_k) {
-                                h.prim_id = idx;
-                                closest.set(h.t);
-                                best = Some(h);
-                                best_k = k;
-                            }
+                        if let Some(mut h) = self.sphere_hit(idx, r, tmin, hi)
+                            && (h.t < c || (h.t == c && k < best_k))
+                        {
+                            h.prim_id = idx;
+                            closest.set(h.t);
+                            best = Some(h);
+                            best_k = k;
                         }
                     }
                 }
@@ -1152,10 +1161,7 @@ impl World {
     #[inline(always)]
     fn hit_instance(&self, inst_id: usize, r: Ray, inv_d: Vec3, tmin: f64, closest: f64, tie_ok: bool) -> Option<Hit> {
         let inst = &self.instances[inst_id];
-        let mesh = match self.meshes.get(inst.mesh_id) {
-            Some(m) => m,
-            None => return None,
-        };
+        let mesh = self.meshes.get(inst.mesh_id)?;
         // ワールド空間の境界ボックスで先に棄却する（物体空間への変換と誤差計算を省く）。箱は保守的で、
         // スラブ判定も遠い側を広げてあるので、ここで棄却されるインスタンスに当たるレイは無い
         if !inst.world_bounds.hit_inv(r, inv_d, tmin.min(0.0), closest * (1.0 + 1e-9)) {
@@ -1443,11 +1449,11 @@ impl World {
             let mut any = false;
             for (tri_id, tri) in mesh.tris.iter().enumerate() {
                 let mat_id = inst.mat_override.unwrap_or(tri.mat_id);
-                if mats.get(mat_id).and_then(|m| m.emitted()).is_some() {
-                    if let Some((a, b, c)) = tri_world_verts(self, inst.mesh_id, tri_id, inst_id, 0.5) {
-                        bb = bb.grow(a).grow(b).grow(c);
-                        any = true;
-                    }
+                if mats.get(mat_id).and_then(|m| m.emitted()).is_some()
+                    && let Some((a, b, c)) = tri_world_verts(self, inst.mesh_id, tri_id, inst_id, 0.5)
+                {
+                    bb = bb.grow(a).grow(b).grow(c);
+                    any = true;
                 }
             }
             if !any {
@@ -1503,6 +1509,7 @@ impl World {
     /// `sample_light` が返す `LightSample.pdf` と同一の値を、逆方向（命中結果 `hit` から）
     /// 再構成する。`from` は前バウンスのシェーディング点、`time` はレイの time。
     /// `hit` が発光体でない、または `build_lights` 未実行なら 0 を返す。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(x > 0.0)` also catches a NaN pdf/weight; `x <= 0.0` would not
     pub fn light_pdf(&self, from: Vec3, time: f64, hit: &Hit) -> f64 {
         if self.light_total <= 0.0 {
             return 0.0;
@@ -1601,6 +1608,7 @@ impl World {
         self.sample_light_impl(rng, time, p, Some(uv))
     }
 
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(total > 0.0)` also catches a NaN weight total; `total <= 0.0` would not
     fn sample_light_impl(&self, rng: &mut Rng, time: f64, p: Vec3, uv_override: Option<(f64, f64)>) -> Option<LightSample> {
         if self.light_total <= 0.0 || self.lights.is_empty() {
             return None;
@@ -1735,6 +1743,7 @@ impl Light {
     /// - 球: `from` が球の外なら、`from` から見える円錐（立体角）を一様サンプリングする。
     ///   球の内部（境界を含む）・表面すれすれの外部なら表面積一様サンプリングにフォールバックする。
     /// - 三角形: 表面積一様サンプリング。
+    ///
     /// `uv` は面上の点を選ぶ 2 次元乱数（各成分 [0,1)）。層化サンプリング（PERF-3）で外から
     /// 指定できるよう、乱数生成器そのものではなく既に引いた値を受け取る形にしてある。
     fn sample(&self, world: &World, time: f64, from: Vec3, uv: (f64, f64)) -> Option<(Vec3, Vec3)> {
@@ -1787,6 +1796,7 @@ impl Light {
     /// 参照点 `from` から発光面上の点 `pos`（法線 `normal`）への方向の立体角 PDF
     /// （ライト選択確率を除く）。[`Light::sample`] のサンプル分布と一致する。
     /// その方向がサンプルされえない（裏向き・退化）場合は 0。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(dist2 > 0.0)` also catches a NaN squared distance; `dist2 <= 0.0` would not
     fn pdf_omega(&self, world: &World, time: f64, from: Vec3, pos: Vec3, normal: Vec3) -> f64 {
         let to_light = pos - from;
         let dist2 = to_light.dot(to_light);
@@ -1853,6 +1863,7 @@ struct SphereCone {
 /// `from` が球の十分に外部なら、`from` から球を見込む円錐を返す。
 /// 内部（境界を含む）または表面すれすれ（sin²θmax > [`NEAR_SURFACE_SIN2`]）なら `None`
 /// （呼び出し側は表面積サンプリングにフォールバックする）。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(sin2_max <= NEAR_SURFACE_SIN2)` also catches a NaN ratio (falls back to the near-surface path)
 fn sphere_cone(s: &Sphere, from: Vec3) -> Option<SphereCone> {
     let to_c = s.c - from;
     let dc2 = to_c.dot(to_c);
@@ -1969,6 +1980,7 @@ pub struct DeltaLightHit {
 
 impl DeltaLight {
     /// 評価点 `p` から見たこの光源。寄与 0（スポットの外・距離 0）なら `None`。乱数は引かない。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(d2 > 0.0)` also catches a NaN squared distance (light at the point); `d2 <= 0.0` would not
     pub fn sample_at(&self, p: Vec3) -> Option<DeltaLightHit> {
         match *self {
             DeltaLight::Point { position, intensity } => Self::point_like(p, position, intensity),
@@ -1998,6 +2010,7 @@ impl DeltaLight {
         }
     }
 
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(d2 > 0.0)` also catches a NaN squared distance; `d2 <= 0.0` would not
     fn point_like(p: Vec3, position: Vec3, intensity: Color) -> Option<DeltaLightHit> {
         let to = position - p;
         let d2 = to.dot(to);

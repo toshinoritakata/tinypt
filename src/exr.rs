@@ -71,5 +71,5 @@ pub fn write_exr(path: &str, w: usize, h: usize, pixels: &[Color]) -> io::Result
     image
         .write()
         .to_file(path)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+        .map_err(io::Error::other)
 }

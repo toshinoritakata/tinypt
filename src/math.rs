@@ -128,6 +128,7 @@ impl Mat3 {
     }
 
     /// 行列積 `self · b`。
+    #[allow(clippy::needless_range_loop)] // 3x3 の行列積は行・列の添字そのものが意味を持つので、添字形のほうが読みやすい
     pub fn mul(self, b: Mat3) -> Mat3 {
         let mut r = [[0.0; 3]; 3];
         for i in 0..3 {
@@ -240,6 +241,7 @@ pub fn reflect(v: Vec3, n: Vec3) -> Vec3 { v - 2.0 * v.dot(n) * n }
 /// - `v`: 入射ベクトル（表面に向かう方向）
 /// - `n`: 外向き法線（単位ベクトル）
 /// - `eta`: 屈折率比 η_i / η_t
+#[allow(clippy::manual_clamp)] // min/max maps a NaN dot product to -1.0; clamp would propagate the NaN into the refraction cosine
 pub fn refract(v: Vec3, n: Vec3, eta: f64) -> Option<Vec3> {
     let cosi = (-v).dot(n).max(-1.0).min(1.0);
     let sin2t = eta * eta * (1.0 - cosi * cosi);

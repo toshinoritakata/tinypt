@@ -21,7 +21,7 @@ const PERM: [u8; 512] = {
         p[i] = i as u8;
         i += 1;
     }
-    let mut state = 0x5EED_0FA1_1u64;
+    let mut state = 0x0005_EED0_FA11_u64;
     let mut i = 255;
     while i > 0 {
         state = splitmix64(state);

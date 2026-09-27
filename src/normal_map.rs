@@ -112,6 +112,7 @@ impl NormalMap {
     /// 接空間 `(t, b, ns)`（正規直交、`ns` は単位・向き合わせ済み）での摂動後の法線（単位ベクトル）。
     /// `dpdu_len` / `dpdv_len` は接ベクトルの長さ（バンプの無次元化に使う）。
     /// 退化入力（非有限、長さ 0）では `ns` をそのまま返す。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(x > 0.0)` also catches a NaN length (degenerate/non-finite texel); `x <= 0.0` would not
     pub fn perturb(&self, uv: (f64, f64), t: Vec3, b: Vec3, ns: Vec3, dpdu_len: f64, dpdv_len: f64) -> Vec3 {
         let n = match self {
             NormalMap::Tangent { tex, scale } => {

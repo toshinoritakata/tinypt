@@ -61,6 +61,7 @@ impl Medium {
     /// レイ `r` の `[t0, t1]` のうち、媒質が実際に存在する区間 `[a, b]` を返す。
     /// `bounds` が `None` なら `(t0, t1)`、あれば AABB との交差区間と `[t0, t1]` の共通部分。
     /// 重なりが無ければ `None`。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(t1 > t0)` also catches a NaN bound; `t1 <= t0` would not
     pub fn interval(&self, r: Ray, t0: f64, t1: f64) -> Option<(f64, f64)> {
         if !(t1 > t0) { return None; }
         match self.bounds {

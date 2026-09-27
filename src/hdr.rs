@@ -101,7 +101,7 @@ fn parse_resolution(line: &str) -> io::Result<(char, char, usize, usize)> {
 
 /// 1 スキャンラインを読み込む。新形式（チャネル別 RLE）と旧形式に対応。
 fn read_scanline<R: Read>(r: &mut R, out: &mut [u8], w: usize) -> io::Result<()> {
-    if w < 8 || w > 0x7fff {
+    if !(8..=0x7fff).contains(&w) {
         r.read_exact(out)?;
         return Ok(());
     }
@@ -147,7 +147,7 @@ fn read_scanline<R: Read>(r: &mut R, out: &mut [u8], w: usize) -> io::Result<()>
 
 /// 1 スキャンラインを RLE 圧縮して書き出す。
 fn write_scanline<W: Write>(wtr: &mut W, scanline: &[u8], w: usize) -> io::Result<()> {
-    if w < 8 || w > 0x7fff {
+    if !(8..=0x7fff).contains(&w) {
         wtr.write_all(scanline)?;
         return Ok(());
     }

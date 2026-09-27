@@ -13,6 +13,10 @@ use std::path::Path;
 use crate::config::RenderConfig;
 use crate::math::{Vec3, Color};
 
+/// 読み込んだチェックポイントの中身: 次のタスク ID・蓄積バッファ・蓄積の重み（[`load_checkpoint`] が返し、
+/// `render::validate_resume` が検証する）。
+pub type CheckpointState = (usize, Vec<Color>, Vec<f64>);
+
 const CKPT_MAGIC: &[u8; 8] = b"HYPCKPT\0";
 const CKPT_VERSION: u32 = 2;
 
@@ -272,7 +276,7 @@ pub fn load_checkpoint(
     scene_hash: u64,
     w: usize,
     h: usize,
-) -> std::io::Result<Option<(usize, Vec<Color>, Vec<f64>)>> {
+) -> std::io::Result<Option<CheckpointState>> {
     if !Path::new(path).exists() {
         return Ok(None);
     }

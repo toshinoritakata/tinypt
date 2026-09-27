@@ -61,12 +61,12 @@ impl Rng {
     /// Sobol モードで PCG がまだ初期化されていなければ初期化する（PCG を使う直前に呼ぶ。PCG モードでは何もしない）。
     #[inline]
     fn ensure_pcg(&mut self) {
-        if let Some(s) = &mut self.sobol {
-            if let Some(seed) = s.pcg_seed.take() {
-                let sobol = self.sobol;
-                *self = Self::new(seed);
-                self.sobol = sobol;
-            }
+        if let Some(s) = &mut self.sobol
+            && let Some(seed) = s.pcg_seed.take()
+        {
+            let sobol = self.sobol;
+            *self = Self::new(seed);
+            self.sobol = sobol;
         }
     }
 
@@ -85,10 +85,10 @@ impl Rng {
 
     /// [0, 1) の一様分布 `f64` を生成する。
     pub fn next_f64(&mut self) -> f64 {
-        if let Some(s) = &mut self.sobol {
-            if let Some(v) = s.next() {
-                return v;
-            }
+        if let Some(s) = &mut self.sobol
+            && let Some(v) = s.next()
+        {
+            return v;
         }
         // 2 回の 32 ビット出力から 53 ビットの精度を得る（IEEE 754 倍精度の仮数部）
         let hi = (self.next_u32() as u64) << 21;

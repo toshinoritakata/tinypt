@@ -490,10 +490,11 @@ pub fn load_scene(
 /// チェックポイントのシーンハッシュが OBJ/環境マップの内容まで含むために使う。
 pub fn referenced_files(xml: &str, base_dir: &Path) -> io::Result<Vec<PathBuf>> {
     fn walk(el: &Element, base_dir: &Path, out: &mut Vec<PathBuf>) {
-        if el.tag == "string" && matches!(el.attr("name"), Some("filename") | Some("filename_end")) {
-            if let Some(v) = el.attr("value") {
-                out.push(resolve_path(base_dir, v));
-            }
+        if el.tag == "string"
+            && matches!(el.attr("name"), Some("filename") | Some("filename_end"))
+            && let Some(v) = el.attr("value")
+        {
+            out.push(resolve_path(base_dir, v));
         }
         for c in &el.children {
             walk(c, base_dir, out);
@@ -575,6 +576,7 @@ fn shape_emitter(el: &Element) -> Option<&Element> {
 /// **`position` / `direction` を直接書く形は tinypt の独自拡張**（Mitsuba の spot / point は `to_world` で位置と向きを
 /// 与える。`Dielectric` の `absorption`、媒質の `bounds_min/max` と同じ扱い）。`intensity` / `irradiance` は
 /// `<rgb>` と `<float>` の両方を受ける。角度は度。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(d.len() > 0.0)` also catches a NaN length; `d.len() <= 0.0` would not
 fn parse_delta_emitter(el: &Element) -> Option<DeltaLight> {
     let kind = el.typ();
     let radiance_name = if kind == "directional" { "irradiance" } else { "intensity" };
@@ -1853,6 +1855,7 @@ const MAX_XML_EXPR_DEPTH: u32 = 16;
 /// - `bitmap`（Mitsuba 準拠）/ `noise`（**独自拡張**）: 葉。
 /// - `mul` / `add` / `mix`（**独自拡張**。Mitsuba には無い）: 子（`<texture>` か定数の `<rgb>` / `<srgb>`）を組み合わせる。
 ///   `mul` / `add` は 2 個以上（3 個以上は左から順に畳む）、`mix` は 2 個 + 3 個目の子か `<float name="weight">`（既定 0.5）が `t`。
+///
 /// 子が足りない・型が不明・深すぎるときは警告して、読めた範囲（または `None`）に倒す。
 fn parse_expr(el: &Element, base_dir: &Path, textures: &mut Vec<Texture>, depth: u32) -> Option<ValueId> {
     if depth > MAX_XML_EXPR_DEPTH {

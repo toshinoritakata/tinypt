@@ -160,29 +160,29 @@ pub fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderCon
                 }
             }
             "--width" => {
-                if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
-                    if let Some(n) = valid_dimension(n, &arg, w) {
-                        config.width = n;
-                        overrides.width = Some(n);
-                    }
+                if let Some(n) = next_number::<usize>(&mut args, &arg, w)
+                    && let Some(n) = valid_dimension(n, &arg, w)
+                {
+                    config.width = n;
+                    overrides.width = Some(n);
                 }
             }
             "--height" => {
-                if let Some(n) = next_number::<usize>(&mut args, &arg, w) {
-                    if let Some(n) = valid_dimension(n, &arg, w) {
-                        config.height = n;
-                        overrides.height = Some(n);
-                    }
+                if let Some(n) = next_number::<usize>(&mut args, &arg, w)
+                    && let Some(n) = valid_dimension(n, &arg, w)
+                {
+                    config.height = n;
+                    overrides.height = Some(n);
                 }
             }
             "--res" => {
-                if let Some(v) = next_value(&mut args, &arg, w) {
-                    if let Some((rw, rh)) = parse_resolution(&v, w) {
-                        config.width = rw;
-                        config.height = rh;
-                        overrides.width = Some(rw);
-                        overrides.height = Some(rh);
-                    }
+                if let Some(v) = next_value(&mut args, &arg, w)
+                    && let Some((rw, rh)) = parse_resolution(&v, w)
+                {
+                    config.width = rw;
+                    config.height = rh;
+                    overrides.width = Some(rw);
+                    overrides.height = Some(rh);
                 }
             }
             "--out" | "-o" => {

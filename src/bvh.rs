@@ -397,7 +397,7 @@ fn build_wide(nodes: &[BvhNode]) -> Vec<WideNode> {
             for (k, &s) in slots.iter().enumerate() {
                 if nodes[s].left != -1 {
                     let cost = area(s) * cnt[s] as f64;
-                    if best.map_or(true, |(_, c)| cost > c) {
+                    if best.is_none_or(|(_, c)| cost > c) {
                         best = Some((k, cost));
                     }
                 }
@@ -615,7 +615,7 @@ impl Bvh {
                             continue;
                         }
                         // 同値 t は番号の小さい方が勝つ（走査順に依存しない規則）。t が小さければ無条件に勝つ
-                        if best.map_or(true, |(bi, bt, _, _)| t < bt || (t == bt && ti < bi)) {
+                        if best.is_none_or(|(bi, bt, _, _)| t < bt || (t == bt && ti < bi)) {
                             // 区間の上端は、同値 t の候補（丸めで t_scaled が tmax·det をわずかに超える）が
                             // 採用判定で落ちないよう少し広げる。勝敗は上の (t, 番号) の比較だけで決まる
                             tmax = t * TIE_SLACK;

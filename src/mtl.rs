@@ -106,8 +106,7 @@ fn parse_map_args(rest: &str) -> (Option<String>, MapOptions) {
         }
         Some((start, i))
     };
-    loop {
-        let Some((s, e)) = next(pos) else { break };
+    while let Some((s, e)) = next(pos) {
         let tok = &rest[s..e];
         if !tok.starts_with('-') {
             break;
@@ -127,10 +126,10 @@ fn parse_map_args(rest: &str) -> (Option<String>, MapOptions) {
                         None => return (None, opts), // 引数が足りない
                     }
                 }
-                if flag == "-bm" {
-                    if let Some(v) = first.and_then(|t| t.parse::<f64>().ok()) {
-                        opts.bm = v;
-                    }
+                if flag == "-bm"
+                    && let Some(v) = first.and_then(|t| t.parse::<f64>().ok())
+                {
+                    opts.bm = v;
                 }
                 pos = p;
             }

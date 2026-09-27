@@ -331,6 +331,7 @@ impl Sphere {
     /// 中心を `ctr`（`self.c` 以外でもよい）に置いた球との交差判定。モーションブラーする球は、呼び出し側が
     /// レイの `time` で補間した中心を渡す。`ctr_err` は補間で `ctr` に乗る丸め誤差の上界（静止は 0。
     /// `x + 0.0 == x` なので、静止球の結果は従来とビット単位で同じ）。
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(disc > 0.0)` also catches NaN discriminants (no real roots); `disc <= 0.0` would not
     pub fn hit_at(&self, ctr: Vec3, ctr_err: f64, r: Ray, tmin: f64, tmax: f64) -> Option<Hit> {
         let oc = r.o - ctr;
         let oc_err = (r.o.abs() + ctr.abs()).max_abs() * gamma(1) + ctr_err;
