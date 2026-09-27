@@ -1,4 +1,4 @@
-//! tinypt のレンダリング途中ビューア（egui / eframe）。`--features viewer` でだけビルドされる。
+//! tinypt-view — tinypt のレンダリング途中ビューア（egui / eframe）。`--features view` でだけビルドされる。
 //!
 //! CLI（`tinypt`）と同じオプションを受け付け（解析は [`tinypt::cli`] を共有）、別スレッドでレンダーしながら
 //! 蓄積バッファを約 10 Hz で表示する。範囲は「進行を見るだけ」: 中断・保存・読み込み直しはあるが、
@@ -16,14 +16,14 @@
 //! **B（やり直し）**: spp・解像度・シード・適応サンプリングは「適用」で、シーン切り替えと同じ
 //! `open_scene`（止める → ワーカー終了を待つ → 読む → 描く）を通る。
 //!
-//! 検証用フック（環境変数）: `TINYPT_VIEWER_VIEW=exposure=1.5;tonemap=none;denoise=0` は
-//! `TINYPT_VIEWER_VIEW_AT_TILES=N`（既定 0）タイルで A の値を GUI の状態に設定し、
-//! `TINYPT_VIEWER_APPLY=spp=8;res=160x90;seed=2` は最初の描画開始後に B の欄へ入れて「適用」と同じ処理を呼ぶ。
-//! `TINYPT_VIEWER_AUTOSAVE=PATH` は完了・中断の後に保存ボタンと同じ処理で保存し、
-//! `TINYPT_VIEWER_CANCEL_AT_TILES=N` は N タイルのマージ後に中断する。
-//! `TINYPT_VIEWER_OPEN=A;B;…` と `TINYPT_VIEWER_SAVE_DIR=DIR` は、最初のシーンの完了後に（ボタンと同じ
+//! 検証用フック（環境変数）: `TINYPT_VIEW_DISPLAY=exposure=1.5;tonemap=none;denoise=0` は
+//! `TINYPT_VIEW_DISPLAY_AT_TILES=N`（既定 0）タイルで A の値を GUI の状態に設定し、
+//! `TINYPT_VIEW_APPLY=spp=8;res=160x90;seed=2` は最初の描画開始後に B の欄へ入れて「適用」と同じ処理を呼ぶ。
+//! `TINYPT_VIEW_AUTOSAVE=PATH` は完了・中断の後に保存ボタンと同じ処理で保存し、
+//! `TINYPT_VIEW_CANCEL_AT_TILES=N` は N タイルのマージ後に中断する。
+//! `TINYPT_VIEW_OPEN=A;B;…` と `TINYPT_VIEW_SAVE_DIR=DIR` は、最初のシーンの完了後に（ボタンと同じ
 //! `open_scene` で）順に開き、完了するたびに `DIR/<番号>_<名前>.ppm` へ保存する。
-//! `TINYPT_VIEWER_SWITCH_AT_TILES=N` を足すと、完了を待たず N タイルで次へ切り替える。
+//! `TINYPT_VIEW_SWITCH_AT_TILES=N` を足すと、完了を待たず N タイルで次へ切り替える。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -228,7 +228,7 @@ impl Opts {
         for (v, name) in [(&mut self.width, "width"), (&mut self.height, "height")] {
             if *v == 0 || *v > PREVIEW_MAX {
                 let c = (*v).clamp(1, PREVIEW_MAX);
-                w.push(format!("{name} {v} → {c} (viewer accepts 1..={PREVIEW_MAX})"));
+                w.push(format!("{name} {v} → {c} (tinypt-view accepts 1..={PREVIEW_MAX})"));
                 *v = c;
             }
         }
@@ -270,7 +270,7 @@ struct App {
     view_hook: Option<String>,
     view_hook_at: usize,
     apply_hook: Option<String>,
-    /// 検証フック: `TINYPT_VIEWER_EDIT`（B の欄を入れるだけ）と `TINYPT_VIEWER_SHOTS=N:path;…`
+    /// 検証フック: `TINYPT_VIEW_EDIT`（B の欄を入れるだけ）と `TINYPT_VIEW_SHOTS=N:path;…`
     /// （N タイルに達したらビューア自身のウィンドウを PNG に保存する。OS のスクリーンキャプチャは使わない）
     edit_hook: Option<String>,
     /// プレビューをデノイズ済みで表示するか（保存時デノイズ `view.denoise` とは別の設定）
@@ -328,10 +328,10 @@ impl App {
             active: Opts::of(&base),
             opts_synced: false,
             opts_note: String::new(),
-            view_hook: std::env::var("TINYPT_VIEWER_VIEW").ok(),
-            view_hook_at: std::env::var("TINYPT_VIEWER_VIEW_AT_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-            apply_hook: std::env::var("TINYPT_VIEWER_APPLY").ok(),
-            edit_hook: std::env::var("TINYPT_VIEWER_EDIT").ok(),
+            view_hook: std::env::var("TINYPT_VIEW_DISPLAY").ok(),
+            view_hook_at: std::env::var("TINYPT_VIEW_DISPLAY_AT_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            apply_hook: std::env::var("TINYPT_VIEW_APPLY").ok(),
+            edit_hook: std::env::var("TINYPT_VIEW_EDIT").ok(),
             show_dn: false,
             dn: None,
             dn_slot: Arc::new(Mutex::new(None)),
@@ -342,8 +342,8 @@ impl App {
             serial: 0,
             shown_src: None,
             shown_rgb: Vec::new(),
-            dump_shown: std::env::var("TINYPT_VIEWER_DUMP_SHOWN").ok(),
-            shots: std::env::var("TINYPT_VIEWER_SHOTS")
+            dump_shown: std::env::var("TINYPT_VIEW_DUMP_SHOWN").ok(),
+            shots: std::env::var("TINYPT_VIEW_SHOTS")
                 .map(|v| {
                     v.split(';')
                         .filter_map(|e| e.split_once(':').and_then(|(n, p)| Some((n.parse().ok()?, p.to_string()))))
@@ -355,12 +355,12 @@ impl App {
             path_input: base.scene_path.clone().unwrap_or_default(),
             scenes: Vec::new(),
             scenes_dir: None,
-            seq: std::env::var("TINYPT_VIEWER_OPEN")
+            seq: std::env::var("TINYPT_VIEW_OPEN")
                 .map(|v| v.split(';').filter(|s| !s.is_empty()).map(String::from).collect())
                 .unwrap_or_default(),
             seq_next: 0,
-            seq_dir: std::env::var("TINYPT_VIEWER_SAVE_DIR").ok(),
-            switch_at_tiles: std::env::var("TINYPT_VIEWER_SWITCH_AT_TILES").ok().and_then(|v| v.parse().ok()),
+            seq_dir: std::env::var("TINYPT_VIEW_SAVE_DIR").ok(),
+            switch_at_tiles: std::env::var("TINYPT_VIEW_SWITCH_AT_TILES").ok().and_then(|v| v.parse().ok()),
             seq_saved: false,
             save_path: base.output_path.clone(),
             base,
@@ -370,8 +370,8 @@ impl App {
             message: String::new(),
             one_to_one: false,
             browser: None,
-            autosave: std::env::var("TINYPT_VIEWER_AUTOSAVE").ok(),
-            cancel_at_tiles: std::env::var("TINYPT_VIEWER_CANCEL_AT_TILES").ok().and_then(|v| v.parse().ok()),
+            autosave: std::env::var("TINYPT_VIEW_AUTOSAVE").ok(),
+            cancel_at_tiles: std::env::var("TINYPT_VIEW_CANCEL_AT_TILES").ok().and_then(|v| v.parse().ok()),
         }
     }
 
@@ -1057,16 +1057,16 @@ fn main() -> eframe::Result<()> {
         eprintln!("Warning: {}", w);
     }
     if overrides.help {
-        println!("tinypt viewer {} — live preview of a render", env!("CARGO_PKG_VERSION"));
+        println!("tinypt-view {} — live preview of a render", env!("CARGO_PKG_VERSION"));
         println!("Accepts the same options as tinypt (-o sets the initial save path).\n");
-        print!("{}", USAGE.replacen("Usage: tinypt [OPTIONS]", "Usage: viewer [OPTIONS]", 1));
+        print!("{}", USAGE.replacen("Usage: tinypt [OPTIONS]", "Usage: tinypt-view [OPTIONS]", 1));
         return Ok(());
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 680.0]).with_title("tinypt viewer"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 680.0]).with_title("tinypt-view"),
         ..Default::default()
     };
-    eframe::run_native("tinypt viewer", options, Box::new(move |_cc| Ok(Box::new(App::new(config, overrides)))))
+    eframe::run_native("tinypt-view", options, Box::new(move |_cc| Ok(Box::new(App::new(config, overrides)))))
 }
 
 #[cfg(test)]
@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn list_dir_shows_folders_then_xml_sorted_and_hides_dotfiles() {
-        let dir = std::env::temp_dir().join(format!("tinypt_viewer_ls_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tinypt_view_ls_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("beta")).unwrap();
         std::fs::create_dir_all(dir.join("Alpha")).unwrap();

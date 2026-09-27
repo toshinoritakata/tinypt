@@ -52,7 +52,7 @@ const SUBSTEPS: usize = 8;
 
 impl PixelFilter {
     /// 名前（`--filter` と XML の `type`）から、既定のパラメータで作る。
-    /// `stddev` を検証してガウスを作る（有限かつ正でなければ `None`）。XML パーサ・CLI・viewer が共有する。
+    /// `stddev` を検証してガウスを作る（有限かつ正でなければ `None`）。XML パーサ・CLI・tinypt-view が共有する。
     pub fn gaussian(stddev: f64) -> Option<Self> {
         if stddev.is_finite() && stddev > 0.0 {
             Some(PixelFilter::Gaussian { stddev })

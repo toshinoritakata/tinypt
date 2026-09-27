@@ -213,13 +213,13 @@ cargo build --release --no-default-features
 
 ## ビューア（レンダリング途中を見る）
 
-レンダリングの進行を GUI で眺めるビューア `viewer` がある。egui / eframe を使うので**既定のビルドには含まれず**、Cargo フィーチャ `viewer` を付けたときだけビルドされる（コアのビルド時間・依存には影響しない）。
+レンダリングの進行を GUI で眺めるビューア `tinypt-view` がある。egui / eframe を使うので**既定のビルドには含まれず**、Cargo フィーチャ `view` を付けたときだけビルドされる（コアのビルド時間・依存には影響しない）。
 
 ```bash
-cargo run --release --features viewer --bin viewer -- --scene sample/cornell.xml --spp 256 --res 640x360
+cargo run --release --features view --bin tinypt-view -- --scene sample/cornell.xml --spp 256 --res 640x360
 ```
 
-- オプションは CLI（`tinypt`）と同じ（解析コードを共有している。`viewer --help` は同じ一覧を出す）。`-o` は保存先の初期値になる。
+- オプションは CLI（`tinypt`）と同じ（解析コードを共有している。`tinypt-view --help` は同じ一覧を出す）。`-o` は保存先の初期値になる。
 - 蓄積バッファを約 10 Hz で表示する。画像は保存と同じ経路（`resolve_pixels` → 露出 → トーンマップ → sRGB）で作るので、画面と保存結果は食い違わない。
 - プレビューは既定では**生の蓄積**。`show denoised preview`（View 区画、`oidn` 付きのビルドだけ）を入れると**デノイズ後**を表示する。経路は CLI と同じ（`resolve_pixels` → `denoise_oidn`（リニア）→ `ppm_bytes`）で、表示・保存・CLI の出力はバイト一致する。保存時のデノイズ（`denoise on save`）は別の設定で、両者が食い違うときは画面に注意が出る。
 - デノイズは別スレッドで走り、間引かれる: 前回の終了から「1 秒」と「直近の所要時間の 4 倍」の長いほうだけあけ、レンダリング完了後の最後の 1 回だけは待たずに走る。画像の上の行に `DENOISED @ N/M tiles · render at K/M · STALE by X tiles`（追いつけば `current`、実行中は `denoising…`）が出るので、デノイズ画像が古いまま黙って残ることはない。生との切り替えは同じ位置・同じ倍率のまま。露出・トーンマップを変えてもデノイズはやり直さない（リニアの結果を保持して `ppm_bytes` を通し直す）。

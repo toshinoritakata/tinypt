@@ -6,8 +6,8 @@ edition = "2024"
 [features]
 default = ["oidn"]
 oidn = ["dep:oidn"]
-# GUI ビューア（`viewer` バイナリ）。egui / eframe は重いので既定には入れない
-viewer = ["dep:eframe"]
+# GUI ビューア（`tinypt-view` バイナリ）。egui / eframe は重いので既定には入れない
+view = ["dep:eframe"]
 
 [dependencies]
 crossbeam = "0.8"
@@ -23,9 +23,9 @@ name = "tinypt"
 path = "src/main.rs"
 
 [[bin]]
-name = "viewer"
-path = "src/bin/viewer.rs"
-required-features = ["viewer"]
+name = "tinypt-view"
+path = "src/bin/tinypt-view.rs"
+required-features = ["view"]
 
 [profile.release]
 opt-level = 3
