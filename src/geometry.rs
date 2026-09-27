@@ -146,6 +146,19 @@ impl<'a> TriangleSource<'a> {
         self.tris[ti].bounds_with(self.close(ti))
     }
 
+    /// 全三角形が静止（頂点モーション無し）か。空間分割つきの BVH（SBVH）は静止メッシュだけに使う。
+    #[inline]
+    pub fn is_static(&self) -> bool {
+        self.motion.is_empty()
+    }
+
+    /// 三角形 `ti` のシャッター開の頂点（静止メッシュの空間分割でポリゴンを切るのに使う）。
+    #[inline]
+    pub fn open_vertices(&self, ti: usize) -> (Vec3, Vec3, Vec3) {
+        let t = &self.tris[ti];
+        (t.v0_0, t.v1_0, t.v2_0)
+    }
+
     #[inline(always)]
     pub fn intersect(&self, ti: usize, r: Ray, tmin: f64, tmax: f64) -> Option<(f64, f64, f64)> {
         self.tris[ti].intersect_with(self.close(ti), r, tmin, tmax)

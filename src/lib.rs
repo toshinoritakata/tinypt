@@ -20,6 +20,7 @@ pub mod sampler;     // Owen スクランブル付き Sobol 列（層化サン�
 pub mod ray;         // レイとカメラモデル
 pub mod geometry;    // 幾何プリミティブ（球・三角形・AABB）
 pub mod bvh;         // BVH（Bounding Volume Hierarchy）加速構造
+mod sbvh;            // 空間分割つき BVH ビルダー（メッシュの BVH 用）
 pub mod world;       // ワールド（全ジオメトリ・インスタンス・ライト）
 pub mod transform;   // アフィン変換（任意軸回転・非一様スケール・せん断）
 pub mod shader;      // 材質のパラメータを交差点で計算する層（式・テクスチャ・ノイズ・法線マップ）

@@ -5,6 +5,12 @@
 //! レイがノードを横切るコストを以下で近似し、最小コストの分割を選択:
 //!   コスト = 左子の表面積 × 左の三角形数 + 右子の表面積 × 右の三角形数
 //!
+//! ## 空間分割（SBVH）
+//! メッシュの BVH は、静止メッシュに限り `sbvh.rs`（Stich–Friedrich–Dietrich 2009）で作れる（[`crate::constants::bvh::SBVH_ENABLED`]。
+//! 既定は無効: ヘアーでは効果が無く、sponza で約 16% 速い一方、構築とメモリが増える）。葉が持つ三角形番号は**重複してよい**
+//! （交差判定は三角形全体に対して行い、最近接は `(t, 三角形番号)` の比較で決まるので、同じ三角形を複数の葉が持っても結果は同じ）。
+//! 頂点モーションのあるメッシュ（掃過の箱）と、TLAS・光源 BVH は従来のオブジェクト分割。
+//!
 //! ## 構造
 //! - 線形配列に格納されたノードツリー（ポインタ不要）
 //! - リーフノードは最大 `LEAF_SIZE` 個の三角形を保持
@@ -350,7 +356,7 @@ fn build_range(
 /// 左右を別スレッドに振る（合計で高々 `2^depth - 1` 回スレッドを起こす）。`threads <= 1` か、
 /// 三角形数が `PARALLEL_MIN_TRIS` 未満なら 0（＝並列化しない。`build_range` が 1 段目で
 /// `build_node_sequential` に切り替わり、旧実装と同じ 1 パスの構築になる）。
-fn parallel_depth_budget(threads: usize, n_tris: usize) -> usize {
+pub(crate) fn parallel_depth_budget(threads: usize, n_tris: usize) -> usize {
     if threads <= 1 || n_tris < PARALLEL_MIN_TRIS {
         return 0;
     }
@@ -453,8 +459,31 @@ impl Bvh {
     /// を通るので、テストで「逐次 = `build_with_threads(tris, 1)`」「並列 = `build_with_threads(tris, N)`」
     /// を比較できる。
     fn build_with_threads(src: TriangleSource<'_>, threads: usize) -> Self {
+        // 頂点モーションの無いメッシュは空間分割つき（SBVH）。モーションのあるメッシュは、箱が開・閉の頂点の和（掃過）で、
+        // 三角形のポリゴンを面で切っても時刻ごとの形が変わるため、切った部分の箱を正しく作れない — 従来のオブジェクト分割のまま
+        if crate::constants::bvh::SBVH_ENABLED && src.is_static() {
+            Self::build_sbvh_with(src, crate::sbvh::Params::default(), threads)
+        } else {
+            Self::build_object_split_with(src, threads)
+        }
+    }
+
+    /// オブジェクト分割だけの構築（従来の BVH。頂点モーションのあるメッシュと、SBVH との比較・テスト用）。
+    pub(crate) fn build_object_split_with(src: TriangleSource<'_>, threads: usize) -> Self {
         let tri_bounds: Vec<Aabb> = (0..src.len()).map(|ti| src.bounds(ti)).collect();
         Self::build_from_bounds(&tri_bounds, threads)
+    }
+
+    /// 空間分割つき（SBVH）の構築。`src` は静止メッシュであること。
+    pub(crate) fn build_sbvh_with(src: TriangleSource<'_>, p: crate::sbvh::Params, threads: usize) -> Self {
+        let (nodes, indices) = crate::sbvh::build(src, p, threads);
+        let wide = build_wide(&nodes);
+        Self { wide, indices, bounds: nodes.first().map(|n| n.bbox) }
+    }
+
+    /// 葉が持つ三角形参照の総数（重複を含む。三角形数との比が SBVH の重複率）。
+    pub fn ref_count(&self) -> usize {
+        self.indices.len()
     }
 
     /// プリミティブごとの AABB だけから BVH を作る共通ビルダー（binned SAH・並列部分木構築）。
@@ -1153,7 +1182,176 @@ mod tests {
                     }
                 }
             }
-            assert!(seen.iter().all(|&c| c == 1), "n={n}");
+            // SBVH は同じ三角形を複数の葉に入れることがある（重複は 1 以上、総数は上限以内）
+            assert!(seen.iter().all(|&c| c >= 1), "n={n}: 葉に入っていない三角形がある");
+            let total: u32 = seen.iter().sum();
+            assert!(total as f64 <= n as f64 * crate::constants::bvh::SBVH_DUP_CAP + 1.0, "n={n}: 参照数 {total} が上限を超えた");
+            // オブジェクト分割だけの構築（頂点モーションのあるメッシュの経路）は従来どおり、ちょうど 1 回
+            let obj = Bvh::build_object_split_with((&tris).into(), 1);
+            let mut once = vec![0u32; n];
+            for &i in &obj.indices {
+                once[i] += 1;
+            }
+            assert!(once.iter().all(|&c| c == 1), "n={n}");
         }
+    }
+
+    // ---- SBVH（空間分割）----
+
+    use crate::sbvh::Params;
+
+    /// 種類の違う三角形の詰め合わせ: 普通・細長い斜め・軸に平行な板・縮退（点・一直線）・大きな三角形。
+    fn mixed_tris(n: usize, rng: &mut Rng) -> Vec<Triangle> {
+        let mut rv = |s: f64| Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * s;
+        (0..n)
+            .map(|i| {
+                let c = rv(10.0);
+                let (a, b, cc) = match i % 6 {
+                    0 => (c + rv(1.0), c + rv(1.0), c + rv(1.0)),
+                    // 長い斜めの針: 幅 0.02、長さ 6
+                    1 => {
+                        let d = rv(6.0);
+                        (c, c + d, c + d + rv(0.02))
+                    }
+                    // x = const の板（軸に平行）
+                    2 => {
+                        let (u, v) = (rv(2.0), rv(2.0));
+                        (c, c + Vec3::new(0.0, u.y, u.z), c + Vec3::new(0.0, v.y, v.z))
+                    }
+                    // 縮退: 3 点が同じ / 一直線
+                    3 => (c, c, c),
+                    4 => {
+                        let d = rv(2.0);
+                        (c, c + d, c + d * 2.0)
+                    }
+                    // 大きい三角形（他の多くをまたぐ）
+                    _ => (c + rv(12.0), c + rv(12.0), c + rv(12.0)),
+                };
+                Triangle::new_static(a, b, cc, i)
+            })
+            .collect()
+    }
+
+    fn random_ray(rng: &mut Rng) -> Ray {
+        let o = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 30.0;
+        let target = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5) * 8.0;
+        Ray { o, d: (target - o).norm(), time: 0.0 }
+    }
+
+    /// 総当たりの勝者（最小の t、同値は小さい番号）。BVH の規則と同じ。
+    fn brute(src: TriangleSource<'_>, r: Ray, accept: &dyn Fn(usize, f64, f64) -> bool) -> Option<(f64, usize)> {
+        let mut best: Option<(f64, usize)> = None;
+        for ti in 0..src.len() {
+            if let Some((t, u, v)) = src.intersect(ti, r, 1e-4, 1e30) {
+                if accept(ti, u, v) && best.map_or(true, |(bt, bi)| t < bt || (t == bt && ti < bi)) {
+                    best = Some((t, ti));
+                }
+            }
+        }
+        best
+    }
+
+    /// 乱択メッシュ（細長い・板・縮退・巨大を含む）で、SBVH の最近接・遮蔽が総当たりと一致する（同じ t、同じ三角形）。
+    /// α = 0・大きい上限の設定も含め、空間分割が実際に起きる（重複が出る）ことも確かめる。
+    #[test]
+    fn sbvh_hit_and_occluded_match_brute_force() {
+        let mut rng = Rng::new(2024);
+        let settings = [
+            Params::default(),
+            Params { alpha: 0.0, bins: 16, dup_cap: 4.0 },
+            Params { alpha: 0.0, bins: 5, dup_cap: 1.5 },
+        ];
+        let mut saw_duplicates = false;
+        for &n in &[1usize, 7, 40, 300, 3000] {
+            let tris = mixed_tris(n, &mut rng);
+            let src = TriangleSource::from(&tris);
+            for p in settings {
+                let bvh = Bvh::build_sbvh_with(src, p, 4);
+                saw_duplicates |= bvh.ref_count() > n;
+                for _ in 0..300 {
+                    let r = random_ray(&mut rng);
+                    let all = |_: usize, _: f64, _: f64| true;
+                    let got = bvh.hit(src, r, 1e-4, 1e30).map(|h| (h.t, h.prim_id));
+                    assert_eq!(got, brute(src, r, &all), "n={n} {p:?}");
+                    let occ = bvh.any_hit_filtered(src, r, 1e-4, 1e30, all).is_some();
+                    assert_eq!(occ, brute(src, r, &all).is_some(), "n={n} {p:?}: occluded");
+                    // アルファ透明を模した、三角形番号と重心座標だけで決まる採否（決定的）でも一致する
+                    let accept = |ti: usize, u: f64, v: f64| (ti % 3 != 0) && ((u * 7.0 + v * 3.0 + ti as f64).fract() > 0.3);
+                    let got = bvh.hit_filtered(src, r, 1e-4, 1e30, accept).map(|h| (h.t, h.prim_id));
+                    assert_eq!(got, brute(src, r, &accept), "n={n} {p:?}: filtered");
+                }
+            }
+        }
+        assert!(saw_duplicates, "空間分割が一度も起きていない（テストが意味を持たない）");
+    }
+
+    /// 参照の総数は `dup_cap × 三角形数` を超えない。`dup_cap = 1` は空間分割なし（ちょうど 1 回ずつ）。
+    #[test]
+    fn sbvh_respects_the_duplication_cap() {
+        let mut rng = Rng::new(31);
+        let tris = mixed_tris(4000, &mut rng);
+        let src = TriangleSource::from(&tris);
+        let n = tris.len();
+        let none = Bvh::build_sbvh_with(src, Params { alpha: 0.0, bins: 16, dup_cap: 1.0 }, 4);
+        assert_eq!(none.ref_count(), n);
+        for cap in [1.25, 1.5, 2.0, 3.0] {
+            let bvh = Bvh::build_sbvh_with(src, Params { alpha: 0.0, bins: 16, dup_cap: cap }, 4);
+            assert!(bvh.ref_count() as f64 <= cap * n as f64, "cap {cap}: {} > {}", bvh.ref_count(), cap * n as f64);
+            assert!(bvh.ref_count() > n, "cap {cap}: 重複が出るはずのメッシュ");
+        }
+    }
+
+    /// 並列構築は逐次構築とビット単位で同じ木（重複の予算配分がスレッドに依らない）。
+    #[test]
+    fn sbvh_parallel_build_matches_sequential() {
+        let mut rng = Rng::new(77);
+        let tris = mixed_tris(PARALLEL_MIN_TRIS * 3 + 123, &mut rng);
+        let src = TriangleSource::from(&tris);
+        let a = Bvh::build_sbvh_with(src, Params::default(), 1);
+        let b = Bvh::build_sbvh_with(src, Params::default(), 8);
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(format!("{:?}", a.wide), format!("{:?}", b.wide));
+        assert!(a.ref_count() > tris.len());
+    }
+
+    /// 頂点モーションのあるメッシュは従来のオブジェクト分割のまま（重複なし、木は `build_object_split_with` と同一）。
+    #[test]
+    fn vertex_motion_meshes_keep_the_object_split_build() {
+        let mut rng = Rng::new(5);
+        let tris = mixed_tris(2000, &mut rng);
+        let motion: Vec<[Vec3; 3]> = tris.iter().map(|t| [t.v0_0 + Vec3::new(0.5, 0.0, 0.0), t.v1_0, t.v2_0]).collect();
+        let src = TriangleSource::new(&tris, &motion);
+        let bvh = Bvh::build_with_threads(src, 4);
+        let obj = Bvh::build_object_split_with(src, 4);
+        assert_eq!(bvh.ref_count(), tris.len(), "モーションのあるメッシュに重複は無い");
+        assert_eq!(bvh.indices, obj.indices);
+        assert_eq!(format!("{:?}", bvh.wide), format!("{:?}", obj.wide));
+    }
+
+    /// SBVH の各葉の箱は、そこに入っている三角形の部分を含む: 三角形上の点を通るレイは必ず当たる（取りこぼしなし）。
+    #[test]
+    fn sbvh_finds_hits_on_thin_long_triangles_from_all_directions() {
+        let mut rng = Rng::new(909);
+        let tris = mixed_tris(1200, &mut rng);
+        let src = TriangleSource::from(&tris);
+        let bvh = Bvh::build_sbvh_with(src, Params { alpha: 0.0, bins: 16, dup_cap: 3.0 }, 4);
+        let mut checked = 0;
+        for (ti, t) in tris.iter().enumerate() {
+            let area2 = (t.v1_0 - t.v0_0).cross(t.v2_0 - t.v0_0).len();
+            if area2 < 1e-9 {
+                continue;
+            }
+            // 三角形内の点 p へ、ランダムな方向から向かうレイ。どの三角形が最近接でもよいが、ヒットは必ず存在する
+            let (a, b) = (rng.next_f64(), rng.next_f64());
+            let (a, b) = if a + b > 1.0 { (1.0 - a, 1.0 - b) } else { (a, b) };
+            let p = t.v0_0 + (t.v1_0 - t.v0_0) * a + (t.v2_0 - t.v0_0) * b;
+            let dir = Vec3::new(rng.next_f64() - 0.5, rng.next_f64() - 0.5, rng.next_f64() - 0.5).norm();
+            let r = Ray { o: p - dir * 20.0, d: dir, time: 0.0 };
+            if brute(src, r, &|_, _, _| true).is_some() {
+                assert_eq!(bvh.hit(src, r, 1e-4, 1e30).map(|h| (h.t, h.prim_id)), brute(src, r, &|_, _, _| true), "tri {ti}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 300);
     }
 }

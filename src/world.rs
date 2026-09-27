@@ -55,6 +55,13 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    /// BVH の葉が持つ三角形参照の総数（SBVH の重複を含む）。三角形数との比が重複率。
+    pub fn bvh_ref_count(&self) -> usize {
+        self.bvh.ref_count()
+    }
+}
+
+impl Mesh {
     /// 三角形リストからメッシュと BVH を構築する（面法線のみ、モーションブラー無し）。
     pub fn new(tris: Vec<Triangle>) -> Self {
         let bvh = Bvh::build(TriangleSource::from(&tris));
