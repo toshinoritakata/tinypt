@@ -112,7 +112,6 @@ impl Job {
     }
 }
 
-/// 保存と同じ経路でリニア RGB を作る（蓄積を解決 → 必要ならデノイズ）。
 /// ブラウザ用のディレクトリ一覧: (サブフォルダ, `.xml` ファイル)、または読めなかった理由。
 type Listing = Result<(Vec<String>, Vec<String>), String>;
 
@@ -122,16 +121,6 @@ fn scan(dir: &std::path::Path) -> Listing {
 
 /// `dir` の中身を (サブフォルダ, `.xml` ファイル)（名前のみ）で返す。隠しエントリ（`.` で始まる名前）は出さず、
 /// 拡張子は大文字小文字を区別せず、どちらも名前の小文字順に並べる。読めないディレクトリはエラー。
-/// 状態行に出す短い表示（例: "gaussian σ0.5"、"mitchell B0.33 C0.33"、"box"）。
-fn filter_label(f: &PixelFilter) -> String {
-    match *f {
-        PixelFilter::Box => "box".to_string(),
-        PixelFilter::Tent => "tent".to_string(),
-        PixelFilter::Gaussian { stddev } => format!("gaussian σ{stddev:.2}"),
-        PixelFilter::Mitchell { b, c } => format!("mitchell B{b:.2} C{c:.2}"),
-    }
-}
-
 fn list_dir(dir: &std::path::Path) -> std::io::Result<(Vec<String>, Vec<String>)> {
     let (mut dirs, mut xmls) = (Vec::new(), Vec::new());
     for e in std::fs::read_dir(dir)?.flatten() {
@@ -151,6 +140,44 @@ fn list_dir(dir: &std::path::Path) -> std::io::Result<(Vec<String>, Vec<String>)
     Ok((dirs, xmls))
 }
 
+/// 起動時のシーン一覧の既定フォルダ: シーン未選択で起動したとき（`--scene` 無し）、`Open…` と `scenes…` を
+/// 空のまま出さないための選び方。優先順位:
+/// 1. `cwd/sample`（プロジェクト直下で起動したときの通常パス）。
+/// 2. 実行ファイルの祖先を遡って見つけた最初の `<祖先>/sample`（`target/release/tinypt-view` から
+///    リポジトリ直下の `sample/` を辿り着ける。6 階層まで。`cargo run` の深いビルドパスも十分にカバーする）。
+/// 3. どちらも無ければ `cwd`（空でも `Open…` はここから始められる）。
+///
+/// 一度シーンを開けば、以後は常にそのシーンのフォルダに従う（[`App::refresh_scene_list`]）。
+fn default_scene_dir(cwd: &std::path::Path, exe: Option<&std::path::Path>) -> std::path::PathBuf {
+    let cand = cwd.join("sample");
+    if cand.is_dir() {
+        return cand;
+    }
+    if let Some(exe) = exe {
+        let mut dir = exe.parent();
+        for _ in 0..6 {
+            let Some(d) = dir else { break };
+            let cand = d.join("sample");
+            if cand.is_dir() {
+                return cand;
+            }
+            dir = d.parent();
+        }
+    }
+    cwd.to_path_buf()
+}
+
+/// 状態行に出す短い表示（例: "gaussian σ0.5"、"mitchell B0.33 C0.33"、"box"）。
+fn filter_label(f: &PixelFilter) -> String {
+    match *f {
+        PixelFilter::Box => "box".to_string(),
+        PixelFilter::Tent => "tent".to_string(),
+        PixelFilter::Gaussian { stddev } => format!("gaussian σ{stddev:.2}"),
+        PixelFilter::Mitchell { b, c } => format!("mitchell B{b:.2} C{c:.2}"),
+    }
+}
+
+/// 保存と同じ経路でリニア RGB を作る（蓄積を解決 → 必要ならデノイズ）。
 fn resolved_pixels(probe: &RenderProbe, config: &RenderConfig, denoise_it: bool) -> Vec<Color> {
     let mut pixels = probe.with_buffers(|acc, acc_w| resolve_pixels(config.width, config.height, acc, acc_w));
     if denoise_it {
@@ -320,8 +347,9 @@ impl App {
     fn new(base: RenderConfig, overrides: CliOverrides) -> Self {
         let overrides = Arc::new(overrides);
         // `--scene` なしなら組み込みシーンを描かず、シーンが選ばれるまで待つ（CLI の tinypt は従来どおり組み込みを描く）
-        let job = if base.scene_path.is_some() { Job::start(base.clone(), overrides.clone(), None) } else { Job::idle() };
-        Self {
+        let has_scene = base.scene_path.is_some();
+        let job = if has_scene { Job::start(base.clone(), overrides.clone(), None) } else { Job::idle() };
+        let mut app = Self {
             view: View { tonemap: base.tonemap, exposure: base.exposure, denoise: base.denoise_enabled },
             shown_view: None,
             edit: Opts::of(&base),
@@ -372,7 +400,15 @@ impl App {
             browser: None,
             autosave: std::env::var("TINYPT_VIEW_AUTOSAVE").ok(),
             cancel_at_tiles: std::env::var("TINYPT_VIEW_CANCEL_AT_TILES").ok().and_then(|v| v.parse().ok()),
+        };
+        // シーン未選択で起動したときだけ、既定フォルダから一覧を出す（`Open…` もここから始まる）。
+        // `--scene` 付きなら update() の最初のフレームで、そのシーンのフォルダに `refresh_scene_list` が上書きする
+        if !has_scene {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let exe = std::env::current_exe().ok();
+            app.set_scenes_dir(Some(default_scene_dir(&cwd, exe.as_deref())));
         }
+        app
     }
 
     /// シーンを開いて描き始める（`Open…`・パス欄・一覧・`Reload`・検証フックが共通で使う唯一の入口）。
@@ -491,6 +527,12 @@ impl App {
     /// 一覧用に、`path` と同じディレクトリの `*.xml` を集める（ディレクトリが変わったときだけ）。
     fn refresh_scene_list(&mut self, path: &str) {
         let dir = std::path::Path::new(path).parent().map(|d| if d.as_os_str().is_empty() { ".".into() } else { d.to_path_buf() });
+        self.set_scenes_dir(dir);
+    }
+
+    /// `dir` の `*.xml` を一覧に取り込む（`self.scenes_dir` と同じなら何もしない）。`None` なら一覧を空にする
+    /// （シーンのパスに親ディレクトリが無い異常な入力用。通常は起きない）。
+    fn set_scenes_dir(&mut self, dir: Option<std::path::PathBuf>) {
         if dir == self.scenes_dir {
             return;
         }
@@ -758,20 +800,27 @@ impl eframe::App for App {
                             }),
                     };
                 }
-                if !self.scenes.is_empty() {
-                    let mut picked = None;
-                    let cur = self.job.path.clone().unwrap_or_default();
+                // 一覧が空でも（シーン未選択で起動した直後の既定フォルダに .xml が無いなど）コントロール自体は
+                // 常に出す（空だと「消えた」ように見えるため）。空のときは無効表示にして中身も分かるようにする
+                let has_scenes = !self.scenes.is_empty();
+                let mut picked = None;
+                let cur = self.job.path.clone().unwrap_or_default();
+                ui.add_enabled_ui(has_scenes, |ui| {
                     egui::ComboBox::from_id_salt("scenes").selected_text("scenes…").show_ui(ui, |ui| {
-                        for sc in &self.scenes {
-                            let name = std::path::Path::new(sc).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                            if ui.selectable_label(*sc == cur, name).clicked() {
-                                picked = Some(sc.clone());
+                        if has_scenes {
+                            for sc in &self.scenes {
+                                let name = std::path::Path::new(sc).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                if ui.selectable_label(*sc == cur, name).clicked() {
+                                    picked = Some(sc.clone());
+                                }
                             }
+                        } else {
+                            ui.label("(no .xml here)");
                         }
                     });
-                    if let Some(sc) = picked {
-                        self.open_scene(Some(sc));
-                    }
+                });
+                if let Some(sc) = picked {
+                    self.open_scene(Some(sc));
                 }
                 if ui.add_enabled(self.job.path.is_some(), egui::Button::new("Reload")).clicked() {
                     let p = self.job.path.clone();
@@ -1071,7 +1120,53 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::list_dir;
+    use super::{default_scene_dir, list_dir};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tinypt_view_dsd_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `cwd/sample` があれば、実行ファイルの位置に関係なくそれを使う。
+    #[test]
+    fn default_scene_dir_prefers_cwd_sample() {
+        let root = scratch("cwd");
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        let exe = root.join("somewhere/else/tinypt-view"); // 実在しなくてよい（親ディレクトリだけ辿る）
+        assert_eq!(default_scene_dir(&root, Some(&exe)), root.join("sample"));
+        assert_eq!(default_scene_dir(&root, None), root.join("sample"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `cwd/sample` が無ければ、実行ファイルの祖先を遡って見つけた `sample` を使う
+    /// （`target/release/tinypt-view` からリポジトリ直下の `sample/` を辿り着ける形）。
+    #[test]
+    fn default_scene_dir_falls_back_to_a_sample_near_the_exe() {
+        let root = scratch("exe");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("sample")).unwrap();
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        let exe = repo.join("target/release/tinypt-view");
+        let cwd = root.join("somewhere_without_sample");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert_eq!(default_scene_dir(&cwd, Some(&exe)), repo.join("sample"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// どちらにも `sample` が無ければ `cwd` のまま（空でも `Open…` の起点にはなる）。
+    #[test]
+    fn default_scene_dir_falls_back_to_cwd_when_no_sample_is_found() {
+        let root = scratch("none");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let exe = root.join("bin/tinypt-view");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        assert_eq!(default_scene_dir(&cwd, Some(&exe)), cwd);
+        assert_eq!(default_scene_dir(&cwd, None), cwd);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn list_dir_shows_folders_then_xml_sorted_and_hides_dotfiles() {
