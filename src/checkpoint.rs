@@ -127,6 +127,21 @@ pub fn scene_hash_with_medium(config: &RenderConfig, medium: Option<&crate::medi
     ] {
         h.u64(v);
     }
+    // 画素フィルタ（サンプル位置が変わるので必ず混ぜる）。既定 box には影響しない
+    h.field(b"filter");
+    match config.filter {
+        crate::filter::PixelFilter::Box => h.u64(0),
+        crate::filter::PixelFilter::Tent => h.u64(1),
+        crate::filter::PixelFilter::Gaussian { stddev } => {
+            h.u64(2);
+            h.u64(stddev.to_bits());
+        }
+        crate::filter::PixelFilter::Mitchell { b: mb, c: mc } => {
+            h.u64(3);
+            h.u64(mb.to_bits());
+            h.u64(mc.to_bits());
+        }
+    }
     if let Some(m) = medium {
         h.field(b"medium");
         let (lo, hi) = match &m.bounds {

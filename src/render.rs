@@ -24,6 +24,7 @@ use crate::checkpoint::{load_checkpoint, save_checkpoint};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
 use crate::env::EnvMap;
+use crate::filter::FilterSampler;
 use crate::integrator::{radiance, PathLimits};
 use crate::shader::ShaderSet;
 use crate::math::Color;
@@ -172,6 +173,7 @@ fn sample_pixel(
     cam: &Camera,
     limits: PathLimits,
     config: &RenderConfig,
+    filter: Option<&FilterSampler>,
 ) -> (Color, f64) {
     let mut c = Color::new(0.0, 0.0, 0.0);
     let max_spp = (t.sample_end - t.sample_start).max(1);
@@ -181,13 +183,26 @@ fn sample_pixel(
     let sample_once = |s: usize| -> Color {
         // Sobol モード。PCG（次元の上限を超えたときのフォールバック）はサンプルごとに独立なシード
         let mut rng = Rng::sobol(seed_for(x as u32, y as u32, s as u32, config.seed), pixel_seed, s as u32);
-        // 次元 0, 1: 画素内のジッター
+        // 次元 0, 1: 画素内のジッター（box）またはフィルタ重点サンプリングのオフセット
         let jx = rng.next_f64();
         let jy = rng.next_f64();
-        let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
-        let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
+        // box は従来と全く同じ式（表を経由しない）。それ以外はサンプルが画素の外へ出うるが、
+        // このサンプルの寄与は常にこの画素（x, y）のタイルバッファへ足す（タイル処理は変えない）
+        let (sx, sy, w) = match filter {
+            None => {
+                let sx = (x as f64 + jx) * inv_w * 2.0 - 1.0;
+                let sy = 1.0 - (y as f64 + jy) * inv_h * 2.0;
+                (sx, sy, 1.0)
+            }
+            Some(fs) => {
+                let (ox, oy, w) = fs.sample(jx, jy);
+                let sx = (x as f64 + 0.5 + ox) * inv_w * 2.0 - 1.0;
+                let sy = 1.0 - (y as f64 + 0.5 + oy) * inv_h * 2.0;
+                (sx, sy, w)
+            }
+        };
         let ray = cam.ray(sx, sy, &mut rng);
-        radiance(world, shaders, env, medium, ray, &mut rng, limits)
+        radiance(world, shaders, env, medium, ray, &mut rng, limits) * w
     };
 
     if config.adaptive_enabled {
@@ -338,6 +353,9 @@ fn render_impl(
     );
 
     let limits = PathLimits { max_depth: config.max_depth, rr_depth: config.rr_depth };
+    // フィルタの表はレンダーごとに 1 度だけ作る（box は None で従来の一様ジッターの経路）
+    let filter = FilterSampler::new(config.filter);
+    let filter_ref = filter.as_ref();
 
     scope(|sp| {
         let world_ref = &scene.world;
@@ -369,7 +387,7 @@ fn render_impl(
                     for y in t.y0..t.y1 {
                         for x in t.x0..t.x1 {
                             let local_idx = (y - t.y0) * tile_w + (x - t.x0);
-                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, shaders, env, medium, cam, limits, config);
+                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, shaders, env, medium, cam, limits, config, filter_ref);
                             sum[local_idx] = c;
                             wsum[local_idx] = n;
                         }
@@ -529,6 +547,7 @@ mod tests {
             seed: 0,
             tonemap: crate::config::Tonemap::None,
             exposure: 0.0,
+            filter: crate::filter::PixelFilter::default(),
         };
 
         let out = render(&scene, &config, "ignored").expect("render should succeed");
@@ -566,6 +585,7 @@ mod tests {
             seed: 0,
             tonemap: crate::config::Tonemap::None,
             exposure: 0.0,
+            filter: crate::filter::PixelFilter::default(),
         }
     }
 

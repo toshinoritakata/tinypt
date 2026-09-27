@@ -13,6 +13,7 @@
 //! - `emitter type="area"`: `radiance`（shape に付随）
 //! - `emitter type="envmap"`(filename) / `constant`(radiance): 環境マップ。`scale` 対応
 //! - `film`(width/height) / `sampler`(sample_count) / `integrator`(max_depth/rr_depth、Mitsuba と同じ意味、max_depth=-1 は無制限): RenderConfig へ反映
+//! - `film` の `<rfilter type="box|tent|gaussian|mitchell">`: 画素の再構成フィルタ（既定 box。フィルタ重点サンプリングで実装、`filter.rs` 参照）
 //!
 //! ## 方針
 //! - 色: `<rgb>` はリニア、`<srgb>` は sRGB（ガンマ展開）。
@@ -37,6 +38,7 @@ use crate::geometry::{Sphere, Triangle};
 use crate::material::Material;
 use crate::math::{Color, Vec3};
 use crate::material::TexId;
+use crate::filter::PixelFilter;
 use crate::shader::{Exprs, ShaderSet, TexRef, ValueId, ValueNode};
 use crate::noise::{NoiseTexture, Pattern};
 use crate::mtl::{parse_mtl, MtlFile, MtlMaterial};
@@ -240,6 +242,7 @@ pub struct SceneSettings {
     pub spp: Option<usize>,
     pub max_depth: Option<usize>,
     pub rr_depth: Option<usize>,
+    pub filter: Option<PixelFilter>,
 }
 
 impl SceneSettings {
@@ -259,6 +262,42 @@ impl SceneSettings {
         }
         if let Some(r) = self.rr_depth {
             config.rr_depth = r;
+        }
+        if let Some(f) = self.filter {
+            config.filter = f;
+        }
+    }
+}
+
+/// `<film>` の `<rfilter type="...">`（Mitsuba 準拠）。box(既定) / tent / gaussian(`stddev`、既定 0.5) /
+/// mitchell(`B`, `C`、既定 1/3 ずつ)。未知の型・不正なパラメータは警告して無視する（フィルタは既定 box のまま）。
+fn parse_rfilter(el: &Element) -> Option<PixelFilter> {
+    let typ = el.typ();
+    match typ {
+        "box" => Some(PixelFilter::Box),
+        "tent" => Some(PixelFilter::Tent),
+        "gaussian" => {
+            let stddev = el.float("stddev").unwrap_or(0.5);
+            if stddev.is_finite() && stddev > 0.0 {
+                Some(PixelFilter::Gaussian { stddev })
+            } else {
+                warn(&format!("rfilter gaussian stddev must be positive and finite (got {stddev}); ignored"));
+                None
+            }
+        }
+        "mitchell" => {
+            let b = el.float("B").unwrap_or(1.0 / 3.0);
+            let c = el.float("C").unwrap_or(1.0 / 3.0);
+            if b.is_finite() && c.is_finite() {
+                Some(PixelFilter::Mitchell { b, c })
+            } else {
+                warn(&format!("rfilter mitchell B/C must be finite (got B={b}, C={c}); ignored"));
+                None
+            }
+        }
+        other => {
+            warn(&format!("unsupported rfilter type '{other}' (expected box | tent | gaussian | mitchell); ignored"));
+            None
         }
     }
 }
@@ -294,6 +333,9 @@ pub fn load_scene_from_str(
                 }
                 if let Some(h) = child.int("height") {
                     settings.height = Some(h.max(1));
+                }
+                if let Some(rf) = child.child_tag("rfilter") {
+                    settings.filter = parse_rfilter(rf);
                 }
             }
             "sampler" => {
@@ -382,7 +424,7 @@ pub fn load_scene_from_str(
                 }
             }
             // レンダリング設定ブロックは無視（このレンダラーは CLI で制御する）
-            "integrator" | "sampler" | "film" | "default" | "rfilter" => {}
+            "integrator" | "sampler" | "film" | "default" => {}
             other => warn(&format!("unsupported element <{}>, skipped", other)),
         }
     }
@@ -2001,6 +2043,77 @@ mod tests {
         assert_eq!(config.spp, 256);
         assert_eq!(config.max_depth, 12);
         assert_eq!(config.rr_depth, 5);
+    }
+
+    /// `<rfilter>` は `<film>` の子。既定は box（settings.filter は None のまま）。box/tent/gaussian/mitchell を読み、
+    /// 未知の型・不正なパラメータは警告して box のまま（settings.filter は None）。
+    #[test]
+    fn rfilter_reads_each_type_and_warns_on_bad_input() {
+        let film = |inner: &str| format!(
+            r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor>
+                 <film type="hdrfilm">{inner}</film>
+                 <shape type="sphere"><bsdf type="diffuse"/></shape></scene>"#
+        );
+        let load = |xml: &str| capture_warnings(|| load_scene_from_str(xml, Path::new("."), &cfg(), (None, None)).unwrap().1);
+
+        let (settings, w) = load(&film(""));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, None, "no <rfilter>: box stays the default");
+
+        let (settings, w) = load(&film(r#"<rfilter type="box"/>"#));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, Some(PixelFilter::Box));
+
+        let (settings, w) = load(&film(r#"<rfilter type="tent"/>"#));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, Some(PixelFilter::Tent));
+
+        let (settings, w) = load(&film(r#"<rfilter type="gaussian"/>"#));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, Some(PixelFilter::Gaussian { stddev: 0.5 }));
+
+        let (settings, w) = load(&film(r#"<rfilter type="gaussian"><float name="stddev" value="0.8"/></rfilter>"#));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, Some(PixelFilter::Gaussian { stddev: 0.8 }));
+
+        let (settings, w) = load(&film(r#"<rfilter type="mitchell"/>"#));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, Some(PixelFilter::Mitchell { b: 1.0 / 3.0, c: 1.0 / 3.0 }));
+
+        let (settings, w) = load(&film(r#"<rfilter type="mitchell"><float name="B" value="0.5"/><float name="C" value="0.25"/></rfilter>"#));
+        assert!(w.is_empty());
+        assert_eq!(settings.filter, Some(PixelFilter::Mitchell { b: 0.5, c: 0.25 }));
+
+        for bad in [
+            r#"<rfilter type="lanczos"/>"#,
+            r#"<rfilter type="gaussian"><float name="stddev" value="-1"/></rfilter>"#,
+            r#"<rfilter type="gaussian"><float name="stddev" value="nan"/></rfilter>"#,
+            r#"<rfilter type="mitchell"><float name="B" value="inf"/></rfilter>"#,
+        ] {
+            let (settings, w) = load(&film(bad));
+            assert!(!w.is_empty(), "{bad}");
+            assert_eq!(settings.filter, None, "{bad}: falls back to box");
+        }
+    }
+
+    /// CLI の `--filter` はシーンファイルの `<rfilter>` より優先する（他の CLI 上書きと同じ規則）。
+    #[test]
+    fn cli_filter_overrides_the_scene_rfilter() {
+        use crate::cli::{load_with_overrides, parse_args};
+        let dir = motion_dir("filter_cli");
+        let xml = format!(
+            r#"<scene version="3.0.0"><sensor type="perspective"><float name="fov" value="40"/></sensor>
+                 <film type="hdrfilm"><rfilter type="gaussian"/></film>{}</scene>"#,
+            obj_shape("a.obj", 0.0, DIFFUSE_A, "")
+        );
+        std::fs::write(dir.join("s.xml"), &xml).unwrap();
+        let mut config = cfg();
+        config.scene_path = Some(dir.join("s.xml").to_string_lossy().into_owned());
+        let (overrides, w) = parse_args(["--filter".to_string(), "mitchell".to_string()], &mut config);
+        assert!(w.is_empty());
+        load_with_overrides(&mut config, &overrides).unwrap();
+        assert_eq!(config.filter, PixelFilter::Mitchell { b: 1.0 / 3.0, c: 1.0 / 3.0 });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// max_depth = -1 は無制限、0 はそのまま（何も描かない）、それ以外の負値と rr_depth < 1 は無視。

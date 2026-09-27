@@ -268,6 +268,7 @@ Loaded in 2.81s (obj parse 0.91s, mesh + BVH build 1.87s, textures 0.00s)
 | `--no-env` | — | それ以前に指定した `--env` を取り消す (デフォルトも未指定＝手続き的な空) |
 | `--denoise` / `--no-denoise` | 有効 | Intel OIDN デノイズ |
 | `--adaptive` / `--no-adaptive` | 無効 | アダプティブサンプリング (バイアスあり、[下記](#アダプティブサンプリングのバイアス)) |
+| `--filter box\|tent\|gaussian\|mitchell` | `box` | 画素の再構成フィルタ ([下記](#画素フィルタ))。シーンファイルの `<rfilter>` より優先 |
 | `--adaptive-min-spp N` | 8 | アダプティブサンプリングの最小サンプル数 (0 は警告して 1 にする) |
 | `--adaptive-threshold N` | 0.02 | 収束閾値 (相対標準偏差、負値は 0 に丸め) |
 | `--seed N` | 0 | 乱数シード。同じ設定なら出力はスレッド数に依らず決定論的 |
@@ -374,12 +375,25 @@ PPM は以前の ASCII 形式 (P3。組み込みシーン 1 spp の 1920x1080 �
 | `<emitter type="point"\|"directional"\|"spot">` | シーン直下のデルタ光源 (複数可)。`position` / `direction` 直書きは独自拡張 ([詳細](#デルタ光源)) |
 | `<medium type="homogeneous">` | シーン直下に 1 つ。`sigma_t` / `albedo` / `<phase>` / `bounds_min`・`bounds_max` (独自拡張) ([詳細](#参加媒質)) |
 | `<film>` / `<sampler>` / `<integrator>` | 解像度 / `sample_count` / `max_depth`・`rr_depth` (Mitsuba と同じパス長の意味: `max_depth` 1 = 直接見える発光体のみ、2 = 直接照明まで、-1 = 無制限。組み込みシーンの既定は `max_depth` 9・`rr_depth` 4) |
+| `<film>` の `<rfilter>` | 画素フィルタ (`box`(既定) / `tent` / `gaussian`(`stddev`) / `mitchell`(`B`, `C`)、[詳細](#画素フィルタ)) |
 
 - **色**: `<rgb>` はリニア、`<srgb>` は sRGB (ガンマ展開)。
 - **CLI 優先**: `--spp` はシーンファイルの `sample_count` を上書きする。解像度は `--width` / `--height` / `--res` で上書きできる (`<film>` より優先)。`max_depth`・`rr_depth` は CLI から変更不可。
 - **背景**: 環境 emitter が無ければ黒 (Mitsuba 準拠)。組み込みシーンの手続き的な空は使わない。
 - **スムーズシェーディング**: OBJ に頂点法線 (`vn`) があれば重心座標で補間してシェーディングに使う (既定)。`<boolean name="face_normals" value="true"/>` を shape に書くと頂点法線を捨てて面法線だけで陰影を付ける。`rectangle` / `cube` / `disk` / `sphere` は元から頂点法線を持たないので、この指定で結果は変わらない。 値は Mitsuba と同じく `true` / `false` のみで、それ以外 (`1` / `yes` / `TRUE` など) は**警告して既定にフォールバック**する。
-- 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。ただし `<default>` と `<rfilter>` は**警告なし**で無視される。
+- 未対応の要素・型・属性は警告してスキップ／フォールバックする (寛容なパース)。ただし `<default>` は**警告なし**で無視される。
+### 画素フィルタ
+
+画素の再構成フィルタは既定で `box`（半径 0.5 の一様。指定が無いシーンは常にビット単位で従来と同じ）。`tent`（半径 1）・`gaussian`（Mitsuba と同じ定義: `stddev` 既定 0.5、半径 `4·stddev` で裾を引いて 0 になる）・`mitchell`（`B`・`C` 既定 1/3 ずつ、半径 2）を選べる。**Mitsuba 自体の既定は gaussian だが、tinypt は box を既定にしている**（`--filter`/`<rfilter>` を指定しないシーン・ゴールデンテストがビット単位で変わらないようにするため）。
+
+```xml
+<film type="hdrfilm">
+  <rfilter type="gaussian"><float name="stddev" value="0.5"/></rfilter>
+</film>
+```
+
+各軸をフィルタの絶対値に比例してサンプルする（フィルタ重点サンプリング）。box・tent・gaussian は非負なので重みは常に 1。Mitchell は `1 < |x| < 2` に負のローブがあり、サンプルの重みに符号が付く（不偏を保つため、割るのは従来どおりサンプル数で、重みの和ではない）。境界付近で出力が負になりうるので、出力直前（8bit 量子化）でのみ 0 に切る（Mitsuba と同じ）。デノイズに渡す直前のコピーも同様に 0 に切る（蓄積・チェックポイントは符号つきのまま）。CLI の `--filter` はシーンファイルの `<rfilter>` より優先する。
+
 - スペクトルや `<default>`/`$param` 置換、環境マップの `to_world` 回転は未対応。`$param` に依存するシーンでも警告は出ない。
 
 ### 参加媒質

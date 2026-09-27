@@ -380,7 +380,13 @@ impl App {
         let (e, warns) = self.edit.clamped();
         self.edit = e;
         self.opts_note = if warns.is_empty() { String::new() } else { format!("adjusted: {}", warns.join(", ")) };
-        let mut ov = CliOverrides { spp: self.overrides.spp, width: self.overrides.width, height: self.overrides.height, help: false };
+        let mut ov = CliOverrides {
+            spp: self.overrides.spp,
+            width: self.overrides.width,
+            height: self.overrides.height,
+            help: false,
+            filter: self.overrides.filter,
+        };
         if e.spp != self.active.spp {
             ov.spp = Some(e.spp);
             self.base.spp = e.spp;

@@ -18,12 +18,14 @@ pub fn denoise_oidn(pixels: &[Color], w: usize, h: usize) -> Vec<Color> {
         return Vec::new();
     }
 
-    // Convert Color to f32 RGB buffer (OIDN expects f32)
+    // Convert Color to f32 RGB buffer (OIDN expects f32). OIDN expects non-negative HDR input;
+    // a filter with negative lobes (Mitchell) can leave small negative pixels near edges, so clamp
+    // this copy to 0 (the accumulator itself, and the checkpoint, stay signed and unclamped).
     let mut buffer: Vec<f32> = Vec::with_capacity(w * h * 3);
     for c in pixels {
-        buffer.push(c.r() as f32);
-        buffer.push(c.g() as f32);
-        buffer.push(c.b() as f32);
+        buffer.push(c.r().max(0.0) as f32);
+        buffer.push(c.g().max(0.0) as f32);
+        buffer.push(c.b().max(0.0) as f32);
     }
 
     // OIDN 2.5 以降、デバイス生成とフィルタ生成は Result を返す。

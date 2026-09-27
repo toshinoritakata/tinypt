@@ -45,6 +45,8 @@ pub struct RenderConfig {
     pub tonemap: Tonemap,
     /// 露出補正（EV 単位、0.0 で補正なし）
     pub exposure: f64,
+    /// 画素の再構成フィルタ（アンチエイリアス。既定 box = 従来どおりのビット一致）
+    pub filter: crate::filter::PixelFilter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,7 @@ impl RenderConfig {
             seed: 0,
             tonemap: Tonemap::Aces,
             exposure: 0.0,
+            filter: crate::filter::PixelFilter::default(),
         }
     }
 }

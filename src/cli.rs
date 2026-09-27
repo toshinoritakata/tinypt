@@ -17,6 +17,8 @@ pub struct CliOverrides {
     pub height: Option<usize>,
     /// `-h` / `--help` が指定された（使い方を表示してレンダーせずに終了する）
     pub help: bool,
+    /// `--filter` が指定された場合の画素フィルタ（シーンファイルの `<rfilter>` より優先）
+    pub filter: Option<crate::filter::PixelFilter>,
 }
 
 impl CliOverrides {
@@ -84,6 +86,7 @@ Sampling:
   --adaptive-threshold X     Convergence threshold, relative std. dev., finite (default: 0.02)
   --seed N                   Random seed (default: 0)
   --morton / --no-morton     Morton-order tiles (default: on)
+  --filter box|tent|gaussian|mitchell  Pixel reconstruction filter (default: box; overrides the scene file's <rfilter>)
 
 Post-processing (PPM only for tonemap/exposure):
   --denoise / --no-denoise   Intel OIDN denoising (default: on)
@@ -243,6 +246,17 @@ pub fn parse_args(args: impl IntoIterator<Item = String>, config: &mut RenderCon
                     config.exposure = n;
                 }
             }
+            "--filter" => {
+                if let Some(v) = next_value(&mut args, &arg, w) {
+                    match crate::filter::PixelFilter::from_name(&v) {
+                        Some(f) => {
+                            config.filter = f;
+                            overrides.filter = Some(f);
+                        }
+                        None => w.push(format!("invalid value '{}' for --filter (expected box|tent|gaussian|mitchell); ignored", v)),
+                    }
+                }
+            }
             "--checkpoint" => {
                 config.checkpoint_enabled = true;
             }
@@ -297,6 +311,10 @@ pub fn load_with_overrides(config: &mut RenderConfig, overrides: &CliOverrides) 
     if let Some(spp) = overrides.spp {
         config.spp = spp;
     }
+    // シーンファイルの <rfilter> より CLI の --filter を優先する（他の CLI 上書きと同じ規則）
+    if let Some(f) = overrides.filter {
+        config.filter = f;
+    }
     Ok(scene)
 }
 
@@ -308,6 +326,19 @@ mod tests {
         let mut config = RenderConfig::default();
         let (o, w) = parse_args(args.iter().map(|s| s.to_string()), &mut config);
         (config, o, w)
+    }
+
+    /// `--filter` は値を反映し、不正な名前は警告して既定 box のまま。
+    #[test]
+    fn filter_flag_parses_and_rejects_unknown_names() {
+        use crate::filter::PixelFilter;
+        let (c, o, w) = parse(&["--filter", "mitchell"]);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.filter, PixelFilter::Mitchell { b: 1.0 / 3.0, c: 1.0 / 3.0 });
+        assert_eq!(o.filter, Some(c.filter));
+        let (c, _, w) = parse(&["--filter", "lanczos"]);
+        assert!(w.iter().any(|m| m.contains("--filter")), "{w:?}");
+        assert_eq!(c.filter, PixelFilter::Box);
     }
 
     /// 正しい引数では警告が出ず、値が反映される。
