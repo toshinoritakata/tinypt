@@ -432,6 +432,30 @@ struct Tlas {
     n_sdf: usize,
 }
 
+/// TLAS の葉の通し番号 `k` が指す先（`Tlas::category` が判定する）。`hit` と `occluded` の TLAS 経由の
+/// 経路が共有する分類で、値そのものは `Tlas` の 3 つの数から即座に決まる添字なので、この分岐自体に
+/// 実行コストは無い（各腕はそのまま従来と同じ 1 回の添字計算）。
+enum TlasLeaf {
+    Instance(usize),
+    Sphere(usize),
+    Sdf(usize),
+}
+
+impl Tlas {
+    /// 通し番号 `k` がどのプリミティブ配列の何番目かを返す（`k < n_inst` はインスタンス、
+    /// 次の `n_sph` 個は球、残りは SDF。[`Tlas`] のドキュメント参照）。
+    #[inline(always)]
+    fn category(&self, k: usize) -> TlasLeaf {
+        if k < self.n_inst {
+            TlasLeaf::Instance(k)
+        } else if k >= self.n_inst + self.n_sph {
+            TlasLeaf::Sdf(k - self.n_inst - self.n_sph)
+        } else {
+            TlasLeaf::Sphere(k - self.n_inst)
+        }
+    }
+}
+
 /// この数以上のプリミティブ（インスタンス + 球）があるときだけ TLAS を使う。少数では総当たりのほうが速い
 /// （決め方は tlas_report.md 参照）。
 const TLAS_MIN_PRIMS: usize = 20;
@@ -1048,32 +1072,34 @@ impl World {
             let mut best_k = usize::MAX;
             Self::tlas_traverse(tlas, r, tmin, &closest, |k| {
                 let c = closest.get();
-                if k < tlas.n_inst {
-                    if let Some(h) = self.hit_instance(k, r, inv_d, tmin, c, k < best_k) {
-                        closest.set(h.t);
-                        best = Some(h);
-                        best_k = k;
-                    }
-                } else if k >= tlas.n_inst + tlas.n_sph {
-                    let sdf_idx = k - tlas.n_inst - tlas.n_sph;
-                    let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
-                    let cand = self.sdfs[sdf_idx].hit(r, tmin, hi).filter(|h| h.t < c || (h.t == c && k < best_k));
-                    if let Some(mut h) = cand {
-                        h.prim_id = tlas.n_sph + sdf_idx;
-                        closest.set(h.t);
-                        best = Some(h);
-                        best_k = k;
-                    }
-                } else {
-                    let idx = k - tlas.n_inst;
-                    // 同値タイで勝てる（添字が小さい）ときだけ、区間の上端をわずかに広げて t == closest の交差を拾う
-                    let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
-                    if let Some(mut h) = self.sphere_hit(idx, r, tmin, hi) {
-                        if h.t < c || (h.t == c && k < best_k) {
-                            h.prim_id = idx;
+                match tlas.category(k) {
+                    TlasLeaf::Instance(inst_id) => {
+                        if let Some(h) = self.hit_instance(inst_id, r, inv_d, tmin, c, k < best_k) {
                             closest.set(h.t);
                             best = Some(h);
                             best_k = k;
+                        }
+                    }
+                    TlasLeaf::Sdf(sdf_idx) => {
+                        let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
+                        let cand = self.sdfs[sdf_idx].hit(r, tmin, hi).filter(|h| h.t < c || (h.t == c && k < best_k));
+                        if let Some(mut h) = cand {
+                            h.prim_id = tlas.n_sph + sdf_idx;
+                            closest.set(h.t);
+                            best = Some(h);
+                            best_k = k;
+                        }
+                    }
+                    TlasLeaf::Sphere(idx) => {
+                        // 同値タイで勝てる（添字が小さい）ときだけ、区間の上端をわずかに広げて t == closest の交差を拾う
+                        let hi = if k < best_k && best.is_some() { c.next_up() } else { c };
+                        if let Some(mut h) = self.sphere_hit(idx, r, tmin, hi) {
+                            if h.t < c || (h.t == c && k < best_k) {
+                                h.prim_id = idx;
+                                closest.set(h.t);
+                                best = Some(h);
+                                best_k = k;
+                            }
                         }
                     }
                 }
@@ -1227,13 +1253,10 @@ impl World {
             let tmax_cell = Cell::new(tmax);
             let mut found = false;
             Self::tlas_traverse(tlas, r, tmin, &tmax_cell, |k| {
-                found = if k < tlas.n_inst {
-                    self.occluded_instance(k, r, inv_d, tmin, tmax, skip)
-                } else if k >= tlas.n_inst + tlas.n_sph {
-                    self.sdfs[k - tlas.n_inst - tlas.n_sph].hit(r, tmin, tmax).is_some()
-                } else {
-                    let idx = k - tlas.n_inst;
-                    skip != Some((None, idx)) && self.sphere_hit(idx, r, tmin, tmax).is_some()
+                found = match tlas.category(k) {
+                    TlasLeaf::Instance(inst_id) => self.occluded_instance(inst_id, r, inv_d, tmin, tmax, skip),
+                    TlasLeaf::Sdf(sdf_idx) => self.sdfs[sdf_idx].hit(r, tmin, tmax).is_some(),
+                    TlasLeaf::Sphere(idx) => skip != Some((None, idx)) && self.sphere_hit(idx, r, tmin, tmax).is_some(),
                 };
                 found
             });
