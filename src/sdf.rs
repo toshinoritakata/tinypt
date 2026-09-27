@@ -44,7 +44,7 @@ pub enum SdfNoisePattern {
     Turbulence,
 }
 
-/// `Displace` のノイズ場のパラメータ。`f(p) = f_child(p) + amplitude · n(p · scale + offset)`。ノイズ場は
+/// `Displace` のノイズ場のパラメータ。`f(p) = f_child(p) + amplitude · n((p + offset) · scale)`。ノイズ場は
 /// **物体空間に固定**（時刻で動かない）。
 #[derive(Clone, Copy, Debug)]
 pub struct SdfNoise {
@@ -55,7 +55,7 @@ pub struct SdfNoise {
     pub octaves: u32,
     pub lacunarity: f64,
     pub gain: f64,
-    /// 倍率をかけた後に足す
+    /// 倍率をかける前に座標へ足す（`<texture type="noise">` の `offset` と同じ意味）
     pub offset: Vec3,
 }
 
@@ -65,9 +65,9 @@ pub struct SdfNoise {
 const PERLIN_LIPSCHITZ: f64 = 4.0;
 
 impl SdfNoise {
-    /// ノイズ値 `n(p · scale + offset)`（[-1, 1]）。
+    /// ノイズ値 `n((p + offset) · scale)`（[-1, 1]）。
     fn value(&self, p: Vec3) -> f64 {
-        let q = p * self.scale + self.offset;
+        let q = (p + self.offset) * self.scale;
         match self.pattern {
             SdfNoisePattern::Perlin => perlin(q),
             SdfNoisePattern::Fbm => fbm(q, self.octaves, self.lacunarity, self.gain),
@@ -75,7 +75,7 @@ impl SdfNoise {
         }
     }
 
-    /// 変位項 `amplitude · n(p · scale + offset)` の勾配の大きさの上界（物体空間）。
+    /// 変位項 `amplitude · n((p + offset) · scale)` の勾配の大きさの上界（物体空間）。
     /// fBm は `Σ g^i·λ^i·L_perlin / Σ g^i`（オクターブ `i`、正規化の分母つき）。乱流は `|perlin|` の和で
     /// リプシッツ定数は同じ、`2t − 1` で 2 倍。
     fn lipschitz(&self) -> f64 {

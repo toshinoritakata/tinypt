@@ -1015,7 +1015,7 @@ fn parse_sdf_node(el: &Element, tree: &mut SdfTree) -> Result<SdfId, String> {
             return Ok(acc);
         }
         "displace" => {
-            // 子の面をノイズ場でずらす（独自拡張）。`f = f_child + amplitude · n(p · scale + offset)`。名前と既定値は
+            // 子の面をノイズ場でずらす（独自拡張）。`f = f_child + amplitude · n((p + offset) · scale)`。名前と既定値は
             // `<texture type="noise">` に揃える（pattern / scale / octaves / lacunarity / gain）
             let kids: Vec<&Element> = el.children.iter().filter(|c| c.tag == "sdf").collect();
             if kids.len() != 1 {
@@ -3702,7 +3702,7 @@ mod tests {
         ));
         assert!(w.is_empty(), "{w:?}");
         let t = s.world.sdfs()[0].tree();
-        let expect = p.len() - 1.0 + 0.2 * crate::noise::perlin(p * 4.0 + Vec3::new(1.0, 2.0, 3.0));
+        let expect = p.len() - 1.0 + 0.2 * crate::noise::perlin((p + Vec3::new(1.0, 2.0, 3.0)) * 4.0);
         assert!((t.eval(p) - expect).abs() < 1e-12);
         // 未知のパターンは警告して fbm、範囲外のパラメータは警告して丸める
         let (s, w) = sdf_scene(&shape(r#"<sdf type="displace"><string name="pattern" value="marble"/><sdf type="sphere"/></sdf>"#));
