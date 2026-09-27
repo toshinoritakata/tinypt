@@ -23,17 +23,12 @@ use crossbeam_channel as chan;
 use crate::checkpoint::{load_checkpoint, save_checkpoint, CheckpointState};
 use crate::config::RenderConfig;
 use crate::constants::ui::PROGRESS_INTERVAL_MS;
-use crate::env::EnvMap;
 use crate::filter::FilterSampler;
 use crate::integrator::{radiance, PathLimits};
-use crate::shader::ShaderSet;
 use crate::math::Color;
-use crate::medium::Medium;
-use crate::ray::Camera;
 use crate::rng::{seed_for, splitmix64, Rng};
 use crate::scene::Scene;
 use crate::task::{idx, Task, TileResult};
-use crate::world::World;
 
 /// レンダラーが出力する蓄積バッファ。
 ///
@@ -166,15 +161,14 @@ fn sample_pixel(
     inv_w: f64,
     inv_h: f64,
     t: &Task,
-    world: &World,
-    shaders: &ShaderSet,
-    env: Option<&EnvMap>,
-    medium: Option<&Medium>,
-    cam: &Camera,
+    scene: &Scene,
     limits: PathLimits,
     config: &RenderConfig,
     filter: Option<&FilterSampler>,
 ) -> (Color, f64) {
+    // `Scene` はレイ生成・積分に要る参照をまとめて持つ束（`world`/`shaders`/`env`/`medium`/`cam`）。
+    // ここで 1 回だけ取り出す（束から出すだけで実行コストは無い。以下は従来と同じ個別の参照を使う）
+    let (world, shaders, env, medium, cam) = (&scene.world, &scene.shaders, scene.env.as_ref(), scene.medium.as_ref(), &scene.cam);
     let mut c = Color::new(0.0, 0.0, 0.0);
     let max_spp = (t.sample_end - t.sample_start).max(1);
     // 画素ごとのスクランブルの種（画素座標とユーザーシードから。全サンプル共通）
@@ -358,20 +352,9 @@ fn render_impl(
     let filter_ref = filter.as_ref();
 
     scope(|sp| {
-        let world_ref = &scene.world;
-        let shaders_ref = &scene.shaders;
-        let cam_ref = &scene.cam;
-        let env_ref = scene.env.as_ref();
-        let medium_ref = scene.medium.as_ref();
-
         for _ in 0..threads {
             let rx = rx.clone();
             let rtx = rtx.clone();
-            let world = world_ref;
-            let shaders = shaders_ref;
-            let cam = cam_ref;
-            let env = env_ref;
-            let medium = medium_ref;
             sp.spawn(move |_| {
                 // ワーカーループ: チャネルからタスクを受信し処理
                 while let Ok(t) = rx.recv() {
@@ -387,7 +370,7 @@ fn render_impl(
                     for y in t.y0..t.y1 {
                         for x in t.x0..t.x1 {
                             let local_idx = (y - t.y0) * tile_w + (x - t.x0);
-                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, world, shaders, env, medium, cam, limits, config, filter_ref);
+                            let (c, n) = sample_pixel(x, y, inv_w, inv_h, &t, scene, limits, config, filter_ref);
                             sum[local_idx] = c;
                             wsum[local_idx] = n;
                         }
@@ -502,6 +485,7 @@ mod tests {
     use crate::math::Vec3;
     use crate::ray::Camera;
     use crate::scene::Scene;
+    use crate::shader::ShaderSet;
     use crate::world::World;
 
     fn empty_scene(w: usize, h: usize) -> Scene {
