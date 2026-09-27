@@ -605,3 +605,17 @@ RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
 ```
 
 macOS では Instruments の Time Profiler で `target/profiling/tinypt` を指定してサンプリング。
+
+## ライセンス
+
+MIT License と Apache License 2.0 のデュアルライセンス。利用者はどちらか一方を選べる
+([LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE))。
+
+コントリビューションは、特に明記しない限り、同じく MIT OR Apache-2.0 で提供されたものとみなす。
+
+このリポジトリのコードは AI (Claude) の支援を受けて書かれている。設計・機能の選択・レビューは作者による。
+
+### 同梱・外部アセット
+
+- `sample/env.exr`: **出典未確認**。上記のライセンスの対象外として扱い、再配布が必要な場合は出典を確認するか差し替えること。
+- Sponza / Rungholt: リポジトリには含まない (`tools/fetch_models.sh` が配布元から取得)。CC BY 3.0。出典は[外部ベンチマークモデル](#外部ベンチマークモデル-sponza--rungholt)を参照。`docs/images/showcase_sponza_textured.png` と `showcase_rungholt.png` はこれらのモデルを描画したもので、同じ帰属表示に従う。
