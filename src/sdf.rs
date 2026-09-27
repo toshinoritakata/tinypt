@@ -63,6 +63,13 @@ pub struct SdfNoise {
 /// 最大 3.27）に約 22% の余裕を付けた値。解析的な上界ではない（改良 Perlin の補間の勾配は導けるが、`clamp` と
 /// 格子ごとのハッシュ選択を含めた厳密な上界は得ていない）ので、余裕はこの実測の不確かさのためのもの。
 const PERLIN_LIPSCHITZ: f64 = 4.0;
+/// fBm / 乱流の勾配の二乗和による見積もり（[`SdfNoise::lipschitz`]）に掛ける余裕。
+/// `L_FBM_NOTE`: 実測した `max|∇fbm|`（乱択 150 万点と山登りの大きい方）を、二乗和の式（余裕なし）と比べると、
+/// 10 通りのパラメータ（オクターブ 1〜8、λ 2〜3、gain 0.5〜1）で実測 / 式 = 0.79〜0.97（最悪は既定の
+/// オクターブ 4・λ 2・gain 0.5 で 4.16 / 4.27 = 0.97。オクターブ 1 は線形和の側が効く）。1.15 倍でその最悪でも約 18% の余裕が残る。
+const FBM_QUADRATURE_MARGIN: f64 = 1.15;
+/// `SdfNoise::value` の絶対値の上界（perlin / fbm は [-1, 1]、乱流は `2t − 1` で [-1, 1]）。
+const NOISE_ABS_MAX: f64 = 1.0;
 
 impl SdfNoise {
     /// ノイズ値 `n((p + offset) · scale)`（[-1, 1]）。
@@ -87,7 +94,14 @@ impl SdfNoise {
             }
             sum
         };
-        let multi = octave_sum(self.gain * self.lacunarity) / octave_sum(self.gain);
+        // オクターブの重ね方の係数 `L_fbm / L_perlin`。上界の 1 つ目は勾配が**全オクターブで同じ向きに揃う**として
+        // 足し合わせた `Σ(gλ)^i / Σ g^i`（証明済みの上界だが緩い）。2 つ目は揃わない（ほぼ直交する）として二乗和で
+        // 足した `√Σ(gλ)^{2i} / Σ g^i` に 15% の余裕を付けたもの（**実測の裏付け**: 下記 `L_FBM_NOTE`）。
+        // どちらも上界として採れるので小さい方を使う
+        let ratio = self.gain * self.lacunarity;
+        let linear = octave_sum(ratio) / octave_sum(self.gain);
+        let quadrature = FBM_QUADRATURE_MARGIN * octave_sum(ratio * ratio).sqrt() / octave_sum(self.gain);
+        let multi = linear.min(quadrature);
         let noise = match self.pattern {
             SdfNoisePattern::Perlin => PERLIN_LIPSCHITZ,
             SdfNoisePattern::Fbm => PERLIN_LIPSCHITZ * multi,
@@ -288,6 +302,11 @@ impl SdfTree {
     /// `Displace` は `L_child + |amplitude|·scale·L_noise`。**`Displace` が無い木はちょうど 1.0** を返す
     /// （呼び出し側はそのとき従来と同じ演算を通る）。
     pub fn lipschitz(&self) -> f64 {
+        self.node_lipschitz().last().copied().unwrap_or(1.0)
+    }
+
+    /// ノードごとのリプシッツ定数の上界（[`lipschitz`](Self::lipschitz) の途中経過。根の値がその木全体の値）。
+    pub fn node_lipschitz(&self) -> Vec<f64> {
         let mut lip: Vec<f64> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let l = match node {
@@ -302,7 +321,64 @@ impl SdfTree {
             };
             lip.push(l);
         }
-        lip.last().copied().unwrap_or(1.0)
+        lip
+    }
+
+    /// 値 `f` と**安全な歩幅** `safe`（点 `p` から `f` の零点集合までの距離の下界。レイマーチはこの距離だけ進んでも
+    /// 面を越えない）を同時に返す。`lips` は [`node_lipschitz`](Self::node_lipschitz)。値は [`eval_at`](Self::eval_at) と同じ。
+    /// 木を前から 1 パスで評価し、ノードごとに `f_i` と `s_i`（`s_i ≤ dist(p, {f_i = 0})`）を持ち上げる:
+    /// - **プリミティブ**: `s = |f|`（厳密な符号付き距離、`L = 1`）。
+    /// - **和・積・差**（`min` / `max` / `max(a, −b)`）: 零点集合は子の零点集合の和集合に含まれる
+    ///   （`min(fa, fb) = 0` なら `fa = 0` か `fb = 0`、`max` も同様）ので `dist ≥ min(s_a, s_b)`。
+    ///   さらに `f_i` 自体が `L_i`-リプシッツなので `|f_i| / L_i` も下界。**大きい方**を採る（どちらも下界）。
+    /// - **平滑演算**: 零点集合が子の零点集合に含まれないので子の `s` は使えない。`|f_i| / L_i` だけ。
+    /// - **`Displace`**（`f = f_c + A·n`、`|n| ≤ 1`）: `|f_c(q)| > |A|` の点では `f(q)` は `f_c` と同符号で 0 にならない。
+    ///   `f_c` は `L_c`-リプシッツなので、`p` を中心とする半径 `r < (|f_c(p)| − |A|) / L_c` の球では `|f_c(q)| ≥ |f_c(p)| − L_c·r > |A|`、
+    ///   つまり零点は無い。よって `|f_c(p)| > |A|` なら `s = (|f_c(p)| − |A|) / L_c`（殻の外は子の `L_c` だけで進める）。
+    ///   これと `|f| / L_i` は共に下界なので大きい方を採る。殻の中（`|f_c| ≤ |A|`）は `|f| / L_i` のみ。
+    pub fn eval_step_at(&self, p: Vec3, time: f64, lips: &[f64]) -> (f64, f64) {
+        let n = self.nodes.len();
+        if n == 0 {
+            return (f64::INFINITY, f64::INFINITY);
+        }
+        // ノード数が少ないときはスタック、多いときだけヒープ（`eval_at` と同じ）
+        let (mut fs_stack, mut ss_stack) = ([0.0f64; EVAL_STACK_N], [0.0f64; EVAL_STACK_N]);
+        let (mut fs_heap, mut ss_heap);
+        let (fs, ss): (&mut [f64], &mut [f64]) = if n <= EVAL_STACK_N {
+            (&mut fs_stack[..n], &mut ss_stack[..n])
+        } else {
+            fs_heap = vec![0.0; n];
+            ss_heap = vec![0.0; n];
+            (&mut fs_heap, &mut ss_heap)
+        };
+        for i in 0..n {
+            let (f, safe) = match (&self.nodes[i], self.motion.get(i).copied().flatten()) {
+                (SdfNode::Prim(prim), moving) => {
+                    let f = match moving {
+                        Some(end) => eval_prim(&prim_at(prim, end, time), p),
+                        None => eval_prim(prim, p),
+                    };
+                    (f, f.abs())
+                }
+                (node @ SdfNode::Op(op), _) => {
+                    let f = self.eval_node(node, p, fs);
+                    let own = f.abs() / lips[i];
+                    let safe = match *op {
+                        SdfOp::Union(a, b) | SdfOp::Intersect(a, b) | SdfOp::Subtract(a, b) => own.max(ss[a as usize].min(ss[b as usize])),
+                        SdfOp::SmoothUnion(..) | SdfOp::SmoothIntersect(..) | SdfOp::SmoothSubtract(..) => own,
+                        SdfOp::Displace(a, noise) => {
+                            let shell = noise.amplitude.abs() * NOISE_ABS_MAX;
+                            let outside = fs[a as usize].abs() - shell;
+                            if outside > 0.0 { own.max(outside / lips[a as usize]) } else { own }
+                        }
+                    };
+                    (f, safe)
+                }
+            };
+            fs[i] = f;
+            ss[i] = safe;
+        }
+        (fs[n - 1], ss[n - 1])
     }
 
     /// 勾配（外向き法線、正規化前）を四面体中心差分で求める（4 回評価。Inigo Quilez の手法）。
@@ -466,6 +542,8 @@ pub struct SdfShape {
     anim: Option<AnimatedTransform>,
     /// 木のリプシッツ定数（`Displace` が無ければちょうど 1.0）。レイマーチの歩幅を割る
     lipschitz: f64,
+    /// ノードごとのリプシッツ定数（`lipschitz > 1` のときだけ。殻スキップの歩幅計算 [`SdfTree::eval_step_at`] に使う）
+    node_lips: Vec<f64>,
     /// 収束幅（物体空間）
     eps_obj: f64,
     /// 法線の差分幅（物体空間）
@@ -482,10 +560,12 @@ impl SdfShape {
         }
         let diag = (b.max - b.min).len().max(1e-9);
         let eps_obj = EPS_REL * diag;
-        let lipschitz = tree.lipschitz();
+        let node_lips = tree.node_lipschitz();
+        let lipschitz = node_lips.last().copied().unwrap_or(1.0);
+        let node_lips = if lipschitz == 1.0 { Vec::new() } else { node_lips };
         let obj_bounds = grow(b, ERR_BOX_EPS * eps_obj * 2.0 * lipschitz);
         let world_bounds = crate::world::box_world_bounds(obj_bounds, &xform);
-        Some(Self { tree, xform, mat_id, obj_bounds, world_bounds, anim: None, lipschitz, eps_obj, normal_h: (NORMAL_H_REL * diag).max(1e-9) })
+        Some(Self { tree, xform, mat_id, obj_bounds, world_bounds, anim: None, lipschitz, node_lips, eps_obj, normal_h: (NORMAL_H_REL * diag).max(1e-9) })
     }
 
     pub fn tree(&self) -> &SdfTree {
@@ -567,9 +647,9 @@ impl SdfShape {
         let mut t = t_in.max(tmin);
         let t_end = t_out.min(tmax);
         let eps = self.eps_obj;
-        // 歩幅は |f| / (L·|d_obj|)。`Displace` が無い（L == 1）ときは割らず、従来と同じ `d_len` のまま
-        let step_len = if self.lipschitz == 1.0 { d_len } else { d_len * self.lipschitz };
-        // 歩幅が 1/L に縮むぶん、面に浅く近づくレイの収束にも L 倍の歩数が要る（L == 1 は従来どおり MAX_STEPS）
+        // 歩幅は `safe / |d_obj|`（`safe` は面を越えない距離。L == 1 では従来どおり `|f|`、`Displace` を含む形状では
+        // `eval_step_at` の殻スキップつきの値）。殻の中では `|f| / L` まで縮むので、面に浅く近づくレイの収束にも
+        // L 倍の歩数が要る（L == 1 は従来どおり MAX_STEPS）
         let max_steps = if self.lipschitz == 1.0 { MAX_STEPS } else { ((MAX_STEPS as f64 * self.lipschitz) as usize).min(MAX_STEPS_CAP) };
         // 直前のマーチ位置（t, f）。収束点の手前で、f は収束点と同じ符号（外側から始まれば正、内側から始まれば負）
         let mut prev: Option<(f64, f64)> = None;
@@ -578,7 +658,13 @@ impl SdfShape {
                 return None;
             }
             let p = o_obj + d_obj * t;
-            let f = self.tree.eval_at(p, r.time);
+            // L == 1 は従来どおり `|f| / |d|`。`Displace` を含む形状は、殻の外では子の L だけで進める安全歩幅を使う
+            let (f, safe) = if self.node_lips.is_empty() {
+                let f = self.tree.eval_at(p, r.time);
+                (f, f.abs())
+            } else {
+                self.tree.eval_step_at(p, r.time, &self.node_lips)
+            };
             let af = f.abs();
             if af < eps {
                 if t > tmin {
@@ -594,7 +680,7 @@ impl SdfShape {
                 continue;
             }
             prev = Some((t, f));
-            t += af / step_len;
+            t += safe / d_len;
         }
         None
     }
@@ -1316,5 +1402,138 @@ mod tests {
         let down = Vec3::new(0.0, -1.0, 0.0);
         let top = |time: f64| moving.hit(Ray { o: Vec3::new(0.0, 10.0, 0.0), d: down, time }, 0.0, 1e9).unwrap().p.y;
         assert!((top(0.0) - 1.0).abs() < 0.06 && (top(1.0) - 4.0).abs() < 0.06, "{} {}", top(0.0), top(1.0));
+    }
+
+    /// 変位項だけの傾きの実測が、パラメータごとの `SdfNoise::lipschitz` を超えない（fBm / 乱流の二乗和の見積もりの裏付け）。
+    #[test]
+    fn measured_noise_slopes_stay_under_the_lipschitz_estimate_for_several_octave_settings() {
+        let mut rng = 555u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for (octaves, lacunarity, gain) in [(1, 2.0, 0.5), (2, 2.0, 0.5), (4, 2.0, 0.5), (5, 2.0, 0.5), (8, 2.0, 0.5), (4, 2.0, 0.7), (5, 2.5, 0.6), (4, 3.0, 0.5), (4, 2.0, 1.0), (6, 2.0, 0.9)] {
+            for pattern in [SdfNoisePattern::Fbm, SdfNoisePattern::Turbulence] {
+                let n = SdfNoise { pattern, amplitude: 1.0, scale: 1.0, octaves, lacunarity, gain, offset: Vec3::new(0.0, 0.0, 0.0) };
+                let l = n.lipschitz();
+                let mut worst: f64 = 0.0;
+                for _ in 0..150_000 {
+                    let p = Vec3::new(next() * 40.0, next() * 40.0, next() * 40.0);
+                    let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5).norm() * 1e-5;
+                    worst = worst.max((n.value(p + d) - n.value(p)).abs() / d.len());
+                }
+                assert!(worst <= l, "{pattern:?} o={octaves} lac={lacunarity} gain={gain}: measured {worst} > L {l}");
+            }
+        }
+    }
+
+    /// 殻スキップの安全歩幅は本当に安全: `eval_step_at` の `safe` の球の中では `f` の符号が変わらない（零点が無い）。
+    /// 変位・和・積・差・平滑演算・動くプリミティブを含む木で、乱択した点と方向、球の中の点列を調べる。
+    #[test]
+    fn safe_step_never_reaches_the_surface() {
+        let mut t = SdfTree::new();
+        let s1 = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(0.0, 0.0, 0.0), radius: 1.0 }));
+        let d1 = t.push(SdfNode::Op(SdfOp::Displace(s1, noise(SdfNoisePattern::Fbm, 0.15, 3.0))));
+        let bx = t.push(SdfNode::Prim(SdfPrim::Box { center: Vec3::new(2.2, 0.3, 0.0), half: Vec3::new(0.5, 0.5, 0.5), round: 0.1 }));
+        assert!(t.set_prim_end(bx, SdfPrimEnd::Center(Vec3::new(2.2, 1.3, 0.0))));
+        let s2 = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(-2.0, 0.0, 0.5), radius: 0.8 }));
+        let sm = t.push(SdfNode::Op(SdfOp::SmoothUnion(bx, s2, 0.3)));
+        let u = t.push(SdfNode::Op(SdfOp::Union(d1, sm)));
+        let cut = t.push(SdfNode::Prim(SdfPrim::Sphere { center: Vec3::new(0.0, 0.9, 0.0), radius: 0.5 }));
+        let sub = t.push(SdfNode::Op(SdfOp::Subtract(u, cut)));
+        t.push(SdfNode::Op(SdfOp::Displace(sub, noise(SdfNoisePattern::Turbulence, 0.05, 6.0))));
+        let lips = t.node_lipschitz();
+        let mut rng = 4242u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut checked, mut skipped_far) = (0, 0);
+        for _ in 0..4000 {
+            let p = Vec3::new(next() * 8.0 - 4.0, next() * 5.0 - 2.5, next() * 5.0 - 2.5);
+            let time = next();
+            let (f, safe) = t.eval_step_at(p, time, &lips);
+            assert_eq!(f.to_bits(), t.eval_at(p, time).to_bits(), "eval_step_at must return the same f as eval_at");
+            assert!(safe >= 0.0 && safe <= f.abs() + 1e-12, "safe {safe} vs |f| {}", f.abs());
+            if safe > f.abs() / lips[lips.len() - 1] * 1.5 {
+                skipped_far += 1;
+            }
+            // 半径 `safe` の球の内側の点で f が同じ符号のまま（0 にならない）
+            for _ in 0..40 {
+                let dir = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5).norm();
+                let q = p + dir * (safe * next() * 0.999);
+                let fq = t.eval_at(q, time);
+                assert!(fq * f > 0.0, "sign change inside the safe ball: f = {f}, safe = {safe}, f(q) = {fq}");
+            }
+            checked += 1;
+        }
+        assert!(checked == 4000 && skipped_far > 100, "the shell skip should give a larger step than |f|/L for many far points ({skipped_far})");
+    }
+
+    /// 殻の中から始まるレイ・殻の外を掠めるレイも、密なマーチと同じ最初の根に届く（取りこぼし無し）。
+    #[test]
+    fn dense_march_agrees_for_rays_starting_in_the_shell_and_passing_just_outside_it() {
+        let tree = displaced_sphere(noise(SdfNoisePattern::Fbm, 0.15, 3.0));
+        let shape = SdfShape::new(tree.clone(), Transform::identity(), 0).unwrap();
+        let dense = |r: Ray, t_max: f64| -> Option<f64> {
+            let f = |t: f64| tree.eval(r.at(t));
+            let mut t = 0.0;
+            while t < t_max {
+                if f(t) > 0.0 && f(t + 1e-3) <= 0.0 {
+                    let (mut lo, mut hi) = (t, t + 1e-3);
+                    for _ in 0..50 {
+                        let mid = 0.5 * (lo + hi);
+                        if f(mid) > 0.0 { lo = mid } else { hi = mid }
+                    }
+                    return Some(0.5 * (lo + hi));
+                }
+                t += 1e-3;
+            }
+            None
+        };
+        let (mut in_shell, mut grazing) = (0, 0);
+        for i in 0..600 {
+            let a = i as f64 * 0.917;
+            let dir = Vec3::new((a * 1.3).sin(), (a * 0.7).cos(), (a * 2.1).sin()).norm();
+            // 殻の中（半径 0.85..1.15、|f_child| ≤ 0.15）から始まる、まだ面に出会っていない（外側 f > 0）点
+            let radius = 0.86 + 0.28 * ((a * 0.37).sin() * 0.5 + 0.5);
+            let o = dir * radius;
+            if tree.eval(o) <= 0.0 {
+                continue;
+            }
+            let d = Vec3::new((a * 0.9).cos(), (a * 1.7).sin(), (a * 0.3).cos()).norm();
+            let r = Ray { o, d, time: 0.0 };
+            in_shell += 1;
+            let (got, want) = (shape.hit(r, 0.0, 1e9).map(|h| h.t), dense(r, 6.0));
+            match (got, want) {
+                (Some(g), Some(e)) => assert!((g - e).abs() < 1e-4, "shell start ray {i}: {g} vs {e}"),
+                (None, Some(e)) => panic!("shell start ray {i}: missed the hit at {e}"),
+                (Some(g), None) => panic!("shell start ray {i}: hit {g} not in the dense march"),
+                (None, None) => {}
+            }
+        }
+        for i in 0..600 {
+            // 球の外側 1.16..1.30（殻のすぐ外）を通る直線: 殻に触れる・触れないの境目
+            let a = i as f64 * 0.531;
+            let b = 1.16 + 0.14 * ((a * 0.77).sin() * 0.5 + 0.5);
+            let side = Vec3::new(a.cos(), 0.0, a.sin());
+            let up = Vec3::new(0.0, 1.0, 0.0);
+            let along = side.cross(up).norm();
+            let o = side * b + along * -4.0 + up * ((a * 1.1).sin() * 0.6);
+            let r = Ray { o, d: along, time: 0.0 };
+            grazing += 1;
+            let (got, want) = (shape.hit(r, 0.0, 1e9).map(|h| h.t), dense(r, 10.0));
+            match (got, want) {
+                (Some(g), Some(e)) => assert!((g - e).abs() < 1e-4, "grazing ray {i}: {g} vs {e}"),
+                (None, Some(e)) => panic!("grazing ray {i}: missed the hit at {e}"),
+                (Some(g), None) => panic!("grazing ray {i}: hit {g} not in the dense march"),
+                (None, None) => {}
+            }
+        }
+        assert!(in_shell > 100 && grazing == 600);
     }
 }
